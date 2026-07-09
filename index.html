@@ -18,6 +18,9 @@
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.0/babel.min.js"></script>
+<!-- jsmediatags: đọc ID3/metadata tag (bao gồm ảnh bìa) từ file MP3/audio,
+     dùng cho MusicPlayer để lấy cover art thật khi có. -->
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.7/jsmediatags.min.js"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext, Component } = React;
@@ -3189,6 +3192,9 @@ const NEON_CSS = `
   100% { box-shadow: 0 0 0px var(--ach-glow, #fbbf2400); }
 }
 
+/* MusicPlayer — ảnh bìa quay chậm liên tục khi đang phát */
+@keyframes gb-music-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
 /* Coin — bay lên rồi mờ dần (dùng cho +XP / +Coin trong Finance & Task) */
 .gb-coin-fly {
   position: absolute; pointer-events: none; font-weight: 800;
@@ -3430,6 +3436,91 @@ function describeMediaFetchError(code, url) {
   }
 }
 
+// ── ẢNH BÌA MẶC ĐỊNH (đĩa nhạc tím/đen dạng SVG, không cần request mạng) ──
+// Dùng khi không đọc được ID3 cover art (file không có tag ảnh, lỗi parse,
+// hoặc URL không fetch được). Vẽ bằng SVG inline nên luôn hiển thị được,
+// không phụ thuộc mạng.
+const DEFAULT_COVER_ART = "data:image/svg+xml;utf8," + encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <defs>
+    <radialGradient id="g" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#3b2560"/>
+      <stop offset="55%" stop-color="#1a1030"/>
+      <stop offset="100%" stop-color="#0b0714"/>
+    </radialGradient>
+  </defs>
+  <circle cx="100" cy="100" r="98" fill="url(#g)"/>
+  <circle cx="100" cy="100" r="98" fill="none" stroke="#5b3fa0" stroke-width="1.5" opacity="0.5"/>
+  <circle cx="100" cy="100" r="70" fill="none" stroke="#6d4fb5" stroke-width="1" opacity="0.35"/>
+  <circle cx="100" cy="100" r="46" fill="none" stroke="#6d4fb5" stroke-width="1" opacity="0.35"/>
+  <circle cx="100" cy="100" r="24" fill="#2a1a4a" stroke="#8a6fd4" stroke-width="1.5"/>
+  <circle cx="100" cy="100" r="6" fill="#0b0714"/>
+</svg>
+`.trim());
+
+// ── ID3 COVER ART (jsmediatags) ─────────────────────────────────────────────
+// Đọc ảnh bìa nhúng trong tag ID3/metadata của file audio (MP3/FLAC/OGG...).
+// Cách hoạt động:
+//   1. Base64 (data:...) hoặc URL → tải về dạng blob qua fetchAsBlobUrl đã có
+//      sẵn (tận dụng luôn cơ chế né CORS + 2 proxy dự phòng đang dùng cho
+//      BGM, không viết lại logic fetch).
+//   2. Đưa Blob vào window.jsmediatags.read() để parse tag.
+//   3. Nếu có tag "picture" (APIC/ảnh bìa) → convert byte array sang blob URL
+//      để hiển thị làm ảnh bìa.
+//   4. Bất kỳ bước nào lỗi (không có thư viện, file không có tag ảnh, tag lỗi,
+//      timeout...) → trả về null, caller tự fallback sang DEFAULT_COVER_ART.
+// Cache theo key (URL/base64 gốc) để không phải tải lại + parse lại mỗi lần
+// component re-render hoặc đổi bài rồi quay lại bài cũ.
+const coverArtCache = new Map(); // key: original data/url string -> blobUrl | null
+
+async function fetchCoverArt(data) {
+  if (!data) return null;
+  if (coverArtCache.has(data)) return coverArtCache.get(data);
+  if (typeof window === "undefined" || !window.jsmediatags) return null;
+
+  try {
+    const url = resolveMediaUrl(data);
+    // Base64 sẵn trong data: URL → jsmediatags đọc thẳng được, không cần fetch.
+    // URL http/https → tải về blob trước (né CORS bằng cơ chế đã có), rồi mới
+    // đưa File/Blob vào jsmediatags (jsmediatags không tự né CORS được).
+    let source = url;
+    if (/^https?:\/\//i.test(url)) {
+      const { blobUrl } = await fetchAsBlobUrl(url);
+      if (!blobUrl) { coverArtCache.set(data, null); return null; }
+      const blobRes = await fetch(blobUrl);
+      source = await blobRes.blob();
+    }
+
+    const picture = await new Promise((resolve) => {
+      // Timeout thủ công: 1 số file lỗi/quá lớn có thể khiến jsmediatags treo.
+      const timer = setTimeout(() => resolve(null), 8000);
+      try {
+        window.jsmediatags.read(source, {
+          onSuccess: (tag) => {
+            clearTimeout(timer);
+            resolve(tag?.tags?.picture || null);
+          },
+          onError: () => { clearTimeout(timer); resolve(null); },
+        });
+      } catch { clearTimeout(timer); resolve(null); }
+    });
+
+    if (!picture || !picture.data || !picture.data.length) {
+      coverArtCache.set(data, null);
+      return null;
+    }
+
+    const bytes = new Uint8Array(picture.data);
+    const blob = new Blob([bytes], { type: picture.format || "image/jpeg" });
+    const blobUrl = URL.createObjectURL(blob);
+    coverArtCache.set(data, blobUrl);
+    return blobUrl;
+  } catch {
+    coverArtCache.set(data, null);
+    return null;
+  }
+}
+
 // ── FILE UPLOAD → BASE64 (né hoàn toàn CORS vì không có request mạng nào) ──
 // Đọc file người dùng chọn (từ máy) và convert sang data: URL (Base64) ngay
 // trong trình duyệt bằng FileReader — không cần internet, không cần proxy,
@@ -3456,6 +3547,7 @@ function readFileAsBase64(file) {
     reader.readAsDataURL(file);
   });
 }
+
 
 const defaultMediaSettings = () => ({
   logo: "",
@@ -3712,14 +3804,20 @@ function useMediaSettings() {
   // re-render (kể cả do chuyển tab, gõ chữ ở form khác, timer Pomodoro
   // tick...) thì `media` có identity mới → MediaContext.Provider phát value
   // mới → MỌI component dùng useContext(MediaContext) (Hdr, ResetModal,
-  // WeeklyReviewModal, PomodoroModal, AudioPlayer) bị buộc re-render theo,
+  // WeeklyReviewModal, PomodoroModal, MusicPlayer) bị buộc re-render theo,
   // dù dữ liệu media không hề đổi. Với 1 app 12k dòng, hiệu ứng dây chuyền
   // này gây đơ/đứng hình ngẫu nhiên khi thao tác nhanh (chuyển tab liên
   // tục...). useMemo đảm bảo object chỉ đổi khi 1 trong các hàm/settings
   // bên trong thực sự đổi identity.
+  // bgmAudioRef: expose thẳng ref (không phải giá trị) để MusicPlayer đọc
+  // currentTime/duration mỗi frame (qua rAF/interval riêng trong component,
+  // không qua re-render) và gọi seek (audio.currentTime = x) khi kéo progress
+  // bar. Ref là 1 object cố định identity suốt vòng đời hook nên đưa vào đây
+  // KHÔNG phá vỡ memo hoá phía trên (object.current đổi nhưng ref thì không).
   return useMemo(() => ({
     settings, save, playBGM, stopBGM, toggleBGM, playTrackAt, nextTrack, prevTrack,
     playForTab, playEventMusic, playSFX, resetDefaults, playbackError, retryBGM, bgmLoadState,
+    bgmAudioRef,
     clearPlaybackError: () => setPlaybackError(null),
   }), [settings, save, playBGM, stopBGM, toggleBGM, playTrackAt, nextTrack, prevTrack,
       playForTab, playEventMusic, playSFX, resetDefaults, playbackError, retryBGM, bgmLoadState]);
@@ -4027,54 +4125,202 @@ function MediaSettingsModal({onClose}) {
   );
 }
 
-function AudioPlayer() {
+// ── MusicPlayer ──────────────────────────────────────────────────────────
+// Thay thế AudioPlayer cũ. 2 trạng thái:
+//   - Thu gọn: thanh ngang nhỏ góc trái dưới — ảnh bìa tròn quay chậm khi
+//     đang phát + tên bài 1 dòng + nút play/pause.
+//   - Mở rộng: bấm vào thanh thu gọn → phình thành "viên thuốc" (capsule)
+//     dọc — ảnh bìa to xoay liên tục khi phát, tên bài + nghệ sĩ, progress
+//     bar kéo được (seek), thời gian đã phát/tổng, play/pause/next/prev/volume,
+//     nút đóng quay lại trạng thái thu gọn.
+// Ảnh bìa: đọc ID3 cover art thật qua fetchCoverArt() (jsmediatags), có cache
+// theo bài; trong lúc đang tải hoặc khi thất bại → DEFAULT_COVER_ART (đĩa
+// nhạc SVG tím/đen, luôn hiển thị được vì không cần mạng).
+// Progress bar: đọc trực tiếp từ bgmAudioRef.current (audio element thật)
+// bằng setInterval nhẹ (250ms) khi đang phát — không dùng state cho mỗi
+// currentTime để tránh re-render toàn App theo mỗi tick.
+function formatTime(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "0:00";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function MusicPlayer() {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const media = useContext(MediaContext);
-  const [collapsed, setCollapsed] = useState(false);
-  const { settings, toggleBGM, nextTrack, prevTrack, save } = media;
+  const [expanded, setExpanded] = useState(false);
+  const [progress, setProgress] = useState({ current: 0, duration: 0 });
+  const [coverUrl, setCoverUrl] = useState(null);
+  const [coverLoading, setCoverLoading] = useState(false);
+  const [seeking, setSeeking] = useState(null); // 0-100 khi đang kéo, null khi không kéo
+  const { settings, toggleBGM, nextTrack, prevTrack, save, bgmAudioRef } = media;
   const s = settings;
 
   const hasAnything = s && (s.bgm || (s.playlist && s.playlist.length > 0));
+
+  const currentTrack = (s?.currentTrack >= 0 && s?.playlist?.[s.currentTrack]) ? s.playlist[s.currentTrack] : null;
+  const currentName = currentTrack ? currentTrack.name : (s?.bgmName || "Nhạc nền");
+  const currentData = currentTrack ? currentTrack.data : s?.bgm;
+
+  // Đọc progress thật từ audio element mỗi 250ms khi đang phát — tách khỏi
+  // React state chính để không kéo theo re-render toàn App mỗi tick.
+  useEffect(() => {
+    const tick = () => {
+      const audio = bgmAudioRef?.current;
+      if (audio) {
+        setProgress({
+          current: audio.currentTime || 0,
+          duration: Number.isFinite(audio.duration) ? audio.duration : 0,
+        });
+      }
+    };
+    tick();
+    const id = setInterval(tick, 250);
+    return () => clearInterval(id);
+  }, [bgmAudioRef, s?.isPlaying, currentData]);
+
+  // Tải ảnh bìa (ID3) mỗi khi đổi bài. Huỷ áp dụng kết quả nếu bài đã đổi
+  // tiếp trước khi fetch xong (tránh hiện nhầm ảnh bìa của bài cũ).
+  useEffect(() => {
+    let cancelled = false;
+    setCoverUrl(null);
+    if (!currentData) { setCoverLoading(false); return; }
+    setCoverLoading(true);
+    fetchCoverArt(currentData).then((url) => {
+      if (cancelled) return;
+      setCoverLoading(false);
+      setCoverUrl(url || null);
+    }).catch(() => { if (!cancelled) setCoverLoading(false); });
+    return () => { cancelled = true; };
+  }, [currentData]);
+
   if (!hasAnything) return null;
 
-  const currentName = (s.currentTrack >= 0 && s.playlist?.[s.currentTrack]) ? s.playlist[s.currentTrack].name : (s.bgmName || "Nhạc nền");
+  const coverSrc = coverUrl || DEFAULT_COVER_ART;
+  const pct = progress.duration > 0 ? (progress.current / progress.duration) * 100 : 0;
+  const displayPct = seeking !== null ? seeking : pct;
 
-  if (collapsed) {
+  const handleSeek = (e) => {
+    const val = Number(e.target.value);
+    setSeeking(val);
+  };
+  const commitSeek = (e) => {
+    const val = Number(e.target.value);
+    const audio = bgmAudioRef?.current;
+    if (audio && progress.duration > 0) {
+      audio.currentTime = (val / 100) * progress.duration;
+    }
+    setSeeking(null);
+  };
+
+  // Ảnh bìa dùng chung cho cả 2 trạng thái — quay chậm liên tục khi đang
+  // phát (CSS animation, tự dừng qua animationPlayState khi pause).
+  const coverImg = (size) => (
+    <img src={coverSrc} alt="" style={{
+      width: size, height: size, borderRadius: "50%", objectFit: "cover",
+      border: `1px solid ${theme.border}`, flexShrink: 0,
+      animation: "gb-music-spin 8s linear infinite",
+      animationPlayState: s.isPlaying ? "running" : "paused",
+    }}/>
+  );
+
+  if (!expanded) {
     return (
-      <button onClick={()=>setCollapsed(false)} style={{
-        position:"fixed",bottom:20,left:16,zIndex:50,width:40,height:40,borderRadius:"50%",
-        background:theme.surface,border:`1px solid ${theme.border}`,boxShadow:"0 8px 24px rgba(0,0,0,0.5)",
-        display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:16,
-      }}>🎵</button>
+      <button onClick={() => setExpanded(true)} style={{
+        position: "fixed", bottom: 20, left: 16, zIndex: 50,
+        display: "flex", alignItems: "center", gap: 8,
+        background: theme.surface, border: `1px solid ${theme.border}`,
+        borderRadius: 999, padding: "6px 12px 6px 6px",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.5)", cursor: "pointer",
+        maxWidth: 220, textAlign: "left",
+      }}>
+        {coverImg(28)}
+        <span style={{
+          flex: 1, fontSize: 11, color: theme.text, fontWeight: 600,
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}>
+          {currentName}
+        </span>
+        <span
+          onClick={(e) => { e.stopPropagation(); toggleBGM(); }}
+          style={{ fontSize: 15, color: accent, flexShrink: 0, cursor: "pointer" }}>
+          {s.isPlaying ? "⏸️" : "▶️"}
+        </span>
+      </button>
     );
   }
 
   return (
     <div style={{
-      position:"fixed",bottom:20,left:16,zIndex:50,
-      background:theme.surface,border:`1px solid ${theme.border}`,
-      borderRadius:16,padding:"10px 14px",boxShadow:"0 8px 32px rgba(0,0,0,0.5)",
-      minWidth:210,maxWidth:240,
+      position: "fixed", bottom: 20, left: 16, zIndex: 50,
+      background: theme.surface, border: `1px solid ${theme.border}`,
+      borderRadius: 24, padding: 16, boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+      width: 240,
     }}>
-      <div style={{display:"flex",alignItems:"center",gap:8}}>
-        <span style={{fontSize:13}}>{s.isPlaying ? "🎶" : "⏸️"}</span>
-        <span style={{flex:1,fontSize:11,color:theme.text,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+        <button onClick={() => setExpanded(false)} title="Thu gọn"
+          style={{ background: "none", border: "none", color: theme.textDim, cursor: "pointer", fontSize: 13 }}>✕</button>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+        {coverImg(96)}
+      </div>
+
+      <div style={{ textAlign: "center", marginBottom: 10 }}>
+        <div style={{
+          fontSize: 13, fontWeight: 700, color: theme.text,
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}>
           {currentName}
-        </span>
-        <button onClick={()=>save({muted:!s.muted})} title={s.muted?"Bật tiếng":"Tắt tiếng"}
-          style={{background:"none",border:"none",color: s.muted ? theme.danger : theme.textDim,cursor:"pointer",fontSize:12}}>
+        </div>
+        <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>
+          {coverLoading ? "Đang tìm ảnh bìa…" : "GiaBaoDashboard"}
+        </div>
+      </div>
+
+      {/* Progress bar — kéo để tua (seek) */}
+      <div style={{ marginBottom: 4 }}>
+        <input type="range" min={0} max={100} step={0.1}
+          value={displayPct}
+          onChange={handleSeek}
+          onMouseUp={commitSeek}
+          onTouchEnd={commitSeek}
+          style={{ width: "100%", accentColor: accent }}/>
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: theme.textDim, marginBottom: 10 }}>
+        <span>{formatTime(progress.current)}</span>
+        <span>{formatTime(progress.duration)}</span>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 14, marginBottom: 10 }}>
+        <button onClick={prevTrack} disabled={!s.playlist?.length}
+          style={{ background: "none", border: "none", fontSize: 16,
+            color: s.playlist?.length ? theme.text : theme.textDim,
+            cursor: s.playlist?.length ? "pointer" : "default",
+            opacity: s.playlist?.length ? 1 : 0.4 }}>⏮</button>
+        <button onClick={toggleBGM}
+          style={{ background: accent, border: "none", color: "#fff", cursor: "pointer",
+            fontSize: 18, width: 44, height: 44, borderRadius: "50%",
+            display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {s.isPlaying ? "⏸️" : "▶️"}
+        </button>
+        <button onClick={nextTrack} disabled={!s.playlist?.length}
+          style={{ background: "none", border: "none", fontSize: 16,
+            color: s.playlist?.length ? theme.text : theme.textDim,
+            cursor: s.playlist?.length ? "pointer" : "default",
+            opacity: s.playlist?.length ? 1 : 0.4 }}>⏭</button>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <button onClick={() => save({ muted: !s.muted })} title={s.muted ? "Bật tiếng" : "Tắt tiếng"}
+          style={{ background: "none", border: "none", color: s.muted ? theme.danger : theme.textDim, cursor: "pointer", fontSize: 12 }}>
           {s.muted ? "🔇" : "🔊"}
         </button>
-        <button onClick={()=>setCollapsed(true)} style={{background:"none",border:"none",color:theme.textDim,cursor:"pointer",fontSize:12}}>✕</button>
-      </div>
-      <div style={{display:"flex",alignItems:"center",gap:4,marginTop:6}}>
-        <button onClick={prevTrack} disabled={!s.playlist?.length} style={{background:"none",border:"none",color:s.playlist?.length?theme.text:theme.textDim,cursor:s.playlist?.length?"pointer":"default",fontSize:13,opacity:s.playlist?.length?1:0.4}}>⏮</button>
-        <button onClick={toggleBGM} style={{background:"none",border:"none",color:accent,cursor:"pointer",fontSize:16}}>{s.isPlaying ? "⏸️" : "▶️"}</button>
-        <button onClick={nextTrack} disabled={!s.playlist?.length} style={{background:"none",border:"none",color:s.playlist?.length?theme.text:theme.textDim,cursor:s.playlist?.length?"pointer":"default",fontSize:13,opacity:s.playlist?.length?1:0.4}}>⏭</button>
         <input type="range" min={0} max={100} value={s.volume?.bgm ?? 30}
-          onChange={e=>save(prev=>({...prev,volume:{...prev.volume,bgm:Number(e.target.value)}}))}
-          style={{flex:1,height:3}}/>
+          onChange={e => save(prev => ({ ...prev, volume: { ...prev.volume, bgm: Number(e.target.value) } }))}
+          style={{ flex: 1, height: 3, accentColor: accent }}/>
       </div>
     </div>
   );
@@ -5039,7 +5285,7 @@ function App() {
         </ModalPortal>
       )}
       </div>
-      <AudioPlayer/>
+      <MusicPlayer/>
       {mediaModalOpen && <MediaSettingsModal onClose={()=>setMediaModalOpen(false)}/>}
     </div>
     </MediaContext.Provider>
