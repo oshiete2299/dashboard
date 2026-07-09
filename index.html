@@ -3801,12 +3801,19 @@ function useMediaSettings() {
 
   // Nhạc theo tab: gọi từ App mỗi khi đổi tab. Nếu tab có tabMusic riêng thì
   // phát bài đó (ghi đè BGM); nếu không, quay lại BGM gốc/playlist hiện tại.
-  // [FIX] Trước đây hàm này LUÔN gọi playBGM mỗi lần đổi tab — kể cả khi
-  // nguồn nhạc đích giống hệt bài đang phát — khiến playBGM tạo lại
-  // `new Audio()` từ đầu (fetch lại blob, mất currentTime, giật 1 nhịp) mỗi
-  // lần chuyển tab. Giờ so sánh trước: nếu nguồn đích === nguồn đang phát
-  // (currentPlayingDataRef) VÀ audio hiện tại còn sống, không làm gì cả —
-  // để bgmAudioRef.current tiếp tục chạy liên tục, không gián đoạn.
+  // [FIX #1] Trước đây hàm này LUÔN gọi playBGM mỗi lần đổi tab — kể cả khi
+  // nguồn nhạc đích giống hệt bài đang phát.
+  // [FIX #2 — NGUYÊN NHÂN THẬT SỰ CỦA "GIẬT/RESET"]: Bản sửa đầu tiên vẫn
+  // yêu cầu `bgmAudioRef.current` phải tồn tại mới được skip. Nhưng
+  // bgmAudioRef.current chỉ được gán SAU KHI fetchAsBlobUrl (tải file qua
+  // corsproxy.io/allorigins.win) hoàn tất — với link MP3 ngoài, việc này có
+  // thể mất 0.5–2+ giây thực tế. Nếu người dùng đổi tab trong đúng khoảng
+  // đang tải đó, bgmAudioRef.current vẫn là null → điều kiện cũ luôn fail →
+  // gọi lại playBGM → huỷ luôn lần tải đang dở qua token → bài phát lại từ
+  // đầu. Đây chính là hiện tượng "ngắt 1 nhịp, phát lại từ đầu bài".
+  // Fix đúng: chỉ cần so sánh targetData với currentPlayingDataRef (đã được
+  // set NGAY khi playBGM bắt đầu, không đợi fetch xong) — nếu đang tải HOẶC
+  // đã phát xong CÙNG một nguồn, đều bỏ qua, không gọi lại playBGM.
   const playForTab = useCallback((tabIndex) => {
     if (!settings) return;
     const tabTrack = settings.tabMusic?.[tabIndex];
@@ -3819,9 +3826,9 @@ function useMediaSettings() {
 
     if (!targetData) return;
 
-    // Nguồn đích giống bài đang phát VÀ audio element vẫn còn sống → giữ
-    // nguyên, không restart.
-    if (targetData === currentPlayingDataRef.current && bgmAudioRef.current) {
+    // Nguồn đích trùng với nguồn đang tải/đã phát → không làm gì cả, kể cả
+    // khi audio element chưa sẵn sàng (đang giữa lúc fetch qua proxy).
+    if (targetData === currentPlayingDataRef.current) {
       return;
     }
     playBGM(targetData, targetName);
