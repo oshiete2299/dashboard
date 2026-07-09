@@ -40,6 +40,7 @@ const TAB_COLORS = {
 };
 
 const AccentContext = createContext(null);
+const MediaContext = createContext(null);
 
 // ── THEMES ─────────────────────────────────────────────────────────────────
 // Mỗi theme có 5 token màu chính dùng xuyên suốt UI:
@@ -2668,7 +2669,41 @@ const SOUNDS = {
 // soundOn đọc từ setts (App truyền xuống qua context-free global vì đơn giản hoá — cờ được set mỗi lần setts đổi)
 let _gbSoundOn = true;
 const setSoundEnabled = v => { _gbSoundOn = v; };
-const playSound = name => { if (_gbSoundOn && SOUNDS[name]) { try { SOUNDS[name](); } catch {} } };
+// MEDIA SYSTEM — module-level ref so the global playSound() (called from many
+// components deep in the tree) can reach current Media Settings SFX without
+// every caller needing to be rewired through props/context. useMediaSettings
+// keeps this ref in sync with the latest saved settings.
+let _gbMediaSettingsRef = null;
+const setMediaSettingsRef = s => { _gbMediaSettingsRef = s; };
+let _gbEventAudioRef = null;
+// playEventMusic: phát nhạc theo sự kiện (level up / boss win / capsule) —
+// module-level như playSound() để các component sâu trong cây (Hdr,
+// BossFight, HanhTrinh) gọi được mà không cần prop drilling MediaContext.
+const playEventMusic = (eventName) => {
+  const data = _gbMediaSettingsRef?.eventMusic?.[eventName];
+  if (!data) return;
+  try {
+    if (_gbEventAudioRef) _gbEventAudioRef.pause();
+    const audio = new Audio(data);
+    audio.loop = false;
+    audio.volume = (_gbMediaSettingsRef?.muted ? 0 : (_gbMediaSettingsRef?.volume?.bgm ?? 30)) / 100;
+    audio.play().catch(()=>{});
+    _gbEventAudioRef = audio;
+  } catch {}
+};
+const playSound = name => {
+  if (!_gbSoundOn) return;
+  const custom = _gbMediaSettingsRef?.sfx?.[name];
+  if (custom) {
+    try {
+      const a = new Audio(custom);
+      a.volume = (_gbMediaSettingsRef?.volume?.sfx ?? 50) / 100;
+      a.play().catch(()=>{});
+      return;
+    } catch {}
+  }
+  if (SOUNDS[name]) { try { SOUNDS[name](); } catch {} }
+};
 
 // P-01: use local date, not UTC — prevents date flip between 0h–7h in GMT+7
 const toISO = () => {
@@ -3227,6 +3262,412 @@ function ModalPortal({children}) {
   return children;
 }
 
+// ── MEDIA SYSTEM (ảnh + nhạc) ────────────────────────────────────────────
+const MEDIA_KEY = "v30:mediaSettings";
+const SFX_NAMES = ["tick","xp","levelup","bosshit","bosswin","coin"];
+const defaultMediaSettings = () => ({
+  logo: "",
+  background: "",
+  backgroundOpacity: 40,
+  headers: {},          // {[tabIndex]: base64}
+  modalBg: "",          // ảnh nền chung cho Pomodoro/Reset/Weekly Review modals
+  bgm: "",
+  bgmName: "",
+  tabMusic: {},          // {[tabIndex]: base64} nhạc theo tab, ghi đè BGM khi ở tab đó
+  eventMusic: {},         // {levelup, bosswin, capsule} → base64, phát 1 lần khi sự kiện xảy ra
+  playlist: [],           // [{name, data}]
+  currentTrack: -1,       // index trong playlist đang phát, -1 = đang phát bgm gốc
+  sfx: {},                // {[name]: base64}
+  volume: { bgm: 30, sfx: 50 },
+  isPlaying: false,
+  muted: false,
+});
+
+// Hook quản lý toàn bộ Media Settings: load/save qua S (window.storage),
+// điều khiển phát BGM/playlist, và expose playEventMusic cho level up / boss
+// win / mở capsule. Được gọi 1 lần duy nhất ở App và truyền xuống qua
+// MediaContext để mọi component con dùng chung 1 nguồn sự thật.
+function useMediaSettings() {
+  const [settings, setSettings] = useState(null);
+  const bgmAudioRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let loaded = defaultMediaSettings();
+      try {
+        const raw = await S.get(MEDIA_KEY);
+        if (raw && raw !== "null") loaded = { ...defaultMediaSettings(), ...JSON.parse(raw) };
+      } catch {}
+      if (!cancelled) setSettings(loaded);
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Giữ ref module-level đồng bộ cho playSound() toàn cục dùng SFX
+  useEffect(() => { setMediaSettingsRef(settings); }, [settings]);
+
+  const persist = useCallback(async (next) => {
+    try { await S.set(MEDIA_KEY, JSON.stringify(next)); } catch {}
+  }, []);
+
+  // patch: cập nhật + lưu ngay. functional-updater để tránh stale closure
+  // khi nhiều field được sửa liên tiếp (vd headers theo từng tab).
+  const save = useCallback((patch) => {
+    setSettings(prev => {
+      const base = prev || defaultMediaSettings();
+      const next = typeof patch === "function" ? patch(base) : { ...base, ...patch };
+      persist(next);
+      return next;
+    });
+  }, [persist]);
+
+  const resolveVolume = useCallback((kind) => {
+    if (settings?.muted) return 0;
+    return (settings?.volume?.[kind] ?? (kind === "bgm" ? 30 : 50)) / 100;
+  }, [settings]);
+
+  // Phát BGM chính (hoặc bài trong playlist nếu trackIndex hợp lệ)
+  const playBGM = useCallback((data, name) => {
+    if (!data) return;
+    try {
+      if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
+      const audio = new Audio(data);
+      audio.loop = true;
+      audio.volume = resolveVolume("bgm");
+      audio.play().catch(()=>{});
+      bgmAudioRef.current = audio;
+      save(s => ({ ...s, isPlaying: true, bgmName: name ?? s.bgmName }));
+    } catch {}
+  }, [resolveVolume, save]);
+
+  const stopBGM = useCallback(() => {
+    if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
+    save({ isPlaying: false });
+  }, [save]);
+
+  const toggleBGM = useCallback(() => {
+    if (!settings) return;
+    if (bgmAudioRef.current && !bgmAudioRef.current.paused) {
+      bgmAudioRef.current.pause();
+      save({ isPlaying: false });
+    } else if (bgmAudioRef.current) {
+      bgmAudioRef.current.play().catch(()=>{});
+      save({ isPlaying: true });
+    } else {
+      const track = settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack] : null;
+      playBGM(track ? track.data : settings.bgm, track ? track.name : settings.bgmName);
+    }
+  }, [settings, playBGM, save]);
+
+  const playTrackAt = useCallback((idx) => {
+    if (!settings) return;
+    const track = settings.playlist?.[idx];
+    if (!track) return;
+    save({ currentTrack: idx });
+    playBGM(track.data, track.name);
+  }, [settings, playBGM, save]);
+
+  const nextTrack = useCallback(() => {
+    if (!settings?.playlist?.length) return;
+    const idx = (settings.currentTrack + 1 + settings.playlist.length) % settings.playlist.length;
+    playTrackAt(idx);
+  }, [settings, playTrackAt]);
+
+  const prevTrack = useCallback(() => {
+    if (!settings?.playlist?.length) return;
+    const idx = (settings.currentTrack - 1 + settings.playlist.length) % settings.playlist.length;
+    playTrackAt(idx);
+  }, [settings, playTrackAt]);
+
+  // Khi đổi volume trong lúc đang phát, áp ngay không cần restart audio
+  useEffect(() => {
+    if (bgmAudioRef.current) bgmAudioRef.current.volume = resolveVolume("bgm");
+  }, [settings?.volume?.bgm, settings?.muted, resolveVolume]);
+
+  // Nhạc theo tab: gọi từ App mỗi khi đổi tab. Nếu tab có tabMusic riêng thì
+  // phát bài đó (ghi đè BGM); nếu không, quay lại BGM gốc/playlist hiện tại.
+  const playForTab = useCallback((tabIndex) => {
+    if (!settings) return;
+    const tabTrack = settings.tabMusic?.[tabIndex];
+    if (tabTrack) { playBGM(tabTrack, `Tab: ${TABS[tabIndex] || tabIndex}`); return; }
+    const track = settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack] : null;
+    if (track) playBGM(track.data, track.name);
+    else if (settings.bgm) playBGM(settings.bgm, settings.bgmName);
+  }, [settings, playBGM]);
+
+  const playSFX = useCallback((name) => {
+    const data = settings?.sfx?.[name];
+    if (data) {
+      try {
+        const audio = new Audio(data);
+        audio.volume = resolveVolume("sfx");
+        audio.play().catch(()=>{});
+        return;
+      } catch {}
+    }
+    if (SOUNDS[name]) { try { SOUNDS[name](); } catch {} }
+  }, [settings, resolveVolume]);
+
+  const resetDefaults = useCallback(() => {
+    stopBGM();
+    const fresh = defaultMediaSettings();
+    setSettings(fresh);
+    persist(fresh);
+  }, [stopBGM, persist]);
+
+  return {
+    settings, save, playBGM, stopBGM, toggleBGM, playTrackAt, nextTrack, prevTrack,
+    playForTab, playEventMusic, playSFX, resetDefaults,
+  };
+}
+// eventAudioRef bên trong hook không còn dùng (đã chuyển playEventMusic ra
+// module-level để component sâu trong cây gọi được), giữ playEventMusic
+// module-level làm alias để giữ API của object trả về không đổi.
+
+// Trả về style ảnh nền cho modal (Pomodoro/Reset/Weekly Review), phủ 1 lớp
+// màu theme mờ lên trên ảnh để chữ vẫn đọc được rõ. Nếu chưa set ảnh, trả về
+// background màu theme gốc như cũ — không đổi giao diện mặc định.
+function modalBgStyle(theme, modalBg) {
+  if (!modalBg) return { background: theme.surface };
+  return {
+    backgroundImage: `linear-gradient(${theme.surface}E6,${theme.surface}E6), url(${modalBg})`,
+    backgroundSize: "cover",
+    backgroundPosition: "center",
+  };
+}
+
+function MediaField({label, value, placeholder, onChange, rows=2, theme, extra}) {
+  return (
+    <div style={{marginBottom:6}}>
+      <div style={{fontSize:10,color:theme.textDim,marginBottom:3}}>{label}</div>
+      <textarea value={value||""} onChange={e=>onChange(e.target.value)}
+        placeholder={placeholder} rows={rows}
+        style={{width:"100%",boxSizing:"border-box",fontSize:10,padding:6,borderRadius:8,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"vertical",fontFamily:"monospace"}}/>
+      {extra}
+    </div>
+  );
+}
+
+function MediaSettingsModal({onClose}) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const media = useContext(MediaContext);
+  const { settings, save, playBGM, stopBGM, playSFX, resetDefaults } = media;
+  const [newTrackName, setNewTrackName] = useState("");
+  const [newTrackData, setNewTrackData] = useState("");
+  const s = settings || defaultMediaSettings();
+
+  const sectionStyle = {marginBottom:16,paddingBottom:14,borderBottom:`1px solid ${theme.border}55`};
+  const titleStyle = {fontSize:12,fontWeight:700,color:theme.text,marginBottom:6};
+
+  return (
+    <ModalPortal>
+    <div className="gb-modal-backdrop-fade" style={{position:"fixed",inset:0,zIndex:999,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <div className="gb-modal-fade-scale" style={{background:theme.surface,borderRadius:16,padding:20,maxWidth:460,width:"100%",maxHeight:"85vh",overflowY:"auto",border:`1px solid ${theme.border}`}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <span style={{fontSize:15,fontWeight:700,color:accent}}>🎨 Media Settings</span>
+          <button onClick={onClose} style={{background:"none",border:"none",color:theme.textDim,fontSize:20,cursor:"pointer"}}>✕</button>
+        </div>
+
+        {/* Logo */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🖼️ Logo</div>
+          <MediaField theme={theme} value={s.logo} placeholder="Dán Base64 logo..."
+            onChange={v=>save({logo:v})}
+            extra={s.logo ? <img src={s.logo} alt="logo" style={{maxHeight:50,marginTop:6,borderRadius:8,display:"block"}}/> : null}/>
+        </div>
+
+        {/* Ảnh nền toàn app */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🖼️ Ảnh nền toàn app</div>
+          <MediaField theme={theme} value={s.background} placeholder="Dán Base64 ảnh nền..."
+            onChange={v=>save({background:v})}/>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginTop:4}}>
+            <span style={{fontSize:10,color:theme.textDim}}>Độ mờ:</span>
+            <input type="range" min={0} max={80} value={s.backgroundOpacity}
+              onChange={e=>save({backgroundOpacity:Number(e.target.value)})} style={{flex:1}}/>
+            <span style={{fontSize:10,color:theme.textDim,minWidth:30}}>{s.backgroundOpacity}%</span>
+          </div>
+        </div>
+
+        {/* Ảnh header theo tab */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🖼️ Ảnh header theo tab</div>
+          {TABS.map((name,i)=>(
+            <MediaField key={i} theme={theme} rows={1} value={s.headers?.[i]}
+              label={name} placeholder={`Base64 header cho ${name}...`}
+              onChange={v=>save(prev=>({...prev,headers:{...prev.headers,[i]:v}}))}/>
+          ))}
+        </div>
+
+        {/* Ảnh nền modal */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🖼️ Ảnh nền modal (Pomodoro / Reset / Weekly Review)</div>
+          <MediaField theme={theme} value={s.modalBg} placeholder="Dán Base64 ảnh nền modal..."
+            onChange={v=>save({modalBg:v})}/>
+        </div>
+
+        {/* Nhạc nền */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🎵 Nhạc nền (BGM)</div>
+          <MediaField theme={theme} value={s.bgm} placeholder="Dán Base64 bài nhạc..."
+            onChange={v=>save({bgm:v})}/>
+          <input value={s.bgmName||""} onChange={e=>save({bgmName:e.target.value})}
+            placeholder="Tên bài hát..."
+            style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:6,borderRadius:8,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,marginTop:4}}/>
+          <div style={{display:"flex",gap:6,marginTop:6}}>
+            <button onClick={()=>playBGM(s.bgm, s.bgmName)} disabled={!s.bgm}
+              style={{padding:"5px 14px",borderRadius:999,border:"none",background:theme.success,color:"#000",fontSize:10,fontWeight:600,cursor:s.bgm?"pointer":"not-allowed",opacity:s.bgm?1:0.5}}>▶ Test</button>
+            <button onClick={stopBGM}
+              style={{padding:"5px 14px",borderRadius:999,border:`1px solid ${theme.border}`,background:"transparent",color:theme.textDim,fontSize:10,cursor:"pointer"}}>⏹ Dừng</button>
+          </div>
+        </div>
+
+        {/* Nhạc theo tab */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🎵 Nhạc theo tab (ghi đè BGM khi ở tab đó)</div>
+          {TABS.map((name,i)=>(
+            <MediaField key={i} theme={theme} rows={1} value={s.tabMusic?.[i]}
+              label={name} placeholder={`Base64 nhạc cho ${name}...`}
+              onChange={v=>save(prev=>({...prev,tabMusic:{...prev.tabMusic,[i]:v}}))}/>
+          ))}
+        </div>
+
+        {/* Nhạc theo sự kiện */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🎵 Nhạc theo sự kiện</div>
+          {[["levelup","Lên cấp (Level up)"],["bosswin","Thắng Boss"],["capsule","Mở Time Capsule"]].map(([key,label])=>(
+            <MediaField key={key} theme={theme} rows={1} value={s.eventMusic?.[key]}
+              label={label} placeholder={`Base64 nhạc cho ${label}...`}
+              onChange={v=>save(prev=>({...prev,eventMusic:{...prev.eventMusic,[key]:v}}))}/>
+          ))}
+        </div>
+
+        {/* Playlist */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>📂 Playlist</div>
+          {(s.playlist||[]).map((track,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 0",borderBottom:`1px solid ${theme.border}33`}}>
+              <span style={{fontSize:10,color:s.currentTrack===i?accent:theme.textDim}}>{i===s.currentTrack?"▶":"○"}</span>
+              <span onClick={()=>media.playTrackAt(i)} style={{flex:1,fontSize:11,color:theme.text,cursor:"pointer"}}>{track.name||`Bài ${i+1}`}</span>
+              <button onClick={()=>save(prev=>({...prev,playlist:prev.playlist.filter((_,idx)=>idx!==i),currentTrack:prev.currentTrack===i?-1:prev.currentTrack}))}
+                style={{background:"none",border:"none",color:theme.danger,cursor:"pointer",fontSize:13}}>✕</button>
+            </div>
+          ))}
+          <div style={{display:"flex",gap:6,marginTop:6,flexWrap:"wrap"}}>
+            <input value={newTrackName} onChange={e=>setNewTrackName(e.target.value)} placeholder="Tên bài..."
+              style={{flex:"1 1 100px",fontSize:11,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text}}/>
+            <textarea value={newTrackData} onChange={e=>setNewTrackData(e.target.value)} placeholder="Paste Base64..." rows={1}
+              style={{flex:"2 1 140px",fontSize:10,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"none"}}/>
+            <button onClick={()=>{
+              if (!newTrackData) return;
+              save(prev=>({...prev,playlist:[...(prev.playlist||[]),{name:newTrackName||`Bài ${(prev.playlist?.length||0)+1}`,data:newTrackData}]}));
+              setNewTrackName(""); setNewTrackData("");
+            }} style={{padding:"5px 14px",borderRadius:6,border:"none",background:accent,color:"#fff",fontSize:10,cursor:"pointer"}}>+ Thêm</button>
+          </div>
+        </div>
+
+        {/* SFX */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🔊 Âm thanh hiệu ứng (SFX)</div>
+          {SFX_NAMES.map(name=>(
+            <div key={name} style={{marginBottom:6}}>
+              <div style={{fontSize:10,color:theme.textDim,marginBottom:3}}>{name}</div>
+              <div style={{display:"flex",gap:4}}>
+                <textarea value={s.sfx?.[name]||""} onChange={e=>save(prev=>({...prev,sfx:{...prev.sfx,[name]:e.target.value}}))}
+                  placeholder={`Dán Base64 cho ${name}...`} rows={1}
+                  style={{flex:1,fontSize:10,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"vertical",fontFamily:"monospace"}}/>
+                <button onClick={()=>playSFX(name)} style={{padding:"4px 10px",borderRadius:6,border:"none",background:theme.success,color:"#000",fontSize:10,cursor:"pointer"}}>▶</button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Âm lượng */}
+        <div style={sectionStyle}>
+          <div style={titleStyle}>🎚️ Âm lượng</div>
+          <div style={{marginBottom:8}}>
+            <span style={{fontSize:10,color:theme.textDim}}>Nhạc nền: {s.volume?.bgm ?? 30}%</span>
+            <input type="range" min={0} max={100} value={s.volume?.bgm ?? 30}
+              onChange={e=>save(prev=>({...prev,volume:{...prev.volume,bgm:Number(e.target.value)}}))}
+              style={{width:"100%"}}/>
+          </div>
+          <div>
+            <span style={{fontSize:10,color:theme.textDim}}>SFX: {s.volume?.sfx ?? 50}%</span>
+            <input type="range" min={0} max={100} value={s.volume?.sfx ?? 50}
+              onChange={e=>save(prev=>({...prev,volume:{...prev.volume,sfx:Number(e.target.value)}}))}
+              style={{width:"100%"}}/>
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={onClose} style={{flex:1,padding:"10px 0",borderRadius:999,border:"none",background:accent,color:"#fff",fontWeight:700,fontSize:12,cursor:"pointer"}}>💾 Đã lưu — Đóng</button>
+          <button onClick={()=>{ if(confirm("Đặt lại toàn bộ Media Settings về mặc định?")) resetDefaults(); }}
+            style={{flex:1,padding:"10px 0",borderRadius:999,border:`1px solid ${theme.border}`,background:"transparent",color:theme.textDim,fontSize:12,cursor:"pointer"}}>🔄 Đặt lại mặc định</button>
+        </div>
+        <div style={{fontSize:9,color:theme.textDim,marginTop:8,lineHeight:1.5}}>
+          Mọi thay đổi tự động lưu ngay khi bạn nhập. File Base64 nên vừa phải (khuyến nghị &lt;2-3MB mỗi mục) để tránh vượt giới hạn lưu trữ.
+        </div>
+      </div>
+    </div>
+    </ModalPortal>
+  );
+}
+
+function AudioPlayer() {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const media = useContext(MediaContext);
+  const [collapsed, setCollapsed] = useState(false);
+  const { settings, toggleBGM, nextTrack, prevTrack, save } = media;
+  const s = settings;
+
+  const hasAnything = s && (s.bgm || (s.playlist && s.playlist.length > 0));
+  if (!hasAnything) return null;
+
+  const currentName = (s.currentTrack >= 0 && s.playlist?.[s.currentTrack]) ? s.playlist[s.currentTrack].name : (s.bgmName || "Nhạc nền");
+
+  if (collapsed) {
+    return (
+      <button onClick={()=>setCollapsed(false)} style={{
+        position:"fixed",bottom:20,left:16,zIndex:50,width:40,height:40,borderRadius:"50%",
+        background:theme.surface,border:`1px solid ${theme.border}`,boxShadow:"0 8px 24px rgba(0,0,0,0.5)",
+        display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",fontSize:16,
+      }}>🎵</button>
+    );
+  }
+
+  return (
+    <div style={{
+      position:"fixed",bottom:20,left:16,zIndex:50,
+      background:theme.surface,border:`1px solid ${theme.border}`,
+      borderRadius:16,padding:"10px 14px",boxShadow:"0 8px 32px rgba(0,0,0,0.5)",
+      minWidth:210,maxWidth:240,
+    }}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        <span style={{fontSize:13}}>{s.isPlaying ? "🎶" : "⏸️"}</span>
+        <span style={{flex:1,fontSize:11,color:theme.text,fontWeight:600,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+          {currentName}
+        </span>
+        <button onClick={()=>save({muted:!s.muted})} title={s.muted?"Bật tiếng":"Tắt tiếng"}
+          style={{background:"none",border:"none",color: s.muted ? theme.danger : theme.textDim,cursor:"pointer",fontSize:12}}>
+          {s.muted ? "🔇" : "🔊"}
+        </button>
+        <button onClick={()=>setCollapsed(true)} style={{background:"none",border:"none",color:theme.textDim,cursor:"pointer",fontSize:12}}>✕</button>
+      </div>
+      <div style={{display:"flex",alignItems:"center",gap:4,marginTop:6}}>
+        <button onClick={prevTrack} disabled={!s.playlist?.length} style={{background:"none",border:"none",color:s.playlist?.length?theme.text:theme.textDim,cursor:s.playlist?.length?"pointer":"default",fontSize:13,opacity:s.playlist?.length?1:0.4}}>⏮</button>
+        <button onClick={toggleBGM} style={{background:"none",border:"none",color:accent,cursor:"pointer",fontSize:16}}>{s.isPlaying ? "⏸️" : "▶️"}</button>
+        <button onClick={nextTrack} disabled={!s.playlist?.length} style={{background:"none",border:"none",color:s.playlist?.length?theme.text:theme.textDim,cursor:s.playlist?.length?"pointer":"default",fontSize:13,opacity:s.playlist?.length?1:0.4}}>⏭</button>
+        <input type="range" min={0} max={100} value={s.volume?.bgm ?? 30}
+          onChange={e=>save(prev=>({...prev,volume:{...prev.volume,bgm:Number(e.target.value)}}))}
+          style={{flex:1,height:3}}/>
+      </div>
+    </div>
+  );
+}
+
 // ── MỤC 8: CountUp — đếm số mượt bằng requestAnimationFrame, React thuần ──
 // Dùng cho các con số thống kê (XP, %, số ngày...). Chỉ nhận number; nếu value
 // không phải number (vd chuỗi "Lv 3 · Dũng sĩ") thì component cha tự không dùng.
@@ -3339,6 +3780,8 @@ function App() {
   const [tab,  setTab]  = useState(0);
   const [themeKey, setThemeKey] = useState(DEFAULT_THEME_KEY);
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const [mediaModalOpen, setMediaModalOpen] = useState(false);
+  const media = useMediaSettings();
   const theme = THEMES[themeKey] || THEMES[DEFAULT_THEME_KEY];
   const accent = theme.primary; // accent toàn app luôn đồng bộ theo theme, không đổi theo tab nữa
   const [db,   setDb]   = useState({});
@@ -3806,6 +4249,7 @@ function App() {
   useEffect(()=>{
     if(prevLvRef.current !== null && lv.l > prevLvRef.current){
       playSound("levelup");
+      playEventMusic("levelup");
       setJustLeveledUp(true);
       const t = setTimeout(()=>setJustLeveledUp(false), 1200);
       prevLvRef.current = lv.l;
@@ -3841,7 +4285,7 @@ function App() {
   const HIDDEN_TAB_INDEXES = [4, 5, ...(setts.bossEnabled ? [] : [8])];
   const VISIBLE_TABS=TABS.map((t,i)=>({t,i})).filter(x=>!HIDDEN_TAB_INDEXES.includes(x.i));
 
-  const switchTab = (i) => { setTab(i); playSound("tab"); };
+  const switchTab = (i) => { setTab(i); playSound("tab"); media.playForTab(i); };
 
   // C-2: persist start timestamp so reload can restore elapsed time
   const startStudy = useCallback(async ()=>{
@@ -3992,14 +4436,37 @@ function App() {
     alert(`✅ Import thành công: ${Object.keys(importedDb).length} ngày dữ liệu.`);
   }, []);
 
+  const mediaBg = media.settings?.background;
+  const mediaBgOpacity = media.settings?.backgroundOpacity ?? 40;
+  const currentTabHeaderImg = media.settings?.headers?.[tab];
+
   return (
     <ThemeContext.Provider value={theme}>
     <AccentContext.Provider value={accent}>
-    <div style={{background:theme.bg,minHeight:"100vh",fontFamily:"system-ui,sans-serif",color:theme.text,maxWidth:480,margin:"0 auto",paddingBottom:"calc(80px + env(safe-area-inset-bottom, 0px))",transition:"background 0.3s ease,color 0.3s ease"}}>
+    <MediaContext.Provider value={media}>
+    <div style={{position:"relative",background:theme.bg,minHeight:"100vh",fontFamily:"system-ui,sans-serif",color:theme.text,maxWidth:480,margin:"0 auto",paddingBottom:"calc(80px + env(safe-area-inset-bottom, 0px))",transition:"background 0.3s ease,color 0.3s ease"}}>
+      {/* Ảnh nền toàn app — lớp cố định phía sau mọi nội dung, độ mờ chỉnh qua Media Settings */}
+      {mediaBg && (
+        <div style={{
+          position:"absolute",inset:0,zIndex:0,pointerEvents:"none",
+          backgroundImage:`url(${mediaBg})`,backgroundSize:"cover",backgroundPosition:"center",
+          backgroundAttachment:"fixed",
+          opacity:mediaBgOpacity/100,
+        }}/>
+      )}
+      <div style={{position:"relative",zIndex:1}}>
+      {/* Ảnh header riêng theo tab hiện tại */}
+      {currentTabHeaderImg && (
+        <div style={{
+          height:90,backgroundImage:`url(${currentTabHeaderImg})`,backgroundSize:"cover",backgroundPosition:"center",
+          borderRadius:"0 0 18px 18px",marginBottom:-18,
+        }}/>
+      )}
       <Hdr lv={lv} rt={rt} todayE={todayE} todayRank={todayRank} str={str} txp={txp}
            quoteToday={quoteToday} setts={setts} saveSetts={saveSetts} challenge={challenge} chalDone={chalDone}
            backupDoneToday={backupDoneToday} justLeveledUp={justLeveledUp}
-           themeKey={themeKey} themeMenuOpen={themeMenuOpen} setThemeMenuOpen={setThemeMenuOpen} chooseTheme={chooseTheme}/>
+           themeKey={themeKey} themeMenuOpen={themeMenuOpen} setThemeMenuOpen={setThemeMenuOpen} chooseTheme={chooseTheme}
+           mediaModalOpen={mediaModalOpen} setMediaModalOpen={setMediaModalOpen}/>
       {/* Pill Tab Bar */}
       <div style={{position:"sticky",top:0,zIndex:10,background:theme.surfaceAlt,borderBottom:`1px solid ${theme.border}`,display:"flex",overflowX:"auto",WebkitOverflowScrolling:"touch",scrollbarWidth:"none",padding:"8px 10px",gap:6}}>
         {VISIBLE_TABS.map(({t,i})=>{
@@ -4159,14 +4626,19 @@ function App() {
           </div>
         </ModalPortal>
       )}
+      </div>
+      <AudioPlayer/>
+      {mediaModalOpen && <MediaSettingsModal onClose={()=>setMediaModalOpen(false)}/>}
     </div>
+    </MediaContext.Provider>
     </AccentContext.Provider>
     </ThemeContext.Provider>
   );
 }
 
 // ── HEADER ─────────────────────────────────────────────────────────────────
-function Hdr({lv,rt,todayE,todayRank,str,txp,quoteToday,setts,saveSetts,challenge,chalDone,backupDoneToday,justLeveledUp,themeKey,themeMenuOpen,setThemeMenuOpen,chooseTheme}) {
+function Hdr({lv,rt,todayE,todayRank,str,txp,quoteToday,setts,saveSetts,challenge,chalDone,backupDoneToday,justLeveledUp,themeKey,themeMenuOpen,setThemeMenuOpen,chooseTheme,mediaModalOpen,setMediaModalOpen}) {
+  const media = useContext(MediaContext);
   const accent = useContext(AccentContext);
   const theme = useContext(ThemeContext);
   const [showQ,setShowQ]=useState(false);
@@ -4254,8 +4726,15 @@ function Hdr({lv,rt,todayE,todayRank,str,txp,quoteToday,setts,saveSetts,challeng
                 </div>
               )}
             </div>
+            {/* ── Media Settings trigger (⋮) ── */}
+            <button onClick={()=>setMediaModalOpen(p=>!p)} title="Media Settings"
+              style={{background:"none",border:"none",cursor:"pointer",fontSize:13,padding:0,lineHeight:1,marginBottom:2,color:theme.textDim}}>
+              ⋮
+            </button>
           </div>
-          <div style={{fontSize:17,fontWeight:700,color:theme.text}}>Gia Bảo's Dashboard</div>
+          {media?.settings?.logo
+            ? <img src={media.settings.logo} alt="logo" style={{maxHeight:28,maxWidth:180,objectFit:"contain"}}/>
+            : <div style={{fontSize:17,fontWeight:700,color:theme.text}}>Gia Bảo's Dashboard</div>}
           <div className={justLeveledUp?"gb-level-glow":""} style={{
             display:"inline-flex",alignItems:"center",gap:4,
             background:`${accent}18`,
@@ -7467,12 +7946,13 @@ function DistrHistory({distractions,onUpdate}) {
 // ── RESET MODAL ────────────────────────────────────────────────────────────
 function ResetModal({onClose,onConfirm}) {
   const theme = useContext(ThemeContext);
+  const media = useContext(MediaContext);
   const [input,setInput]=useState("");
   const KEYWORD="RESET ALL DATA";
   return (
     <ModalPortal>
     <div className="gb-modal-backdrop-fade" style={{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,.9)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-      <div className="gb-modal-fade-scale" style={{background:theme.surface,border:`2px solid ${theme.danger}`,borderRadius:12,padding:26,width:"100%",maxWidth:320}}>
+      <div className="gb-modal-fade-scale" style={{...modalBgStyle(theme, media?.settings?.modalBg),border:`2px solid ${theme.danger}`,borderRadius:12,padding:26,width:"100%",maxWidth:320}}>
         <div style={{fontSize:14,fontWeight:800,color:theme.danger,marginBottom:8}}>⚠️ Xoá toàn bộ dữ liệu</div>
         <div style={{fontSize:11,color:theme.textDim,lineHeight:1.7,marginBottom:12}}>
           Hành động này sẽ xoá <b style={{color:theme.text}}>tất cả</b> dữ liệu — ngày, task, ghi chú, boss, timeline, capsule... Không thể hoàn tác.
@@ -7501,6 +7981,7 @@ function ResetModal({onClose,onConfirm}) {
 // ── WEEKLY REVIEW MODAL ─────────────────────────────────────────────────────
 function WeeklyReviewModal({weekStart,db,dayExp,targetXP,review,onSave,onClose}) {
   const theme = useContext(ThemeContext);
+  const media = useContext(MediaContext);
   const dates = weekDates(weekStart);
   const weekEnd = dates[6];
   const days = dates.map(iso=>({iso, d: db[iso]||null}));
@@ -7588,7 +8069,7 @@ function WeeklyReviewModal({weekStart,db,dayExp,targetXP,review,onSave,onClose})
   return (
     <ModalPortal>
     <div className="gb-modal-backdrop-fade" style={{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,.9)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-      <div className="gb-modal-fade-scale" style={{background:theme.surface,border:`2px solid ${theme.accent}`,borderRadius:12,padding:20,width:"100%",maxWidth:420,maxHeight:"88vh",overflowY:"auto",boxSizing:"border-box"}}>
+      <div className="gb-modal-fade-scale" style={{...modalBgStyle(theme, media?.settings?.modalBg),border:`2px solid ${theme.accent}`,borderRadius:12,padding:20,width:"100%",maxWidth:420,maxHeight:"88vh",overflowY:"auto",boxSizing:"border-box"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
           <div style={{fontSize:14,fontWeight:800,color:theme.accent}}>📅 Weekly Review</div>
           <button onClick={onClose} style={{background:"none",border:"none",color:theme.textDim,cursor:"pointer",fontSize:18}}>×</button>
@@ -8598,6 +9079,7 @@ function LineChart30({title, data, color, maxVal, unit, emptyLabel=""}) {
 // ── POMODORO ───────────────────────────────────────────────────────────────
 function PomodoroModal({onClose,onDone,pomSetts={},savePomSetts}) {
   const theme = useContext(ThemeContext);
+  const media = useContext(MediaContext);
   const [showPlaylistEdit,setShowPlaylistEdit]=useState(false);
   const DURS=[{l:"25 phút",s:1500},{l:"50 phút",s:3000},{l:"10 phút",s:600}];
   const [di,setDi]=useState(0); const [secs,setSecs]=useState(1500);
@@ -8627,7 +9109,7 @@ function PomodoroModal({onClose,onDone,pomSetts={},savePomSetts}) {
   return(
     <ModalPortal>
     <div className="gb-modal-backdrop-fade" style={{position:"fixed",inset:0,zIndex:100,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-      <div className="gb-modal-fade-scale" style={{background:theme.surface,border:`1px solid ${theme.border}`,borderRadius:12,padding:26,width:"100%",maxWidth:340}}>
+      <div className="gb-modal-fade-scale" style={{...modalBgStyle(theme, media?.settings?.modalBg),border:`1px solid ${theme.border}`,borderRadius:12,padding:26,width:"100%",maxWidth:340}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
           <div style={{fontSize:14,fontWeight:700}}>🍅 Pomodoro</div>
           <button onClick={onClose} style={{background:"none",border:"none",color:theme.textDim,fontSize:20,cursor:"pointer"}}>×</button>
@@ -9788,7 +10270,7 @@ function HanhTrinh({capsuleNotif,setCapsuleNotif,db,str,txp}) {
       try{const r=await S.get("capsules");if(r){
         const caps=JSON.parse(r); setCapsules(caps);
         const due=caps.find(c=>!c.opened&&c.openDate<=today);
-        if(due) setCapsuleNotif(due);
+        if(due) { setCapsuleNotif(due); playEventMusic("capsule"); }
       }}catch{}
     })();
   },[]);
@@ -9956,6 +10438,7 @@ function BossFight({db,save,td,setts={}}) {
     setHitFx(h=>h+1);
     if(newHp===0){
       playSound("bosswin");
+      playEventMusic("bosswin");
       const defeated={...boss,hp:0,defeatedAt:Date.now()};
       saveHist([defeated,...history]);
       saveBoss(null);
