@@ -12120,9 +12120,91 @@ function CorrelationLab({db,dayExp}) {
 }
 
 
+// ── GLOBAL ERROR BOUNDARY ────────────────────────────────────────────────
+// Bọc toàn bộ App: nếu bất kỳ chỗ nào trong app throw lỗi lúc render,
+// thay vì đơ trắng/im lặng, hiện màn hình báo lỗi + nút thử lại / tải lại.
+// Dữ liệu vẫn nằm nguyên trong localStorage, không mất gì khi tải lại.
+class GlobalErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, info) {
+    try { console.error("[GiaBaoDashboard] crashed:", error, info); } catch {}
+  }
+
+  handleRetry = () => {
+    this.setState({ hasError: false, error: null });
+  };
+
+  handleReload = () => {
+    window.location.reload();
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{
+          minHeight: "100vh",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 14,
+          padding: 24,
+          background: "#14110F",
+          color: "#E8DFD0",
+          fontFamily: "sans-serif",
+          textAlign: "center",
+        }}>
+          <div style={{ fontSize: 32 }}>⚠️</div>
+          <div style={{ fontSize: 15, fontWeight: 700 }}>App gặp lỗi và không thể tiếp tục hiển thị</div>
+          <div style={{ fontSize: 12, color: "#8A7E6C", maxWidth: 320 }}>
+            Dữ liệu của mày vẫn còn nguyên (lưu trong máy). Thử "Thử lại" trước, nếu không được thì "Tải lại trang".
+          </div>
+          {this.state.error && (
+            <div style={{
+              fontSize: 10, color: "#8A7E6C", maxWidth: 320, wordBreak: "break-word",
+              background: "#1C1814", padding: 10, borderRadius: 8, textAlign: "left",
+            }}>
+              {String(this.state.error && this.state.error.message || this.state.error)}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
+            <button
+              onClick={this.handleRetry}
+              style={{
+                padding: "8px 16px", borderRadius: 999, border: "1px solid #C9A227",
+                background: "transparent", color: "#C9A227", fontSize: 13, cursor: "pointer",
+              }}
+            >
+              Thử lại
+            </button>
+            <button
+              onClick={this.handleReload}
+              style={{
+                padding: "8px 16px", borderRadius: 999, border: "none",
+                background: "#C9A227", color: "#14110F", fontSize: 13, fontWeight: 700, cursor: "pointer",
+              }}
+            >
+              Tải lại trang
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 const rootEl = document.getElementById("root");
 const root = ReactDOM.createRoot(rootEl);
-root.render(<App />);
+root.render(<GlobalErrorBoundary><App /></GlobalErrorBoundary>);
 </script>
 </body>
 </html>
