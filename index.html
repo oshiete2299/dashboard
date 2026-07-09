@@ -2679,26 +2679,39 @@ let _gbEventAudioRef = null;
 // playEventMusic: phát nhạc theo sự kiện (level up / boss win / capsule) —
 // module-level như playSound() để các component sâu trong cây (Hdr,
 // BossFight, HanhTrinh) gọi được mà không cần prop drilling MediaContext.
-const playEventMusic = (eventName) => {
+const playEventMusic = async (eventName) => {
   const data = _gbMediaSettingsRef?.eventMusic?.[eventName];
   if (!data) return;
+  const url = resolveMediaUrl(data);
   try {
     if (_gbEventAudioRef) _gbEventAudioRef.pause();
-    const audio = new Audio(data);
+    // Fetch-as-blob trước để né CORS, giống BGM/SFX; fallback về URL gốc nếu
+    // fetch lỗi (fetchAsBlobUrl trả data: nguyên vẹn ngay cho Base64).
+    const { blobUrl } = await fetchAsBlobUrl(url);
+    const audio = new Audio(blobUrl || url);
     audio.loop = false;
     audio.volume = (_gbMediaSettingsRef?.muted ? 0 : (_gbMediaSettingsRef?.volume?.bgm ?? 30)) / 100;
     audio.play().catch(()=>{});
+    if (blobUrl && blobUrl.startsWith("blob:")) {
+      audio.onended = () => { try { URL.revokeObjectURL(blobUrl); } catch {} };
+    }
     _gbEventAudioRef = audio;
   } catch {}
 };
-const playSound = name => {
+const playSound = async name => {
   if (!_gbSoundOn) return;
   const custom = _gbMediaSettingsRef?.sfx?.[name];
   if (custom) {
+    const url = resolveMediaUrl(custom);
     try {
-      const a = new Audio(custom);
+      // Fetch-as-blob trước để né CORS, đồng bộ với useMediaSettings.playSFX.
+      const { blobUrl } = await fetchAsBlobUrl(url);
+      const a = new Audio(blobUrl || url);
       a.volume = (_gbMediaSettingsRef?.volume?.sfx ?? 50) / 100;
       a.play().catch(()=>{});
+      if (blobUrl && blobUrl.startsWith("blob:")) {
+        a.onended = () => { try { URL.revokeObjectURL(blobUrl); } catch {} };
+      }
       return;
     } catch {}
   }
@@ -3265,6 +3278,185 @@ function ModalPortal({children}) {
 // ── MEDIA SYSTEM (ảnh + nhạc) ────────────────────────────────────────────
 const MEDIA_KEY = "v30:mediaSettings";
 const SFX_NAMES = ["tick","xp","levelup","bosshit","bosswin","coin"];
+
+// Nhận vào Base64 (data:...) hoặc URL thường (http/https), tự nhận diện link
+// Google Drive dạng chia sẻ (…/file/d/FILE_ID/view hoặc ?id=FILE_ID) và đổi
+// sang direct-download link để trình duyệt phát trực tiếp được. Base64 và
+// các URL khác được trả về nguyên vẹn.
+function resolveMediaUrl(input) {
+  if (!input) return input;
+  const s = input.trim();
+  if (s.startsWith("data:")) return s; // Base64 — không đụng vào
+  if (!/^https?:\/\//i.test(s)) return s; // không phải URL hợp lệ, để nguyên (sẽ báo lỗi khi phát)
+
+  // Các dạng link Google Drive hay gặp:
+  //   https://drive.google.com/file/d/FILE_ID/view?usp=sharing
+  //   https://drive.google.com/open?id=FILE_ID
+  //   https://drive.google.com/uc?id=FILE_ID&export=download
+  const driveMatch = s.match(/drive\.google\.com\/file\/d\/([^/]+)/) || s.match(/[?&]id=([^&]+)/);
+  if (s.includes("drive.google.com") && driveMatch) {
+    const fileId = driveMatch[1];
+    return `https://drive.google.com/uc?export=download&id=${fileId}`;
+  }
+  return s;
+}
+
+// Kiểm tra nhanh 1 URL/Base64 có "trông giống" hợp lệ để phát không — dùng
+// để hiện cảnh báo sớm trong UI trước khi người dùng bấm Test.
+function isLikelyPlayableMedia(input) {
+  if (!input) return true; // rỗng thì không cảnh báo gì cả
+  const s = input.trim();
+  return s.startsWith("data:") || /^https?:\/\//i.test(s);
+}
+
+// ── FETCH-AS-BLOB HELPER (chống CORS cho link nhạc/SFX ngoài) ───────────────
+// Base64 (data:...) không cần fetch — trả về nguyên vẹn ngay.
+// Với URL http/https, thử lần lượt theo thứ tự:
+//   1. fetch() trực tiếp tới URL gốc
+//   2. fetch() qua proxy corsproxy.io (nếu bước 1 bị CORS/network chặn)
+//   3. fetch() qua proxy api.allorigins.win/raw (nếu bước 2 cũng fail)
+// Dừng ngay khi 1 bước thành công. Nếu cả 3 đều fail — trả về
+// { blobUrl: null, error } để caller fallback sang new Audio(url) thẳng (vẫn
+// có thể ăn với link localhost/same-origin hoặc host cho audio-tag trực tiếp
+// dù chặn fetch).
+//
+// LƯU Ý QUAN TRỌNG VỀ PROXY: corsproxy.io và allorigins.win là dịch vụ công
+// khai miễn phí của bên thứ ba — không do Anthropic hay em kiểm soát. File
+// nhạc sẽ đi qua server của họ trước khi tới trình duyệt. Rủi ro thực tế:
+// có thể sập/đổi API/giới hạn băng thông bất kỳ lúc nào không báo trước,
+// không có SLA. Đây là fallback "chữa cháy" cho trường hợp host gốc chặn
+// CORS hẳn (như Catbox/Pomf2 nhiều lúc chặn cả fetch), không phải giải pháp
+// nên phụ thuộc lâu dài. Cân nhắc: nếu có server riêng, tự làm 1 proxy nhỏ
+// (Cloudflare Worker chẳng hạn) sẽ ổn định hơn nhiều.
+//
+// KHÔNG set header "User-Agent" — trình duyệt luôn tự chặn ghi đè header
+// này vì lý do bảo mật (forbidden header); gửi lên sẽ bị bỏ qua hoặc gây lỗi
+// CORS preflight. Header "Accept" vẫn set được và vô hại.
+const FETCH_TIMEOUT_MS = 12000;
+
+const CORS_PROXIES = [
+  (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+];
+
+// 1 lần thử fetch (dùng chung cho cả URL gốc lẫn URL đã bọc proxy).
+async function tryFetchBlob(fetchUrl, onProgress) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(fetchUrl, {
+      signal: controller.signal,
+      headers: { "Accept": "audio/*,*/*;q=0.8" },
+      mode: "cors",
+    });
+    clearTimeout(timer);
+    if (!res.ok) return { blobUrl: null, error: `http-${res.status}` };
+
+    // Đọc theo stream để báo % tiến độ (nếu server trả Content-Length).
+    const total = Number(res.headers.get("content-length")) || 0;
+    if (!res.body || !total) {
+      const blob = await res.blob();
+      onProgress && onProgress(100);
+      return { blobUrl: URL.createObjectURL(blob), error: null };
+    }
+    const reader = res.body.getReader();
+    let received = 0;
+    const chunks = [];
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      onProgress && onProgress(Math.min(99, Math.round((received / total) * 100)));
+    }
+    onProgress && onProgress(100);
+    const blob = new Blob(chunks);
+    return { blobUrl: URL.createObjectURL(blob), error: null };
+  } catch (err) {
+    clearTimeout(timer);
+    if (err && err.name === "AbortError") return { blobUrl: null, error: "timeout" };
+    return { blobUrl: null, error: "cors-or-network" };
+  }
+}
+
+// onStageChange(stageLabel) — optional callback để UI hiện "Đang thử qua
+// proxy..." khác với "Đang tải nhạc..." lúc thử URL gốc.
+async function fetchAsBlobUrl(url, onProgress, onStageChange) {
+  if (!url) return { blobUrl: null, error: "empty" };
+  const trimmed = url.trim();
+  if (trimmed.startsWith("data:")) return { blobUrl: trimmed, error: null, isBase64: true };
+  if (!/^https?:\/\//i.test(trimmed)) return { blobUrl: null, error: "invalid-url" };
+
+  // Bước 1: thử URL gốc trực tiếp.
+  onStageChange && onStageChange("direct");
+  let result = await tryFetchBlob(trimmed, onProgress);
+  if (result.blobUrl) return { ...result, viaProxy: false };
+
+  // Bước 2/3: lần lượt thử qua từng proxy nếu bước trước fail vì CORS/network
+  // (không thử proxy nếu lỗi là 404/403 — link chắc chắn sai, proxy không
+  // giúp được).
+  if (result.error === "cors-or-network" || result.error === "timeout") {
+    for (let i = 0; i < CORS_PROXIES.length; i++) {
+      onStageChange && onStageChange(`proxy-${i + 1}`);
+      const proxyUrl = CORS_PROXIES[i](trimmed);
+      const proxyResult = await tryFetchBlob(proxyUrl, onProgress);
+      if (proxyResult.blobUrl) return { ...proxyResult, viaProxy: true, proxyIndex: i };
+      result = proxyResult; // giữ lỗi gần nhất để báo cho người dùng
+    }
+  }
+
+  return { ...result, viaProxy: false };
+}
+
+// Dịch mã lỗi kỹ thuật ở trên sang câu tiếng Việt dễ hiểu cho người dùng.
+function describeMediaFetchError(code, url) {
+  const isDrive = /drive\.google\.com/i.test(url || "");
+  switch (code) {
+    case "timeout":
+      return "Tải nhạc quá lâu (timeout), kể cả qua proxy dự phòng. Link có thể sai, server chậm, hoặc file quá nặng.";
+    case "http-404":
+      return "Không tìm thấy file (404). Link có thể đã bị xoá hoặc gõ sai.";
+    case "http-403":
+      return "Server từ chối truy cập (403). File có thể đã bị đặt riêng tư hoặc bị khoá.";
+    case "invalid-url":
+      return "Link không hợp lệ. Cần bắt đầu bằng http:// hoặc https://, hoặc dán Base64 (data:...).";
+    case "cors-or-network":
+      return isDrive
+        ? "Không tải được nhạc từ Google Drive (kể cả qua proxy dự phòng). Kiểm tra: file phải để chế độ chia sẻ \"Bất kỳ ai có đường liên kết\" (Anyone with the link)."
+        : "Không tải được link này — server chặn CORS, và cả 2 proxy dự phòng cũng không tải được (có thể proxy đang quá tải/sập tạm thời) hoặc mất mạng.";
+    default:
+      if (code && code.startsWith("http-")) return `Server trả lỗi ${code.replace("http-", "")}.`;
+      return "Không phát được link nhạc này. Có thể do link sai, file đã bị xoá, hoặc server chặn CORS.";
+  }
+}
+
+// ── FILE UPLOAD → BASE64 (né hoàn toàn CORS vì không có request mạng nào) ──
+// Đọc file người dùng chọn (từ máy) và convert sang data: URL (Base64) ngay
+// trong trình duyệt bằng FileReader — không cần internet, không cần proxy,
+// không có khái niệm CORS ở đây vì file đã nằm sẵn trên máy người dùng.
+// Giới hạn nhẹ để tránh làm app quá nặng / vượt giới hạn localStorage.
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8MB — đủ cho hầu hết clip nhạc/SFX ngắn
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) { reject(new Error("no-file")); return; }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      reject(new Error(`too-large:${formatBytes(file.size)}`));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result); // đã là data:...;base64,... sẵn
+    reader.onerror = () => reject(new Error("read-failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
 const defaultMediaSettings = () => ({
   logo: "",
   background: "",
@@ -3290,6 +3482,19 @@ const defaultMediaSettings = () => ({
 function useMediaSettings() {
   const [settings, setSettings] = useState(null);
   const bgmAudioRef = useRef(null);
+  // Blob URL hiện đang dùng cho BGM (nếu có) — cần revoke khi đổi bài / unmount
+  // để tránh rò rỉ bộ nhớ (mỗi blob: URL giữ nguyên data trong RAM cho tới khi
+  // revoke rõ ràng).
+  const bgmBlobUrlRef = useRef(null);
+  // Token tăng dần mỗi lần playBGM được gọi — dùng để huỷ kết quả fetch cũ nếu
+  // người dùng đổi bài / bấm Test liên tục trước khi fetch trước xong.
+  const bgmLoadTokenRef = useRef(0);
+  // Thông báo lỗi phát nhạc gần nhất (vd link Drive chưa public, CORS...).
+  // Modal đọc giá trị này để hiện hướng dẫn cho người dùng.
+  const [playbackError, setPlaybackError] = useState(null);
+  // Trạng thái tải nhạc: { loading, progress (0-100), url, name } — dùng để
+  // hiện "⏳ Đang tải nhạc..." + thanh progress trong Modal.
+  const [bgmLoadState, setBgmLoadState] = useState({ loading: false, progress: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -3327,24 +3532,102 @@ function useMediaSettings() {
     return (settings?.volume?.[kind] ?? (kind === "bgm" ? 30 : 50)) / 100;
   }, [settings]);
 
-  // Phát BGM chính (hoặc bài trong playlist nếu trackIndex hợp lệ)
-  const playBGM = useCallback((data, name) => {
+  // Phát BGM chính (hoặc bài trong playlist nếu trackIndex hợp lệ).
+  // Chấp nhận cả URL (http/https) lẫn Base64 (data:...). Với URL Google
+  // Drive dạng chia sẻ, tự đổi sang direct-download link qua resolveMediaUrl.
+  //
+  // Cơ chế: fetch() trước để tải về dạng blob rồi mới phát (né CORS của
+  // <audio src="URL"> trên nhiều host). Nếu URL gốc bị chặn CORS/network,
+  // fetchAsBlobUrl tự thử lần lượt qua 2 proxy dự phòng (corsproxy.io,
+  // allorigins.win) trước khi báo lỗi. Nếu tất cả đều fail, fallback cuối
+  // cùng là new Audio(url) thẳng (vẫn ăn với link localhost/same-origin).
+  const playBGM = useCallback(async (data, name) => {
     if (!data) return;
-    try {
-      if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
-      const audio = new Audio(data);
-      audio.loop = true;
-      audio.volume = resolveVolume("bgm");
-      audio.play().catch(()=>{});
-      bgmAudioRef.current = audio;
-      save(s => ({ ...s, isPlaying: true, bgmName: name ?? s.bgmName }));
-    } catch {}
+    setPlaybackError(null);
+    const url = resolveMediaUrl(data);
+    const myToken = ++bgmLoadTokenRef.current;
+
+    // Dọn audio + blob URL cũ trước khi tải bài mới.
+    if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
+    if (bgmBlobUrlRef.current) { try { URL.revokeObjectURL(bgmBlobUrlRef.current); } catch {} bgmBlobUrlRef.current = null; }
+
+    setBgmLoadState({ loading: true, progress: 0, url, name, stage: "direct" });
+
+    const startPlayback = (playUrl, viaBlobUrl, fetchError) => {
+      if (myToken !== bgmLoadTokenRef.current) return; // đã bị huỷ bởi 1 lần gọi playBGM mới hơn
+      try {
+        const audio = new Audio(playUrl);
+        audio.loop = true;
+        audio.volume = resolveVolume("bgm");
+        audio.onerror = () => {
+          if (myToken !== bgmLoadTokenRef.current) return;
+          setPlaybackError(describeMediaFetchError(fetchError || "cors-or-network", url));
+          setBgmLoadState({ loading: false, progress: 0 });
+          save({ isPlaying: false });
+        };
+        audio.play().then(() => {
+          if (myToken !== bgmLoadTokenRef.current) return;
+          setPlaybackError(null);
+        }).catch(() => {
+          // Autoplay bị chặn do chưa có tương tác trực tiếp — không phải lỗi
+          // link, chỉ cần bấm Play/Test lại 1 lần. Không báo lỗi ở đây.
+          if (myToken !== bgmLoadTokenRef.current) return;
+          save({ isPlaying: false });
+        });
+        bgmAudioRef.current = audio;
+        if (viaBlobUrl) bgmBlobUrlRef.current = playUrl;
+        setBgmLoadState({ loading: false, progress: 100 });
+        save(s => ({ ...s, isPlaying: true, bgmName: name ?? s.bgmName }));
+      } catch {
+        if (myToken !== bgmLoadTokenRef.current) return;
+        setPlaybackError("Link nhạc không hợp lệ.");
+        setBgmLoadState({ loading: false, progress: 0 });
+      }
+    };
+
+    const { blobUrl, error, viaProxy, proxyIndex } = await fetchAsBlobUrl(
+      url,
+      (pct) => {
+        if (myToken !== bgmLoadTokenRef.current) return;
+        setBgmLoadState(prev => ({ ...prev, loading: true, progress: pct, url, name }));
+      },
+      (stage) => {
+        if (myToken !== bgmLoadTokenRef.current) return;
+        setBgmLoadState(prev => ({ ...prev, loading: true, progress: 0, url, name, stage }));
+      }
+    );
+
+    if (myToken !== bgmLoadTokenRef.current) return; // 1 lần gọi mới hơn đã bắt đầu
+
+    if (blobUrl) {
+      startPlayback(blobUrl, true, null);
+      return;
+    }
+
+    // Fetch trực tiếp + cả 2 proxy đều fail → fallback cuối: thử phát thẳng
+    // từ URL gốc (đúng như cơ chế cũ). Nếu đây cũng lỗi, audio.onerror phía
+    // trên sẽ báo đúng mã lỗi thật (404/403/CORS/timeout) từ lần fetch cuối.
+    startPlayback(url, false, error);
   }, [resolveVolume, save]);
 
   const stopBGM = useCallback(() => {
+    bgmLoadTokenRef.current++; // huỷ mọi fetch đang chạy dở
     if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
+    if (bgmBlobUrlRef.current) { try { URL.revokeObjectURL(bgmBlobUrlRef.current); } catch {} bgmBlobUrlRef.current = null; }
+    setBgmLoadState({ loading: false, progress: 0, stage: null });
     save({ isPlaying: false });
   }, [save]);
+
+  // Thử lại: phát lại đúng bài đang bị lỗi (dùng lastAttempt trong bgmLoadState).
+  const retryBGM = useCallback(() => {
+    const { url, name } = bgmLoadState;
+    if (url) playBGM(url, name);
+  }, [bgmLoadState, playBGM]);
+
+  // Dọn blob URL khi unmount để tránh rò rỉ bộ nhớ.
+  useEffect(() => () => {
+    if (bgmBlobUrlRef.current) { try { URL.revokeObjectURL(bgmBlobUrlRef.current); } catch {} }
+  }, []);
 
   const toggleBGM = useCallback(() => {
     if (!settings) return;
@@ -3396,13 +3679,21 @@ function useMediaSettings() {
     else if (settings.bgm) playBGM(settings.bgm, settings.bgmName);
   }, [settings, playBGM]);
 
-  const playSFX = useCallback((name) => {
+  const playSFX = useCallback(async (name) => {
     const data = settings?.sfx?.[name];
     if (data) {
+      const url = resolveMediaUrl(data);
       try {
-        const audio = new Audio(data);
+        // SFX cần phát nhanh/gọn nên không có loading UI riêng — nhưng vẫn áp
+        // dụng fetch-as-blob trước để né CORS giống BGM. Base64 trả về ngay
+        // (không tốn thời gian fetch mạng).
+        const { blobUrl } = await fetchAsBlobUrl(url);
+        const audio = new Audio(blobUrl || url); // fallback: phát thẳng URL gốc nếu fetch lỗi
         audio.volume = resolveVolume("sfx");
         audio.play().catch(()=>{});
+        if (blobUrl && blobUrl.startsWith("blob:")) {
+          audio.onended = () => { try { URL.revokeObjectURL(blobUrl); } catch {} };
+        }
         return;
       } catch {}
     }
@@ -3416,10 +3707,22 @@ function useMediaSettings() {
     persist(fresh);
   }, [stopBGM, persist]);
 
-  return {
+  // BUGFIX: object trả về PHẢI được memo hoá. Trước đây đây là 1 object
+  // literal mới mỗi lần useMediaSettings() chạy lại — tức là mỗi lần App
+  // re-render (kể cả do chuyển tab, gõ chữ ở form khác, timer Pomodoro
+  // tick...) thì `media` có identity mới → MediaContext.Provider phát value
+  // mới → MỌI component dùng useContext(MediaContext) (Hdr, ResetModal,
+  // WeeklyReviewModal, PomodoroModal, AudioPlayer) bị buộc re-render theo,
+  // dù dữ liệu media không hề đổi. Với 1 app 12k dòng, hiệu ứng dây chuyền
+  // này gây đơ/đứng hình ngẫu nhiên khi thao tác nhanh (chuyển tab liên
+  // tục...). useMemo đảm bảo object chỉ đổi khi 1 trong các hàm/settings
+  // bên trong thực sự đổi identity.
+  return useMemo(() => ({
     settings, save, playBGM, stopBGM, toggleBGM, playTrackAt, nextTrack, prevTrack,
-    playForTab, playEventMusic, playSFX, resetDefaults,
-  };
+    playForTab, playEventMusic, playSFX, resetDefaults, playbackError, retryBGM, bgmLoadState,
+    clearPlaybackError: () => setPlaybackError(null),
+  }), [settings, save, playBGM, stopBGM, toggleBGM, playTrackAt, nextTrack, prevTrack,
+      playForTab, playEventMusic, playSFX, resetDefaults, playbackError, retryBGM, bgmLoadState]);
 }
 // eventAudioRef bên trong hook không còn dùng (đã chuyển playEventMusic ra
 // module-level để component sâu trong cây gọi được), giữ playEventMusic
@@ -3437,13 +3740,57 @@ function modalBgStyle(theme, modalBg) {
   };
 }
 
-function MediaField({label, value, placeholder, onChange, rows=2, theme, extra}) {
+// Nút "📁 Tải file lên" dùng chung: mở file picker hệ thống, đọc file đã
+// chọn thành Base64 (không qua mạng → không CORS), rồi gọi onLoaded(dataUrl,
+// fileName). accept mặc định giới hạn theo audio, có thể override cho ảnh.
+function FileUploadButton({ onLoaded, accept = "audio/*", theme, accent, label = "📁 Tải file lên" }) {
+  const inputRef = useRef(null);
+  const [state, setState] = useState({ loading: false, error: null });
+
+  const handleChange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // cho phép chọn lại đúng file đó lần sau nếu cần
+    if (!file) return;
+    setState({ loading: true, error: null });
+    try {
+      const dataUrl = await readFileAsBase64(file);
+      setState({ loading: false, error: null });
+      onLoaded(dataUrl, file.name);
+    } catch (err) {
+      const msg = String(err && err.message || "");
+      let text = "Không đọc được file. Thử lại hoặc chọn file khác.";
+      if (msg.startsWith("too-large:")) {
+        text = `File quá nặng (${msg.split(":")[1]}). Giới hạn ${formatBytes(MAX_UPLOAD_BYTES)} mỗi mục.`;
+      }
+      setState({ loading: false, error: text });
+    }
+  };
+
+  return (
+    <div style={{display:"inline-flex",flexDirection:"column",gap:3}}>
+      <input ref={inputRef} type="file" accept={accept} onChange={handleChange} style={{display:"none"}}/>
+      <button type="button" onClick={()=>inputRef.current && inputRef.current.click()} disabled={state.loading}
+        style={{padding:"4px 10px",borderRadius:6,border:`1px solid ${theme.border}`,background:"transparent",color:accent,fontSize:10,cursor:state.loading?"default":"pointer",whiteSpace:"nowrap"}}>
+        {state.loading ? "⏳ Đang đọc..." : label}
+      </button>
+      {state.error && <div style={{fontSize:9,color:theme.danger,maxWidth:160,lineHeight:1.4}}>{state.error}</div>}
+    </div>
+  );
+}
+
+function MediaField({label, value, placeholder, onChange, rows=2, theme, extra, accent, onFileLoaded, uploadAccept}) {
   return (
     <div style={{marginBottom:6}}>
-      <div style={{fontSize:10,color:theme.textDim,marginBottom:3}}>{label}</div>
-      <textarea value={value||""} onChange={e=>onChange(e.target.value)}
-        placeholder={placeholder} rows={rows}
-        style={{width:"100%",boxSizing:"border-box",fontSize:10,padding:6,borderRadius:8,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"vertical",fontFamily:"monospace"}}/>
+      {label && <div style={{fontSize:10,color:theme.textDim,marginBottom:3}}>{label}</div>}
+      <div style={{display:"flex",gap:6,alignItems:"flex-start"}}>
+        <textarea value={value||""} onChange={e=>onChange(e.target.value)}
+          placeholder={placeholder} rows={rows}
+          style={{flex:1,minWidth:0,boxSizing:"border-box",fontSize:10,padding:6,borderRadius:8,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"vertical",fontFamily:"monospace"}}/>
+        {onFileLoaded && (
+          <FileUploadButton theme={theme} accent={accent} accept={uploadAccept}
+            onLoaded={(dataUrl, fileName)=>onFileLoaded(dataUrl, fileName)}/>
+        )}
+      </div>
       {extra}
     </div>
   );
@@ -3473,16 +3820,18 @@ function MediaSettingsModal({onClose}) {
         {/* Logo */}
         <div style={sectionStyle}>
           <div style={titleStyle}>🖼️ Logo</div>
-          <MediaField theme={theme} value={s.logo} placeholder="Dán Base64 logo..."
+          <MediaField theme={theme} accent={accent} value={s.logo} placeholder="Dán Base64 logo..."
             onChange={v=>save({logo:v})}
+            uploadAccept="image/*" onFileLoaded={(dataUrl)=>save({logo:dataUrl})}
             extra={s.logo ? <img src={s.logo} alt="logo" style={{maxHeight:50,marginTop:6,borderRadius:8,display:"block"}}/> : null}/>
         </div>
 
         {/* Ảnh nền toàn app */}
         <div style={sectionStyle}>
           <div style={titleStyle}>🖼️ Ảnh nền toàn app</div>
-          <MediaField theme={theme} value={s.background} placeholder="Dán Base64 ảnh nền..."
-            onChange={v=>save({background:v})}/>
+          <MediaField theme={theme} accent={accent} value={s.background} placeholder="Dán Base64 ảnh nền..."
+            onChange={v=>save({background:v})}
+            uploadAccept="image/*" onFileLoaded={(dataUrl)=>save({background:dataUrl})}/>
           <div style={{display:"flex",alignItems:"center",gap:8,marginTop:4}}>
             <span style={{fontSize:10,color:theme.textDim}}>Độ mờ:</span>
             <input type="range" min={0} max={80} value={s.backgroundOpacity}
@@ -3495,32 +3844,84 @@ function MediaSettingsModal({onClose}) {
         <div style={sectionStyle}>
           <div style={titleStyle}>🖼️ Ảnh header theo tab</div>
           {TABS.map((name,i)=>(
-            <MediaField key={i} theme={theme} rows={1} value={s.headers?.[i]}
+            <MediaField key={i} theme={theme} accent={accent} rows={1} value={s.headers?.[i]}
               label={name} placeholder={`Base64 header cho ${name}...`}
-              onChange={v=>save(prev=>({...prev,headers:{...prev.headers,[i]:v}}))}/>
+              onChange={v=>save(prev=>({...prev,headers:{...prev.headers,[i]:v}}))}
+              uploadAccept="image/*" onFileLoaded={(dataUrl)=>save(prev=>({...prev,headers:{...prev.headers,[i]:dataUrl}}))}/>
           ))}
         </div>
 
         {/* Ảnh nền modal */}
         <div style={sectionStyle}>
           <div style={titleStyle}>🖼️ Ảnh nền modal (Pomodoro / Reset / Weekly Review)</div>
-          <MediaField theme={theme} value={s.modalBg} placeholder="Dán Base64 ảnh nền modal..."
-            onChange={v=>save({modalBg:v})}/>
+          <MediaField theme={theme} accent={accent} value={s.modalBg} placeholder="Dán Base64 ảnh nền modal..."
+            onChange={v=>save({modalBg:v})}
+            uploadAccept="image/*" onFileLoaded={(dataUrl)=>save({modalBg:dataUrl})}/>
         </div>
 
         {/* Nhạc nền */}
         <div style={sectionStyle}>
-          <div style={titleStyle}>🎵 Nhạc nền (BGM)</div>
-          <MediaField theme={theme} value={s.bgm} placeholder="Dán Base64 bài nhạc..."
-            onChange={v=>save({bgm:v})}/>
+          <div style={titleStyle}>
+            🎵 Nhạc nền (BGM)
+            <span title={'Hỗ trợ: link từ hosting (Pomf2, Catbox, Pixabay...), Google Drive, hoặc Base64'}
+              style={{marginLeft:6,fontSize:10,color:theme.textDim,cursor:"help",fontWeight:400}}>ⓘ</span>
+          </div>
+          <MediaField theme={theme} accent={accent} value={s.bgm} placeholder="Dán link nhạc trực tiếp (.mp3, .ogg...) hoặc Base64"
+            onChange={v=>save({bgm:v})}
+            onFileLoaded={(dataUrl, fileName)=>save(prev=>({...prev, bgm:dataUrl, bgmName: prev.bgmName || fileName}))}/>
           <input value={s.bgmName||""} onChange={e=>save({bgmName:e.target.value})}
             placeholder="Tên bài hát..."
             style={{width:"100%",boxSizing:"border-box",fontSize:11,padding:6,borderRadius:8,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,marginTop:4}}/>
-          <div style={{display:"flex",gap:6,marginTop:6}}>
-            <button onClick={()=>playBGM(s.bgm, s.bgmName)} disabled={!s.bgm}
-              style={{padding:"5px 14px",borderRadius:999,border:"none",background:theme.success,color:"#000",fontSize:10,fontWeight:600,cursor:s.bgm?"pointer":"not-allowed",opacity:s.bgm?1:0.5}}>▶ Test</button>
+
+          <div style={{display:"flex",gap:6,marginTop:6,flexWrap:"wrap"}}>
+            <button onClick={()=>playBGM(s.bgm, s.bgmName)} disabled={!s.bgm || media.bgmLoadState?.loading}
+              style={{padding:"5px 14px",borderRadius:999,border:"none",background:theme.success,color:"#000",fontSize:10,fontWeight:600,cursor:(s.bgm && !media.bgmLoadState?.loading)?"pointer":"not-allowed",opacity:(s.bgm && !media.bgmLoadState?.loading)?1:0.5}}>▶ Test</button>
             <button onClick={stopBGM}
               style={{padding:"5px 14px",borderRadius:999,border:`1px solid ${theme.border}`,background:"transparent",color:theme.textDim,fontSize:10,cursor:"pointer"}}>⏹ Dừng</button>
+            {s.bgm && /^https?:\/\//i.test(s.bgm.trim()) && (
+              <button onClick={()=>window.open(s.bgm.trim(), "_blank", "noopener,noreferrer")}
+                style={{padding:"5px 14px",borderRadius:999,border:`1px solid ${theme.border}`,background:"transparent",color:theme.textDim,fontSize:10,cursor:"pointer"}}>
+                🔗 Mở link trong tab mới
+              </button>
+            )}
+          </div>
+
+          {/* Loading state + progress bar khi đang tải nhạc */}
+          {media.bgmLoadState?.loading && (
+            <div style={{marginTop:8}}>
+              <div style={{fontSize:10,color:theme.textDim,marginBottom:4}}>
+                {media.bgmLoadState.stage === "proxy-1" && "⏳ Link gốc bị chặn, đang thử qua proxy 1..."}
+                {media.bgmLoadState.stage === "proxy-2" && "⏳ Proxy 1 cũng lỗi, đang thử qua proxy 2..."}
+                {(!media.bgmLoadState.stage || media.bgmLoadState.stage === "direct") && "⏳ Đang tải nhạc..."}
+                {media.bgmLoadState.progress > 0 ? ` ${media.bgmLoadState.progress}%` : ""}
+              </div>
+              <div style={{width:"100%",height:5,borderRadius:999,background:`${theme.border}55`,overflow:"hidden"}}>
+                <div style={{
+                  height:"100%",
+                  width:`${Math.max(4, media.bgmLoadState.progress || 8)}%`,
+                  background:accent,
+                  borderRadius:999,
+                  transition:"width .2s ease",
+                }}/>
+              </div>
+            </div>
+          )}
+
+          {media.playbackError && (
+            <div style={{marginTop:8,padding:"8px 10px",borderRadius:8,background:`${theme.danger}18`,border:`1px solid ${theme.danger}44`}}>
+              <div style={{fontSize:10,color:theme.danger,lineHeight:1.5}}>⚠️ {media.playbackError}</div>
+              <div style={{display:"flex",gap:10,marginTop:4,flexWrap:"wrap"}}>
+                <button onClick={media.retryBGM}
+                  style={{background:"none",border:"none",color:accent,fontSize:9,cursor:"pointer",textDecoration:"underline",fontWeight:600}}>🔁 Thử lại</button>
+                <button onClick={media.clearPlaybackError}
+                  style={{background:"none",border:"none",color:theme.textDim,fontSize:9,cursor:"pointer",textDecoration:"underline"}}>Đóng thông báo</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{fontSize:9,color:theme.textDim,marginTop:6,lineHeight:1.5}}>
+            Hỗ trợ: link từ hosting (Pomf2, Catbox, Pixabay...), Google Drive (tự nhận diện, cần để chế độ chia sẻ "Bất kỳ ai có link"), hoặc Base64.
+            Nếu link gốc bị chặn CORS, app sẽ tự thử qua proxy dự phòng (corsproxy.io / allorigins.win) — các proxy này là dịch vụ miễn phí của bên thứ ba nên đôi lúc có thể chậm hoặc gián đoạn.
           </div>
         </div>
 
@@ -3528,9 +3929,10 @@ function MediaSettingsModal({onClose}) {
         <div style={sectionStyle}>
           <div style={titleStyle}>🎵 Nhạc theo tab (ghi đè BGM khi ở tab đó)</div>
           {TABS.map((name,i)=>(
-            <MediaField key={i} theme={theme} rows={1} value={s.tabMusic?.[i]}
-              label={name} placeholder={`Base64 nhạc cho ${name}...`}
-              onChange={v=>save(prev=>({...prev,tabMusic:{...prev.tabMusic,[i]:v}}))}/>
+            <MediaField key={i} theme={theme} accent={accent} rows={1} value={s.tabMusic?.[i]}
+              label={name} placeholder={`Link nhạc hoặc Base64 cho ${name}...`}
+              onChange={v=>save(prev=>({...prev,tabMusic:{...prev.tabMusic,[i]:v}}))}
+              onFileLoaded={(dataUrl)=>save(prev=>({...prev,tabMusic:{...prev.tabMusic,[i]:dataUrl}}))}/>
           ))}
         </div>
 
@@ -3538,9 +3940,10 @@ function MediaSettingsModal({onClose}) {
         <div style={sectionStyle}>
           <div style={titleStyle}>🎵 Nhạc theo sự kiện</div>
           {[["levelup","Lên cấp (Level up)"],["bosswin","Thắng Boss"],["capsule","Mở Time Capsule"]].map(([key,label])=>(
-            <MediaField key={key} theme={theme} rows={1} value={s.eventMusic?.[key]}
-              label={label} placeholder={`Base64 nhạc cho ${label}...`}
-              onChange={v=>save(prev=>({...prev,eventMusic:{...prev.eventMusic,[key]:v}}))}/>
+            <MediaField key={key} theme={theme} accent={accent} rows={1} value={s.eventMusic?.[key]}
+              label={label} placeholder={`Link nhạc hoặc Base64 cho ${label}...`}
+              onChange={v=>save(prev=>({...prev,eventMusic:{...prev.eventMusic,[key]:v}}))}
+              onFileLoaded={(dataUrl)=>save(prev=>({...prev,eventMusic:{...prev.eventMusic,[key]:dataUrl}}))}/>
           ))}
         </div>
 
@@ -3555,16 +3958,23 @@ function MediaSettingsModal({onClose}) {
                 style={{background:"none",border:"none",color:theme.danger,cursor:"pointer",fontSize:13}}>✕</button>
             </div>
           ))}
-          <div style={{display:"flex",gap:6,marginTop:6,flexWrap:"wrap"}}>
+          <div style={{display:"flex",gap:6,marginTop:6,flexWrap:"wrap",alignItems:"flex-start"}}>
             <input value={newTrackName} onChange={e=>setNewTrackName(e.target.value)} placeholder="Tên bài..."
               style={{flex:"1 1 100px",fontSize:11,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text}}/>
-            <textarea value={newTrackData} onChange={e=>setNewTrackData(e.target.value)} placeholder="Paste Base64..." rows={1}
+            <textarea value={newTrackData} onChange={e=>setNewTrackData(e.target.value)} placeholder="Link nhạc hoặc Base64..." rows={1}
               style={{flex:"2 1 140px",fontSize:10,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"none"}}/>
             <button onClick={()=>{
               if (!newTrackData) return;
               save(prev=>({...prev,playlist:[...(prev.playlist||[]),{name:newTrackName||`Bài ${(prev.playlist?.length||0)+1}`,data:newTrackData}]}));
               setNewTrackName(""); setNewTrackData("");
             }} style={{padding:"5px 14px",borderRadius:6,border:"none",background:accent,color:"#fff",fontSize:10,cursor:"pointer"}}>+ Thêm</button>
+            <FileUploadButton theme={theme} accent={accent} label="📁 Tải file & thêm vào Playlist"
+              onLoaded={(dataUrl, fileName)=>{
+                // Upload xong là thêm thẳng vào playlist luôn — không cần bấm "+ Thêm"
+                // nữa. Nếu người dùng đã gõ sẵn tên ở ô Tên bài thì ưu tiên dùng tên đó.
+                save(prev=>({...prev,playlist:[...(prev.playlist||[]),{name:newTrackName||fileName,data:dataUrl}]}));
+                setNewTrackName(""); setNewTrackData("");
+              }}/>
           </div>
         </div>
 
@@ -3576,9 +3986,11 @@ function MediaSettingsModal({onClose}) {
               <div style={{fontSize:10,color:theme.textDim,marginBottom:3}}>{name}</div>
               <div style={{display:"flex",gap:4}}>
                 <textarea value={s.sfx?.[name]||""} onChange={e=>save(prev=>({...prev,sfx:{...prev.sfx,[name]:e.target.value}}))}
-                  placeholder={`Dán Base64 cho ${name}...`} rows={1}
+                  placeholder={`Link nhạc hoặc Base64 cho ${name}...`} rows={1}
                   style={{flex:1,fontSize:10,padding:5,borderRadius:6,border:`1px solid ${theme.border}`,background:theme.bg,color:theme.text,resize:"vertical",fontFamily:"monospace"}}/>
                 <button onClick={()=>playSFX(name)} style={{padding:"4px 10px",borderRadius:6,border:"none",background:theme.success,color:"#000",fontSize:10,cursor:"pointer"}}>▶</button>
+                <FileUploadButton theme={theme} accent={accent} label="📁"
+                  onLoaded={(dataUrl)=>save(prev=>({...prev,sfx:{...prev.sfx,[name]:dataUrl}}))}/>
               </div>
             </div>
           ))}
@@ -3607,7 +4019,7 @@ function MediaSettingsModal({onClose}) {
             style={{flex:1,padding:"10px 0",borderRadius:999,border:`1px solid ${theme.border}`,background:"transparent",color:theme.textDim,fontSize:12,cursor:"pointer"}}>🔄 Đặt lại mặc định</button>
         </div>
         <div style={{fontSize:9,color:theme.textDim,marginTop:8,lineHeight:1.5}}>
-          Mọi thay đổi tự động lưu ngay khi bạn nhập. File Base64 nên vừa phải (khuyến nghị &lt;2-3MB mỗi mục) để tránh vượt giới hạn lưu trữ.
+          Mọi thay đổi tự động lưu ngay khi bạn nhập. Có thể dán link/Base64 thủ công, hoặc bấm "📁 Tải file lên" để chọn file từ máy — app tự convert sang Base64, không cần mạng nên không lo lỗi CORS. Giới hạn {formatBytes(MAX_UPLOAD_BYTES)} mỗi file để tránh vượt dung lượng lưu trữ.
         </div>
       </div>
     </div>
