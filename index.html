@@ -3589,6 +3589,12 @@ function useMediaSettings() {
   // Token tăng dần mỗi lần playBGM được gọi — dùng để huỷ kết quả fetch cũ nếu
   // người dùng đổi bài / bấm Test liên tục trước khi fetch trước xong.
   const bgmLoadTokenRef = useRef(0);
+  // [FIX reset-khi-đổi-tab] Lưu nguyên vẹn giá trị `data` (base64/URL gốc,
+  // KHÔNG phải blob URL) đang được nạp/phát — dùng để playForTab so sánh
+  // "nguồn đích có giống bài đang phát không" trước khi quyết định gọi lại
+  // playBGM. Nếu không lưu cái này, playForTab không có cách nào biết bài
+  // đang phát là gì để so sánh.
+  const currentPlayingDataRef = useRef(null);
   // Thông báo lỗi phát nhạc gần nhất (vd link Drive chưa public, CORS...).
   // Modal đọc giá trị này để hiện hướng dẫn cho người dùng.
   const [playbackError, setPlaybackError] = useState(null);
@@ -3646,6 +3652,7 @@ function useMediaSettings() {
     setPlaybackError(null);
     const url = resolveMediaUrl(data);
     const myToken = ++bgmLoadTokenRef.current;
+    currentPlayingDataRef.current = data; // giữ nguyên "data" gốc (không phải blob) để so sánh sau này
 
     // Dọn audio + blob URL cũ trước khi tải bài mới.
     if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
@@ -3661,6 +3668,7 @@ function useMediaSettings() {
         audio.volume = resolveVolume("bgm");
         audio.onerror = () => {
           if (myToken !== bgmLoadTokenRef.current) return;
+          if (currentPlayingDataRef.current === data) currentPlayingDataRef.current = null;
           setPlaybackError(describeMediaFetchError(fetchError || "cors-or-network", url));
           setBgmLoadState({ loading: false, progress: 0 });
           save({ isPlaying: false });
@@ -3680,6 +3688,7 @@ function useMediaSettings() {
         save(s => ({ ...s, isPlaying: true, bgmName: name ?? s.bgmName }));
       } catch {
         if (myToken !== bgmLoadTokenRef.current) return;
+        if (currentPlayingDataRef.current === data) currentPlayingDataRef.current = null;
         setPlaybackError("Link nhạc không hợp lệ.");
         setBgmLoadState({ loading: false, progress: 0 });
       }
@@ -3710,8 +3719,30 @@ function useMediaSettings() {
     startPlayback(url, false, error);
   }, [resolveVolume, save]);
 
+  // [MỤC 4] Khôi phục trạng thái phát khi reload trang — nếu lần trước
+  // isPlaying:true lúc đóng app, tự thử phát lại đúng bài (playlist track
+  // theo currentTrack đã lưu, hoặc bgm gốc). Chỉ chạy ĐÚNG 1 LẦN — ngay sau
+  // khi settings load xong lần đầu (autoResumeDoneRef chặn các lần chạy
+  // sau, vd khi settings đổi vì save() khác trong lúc dùng app).
+  // LƯU Ý: trình duyệt chặn autoplay có âm thanh nếu chưa có tương tác
+  // người dùng nào trên trang — audio.play() lúc đó reject, playBGM đã tự
+  // bắt lỗi này và set isPlaying:false im lặng (không báo lỗi giả), đúng
+  // hành vi cũ khi bấm Test/Play. Người dùng chỉ cần bấm Play 1 lần là chạy.
+  const autoResumeDoneRef = useRef(false);
+  useEffect(() => {
+    if (autoResumeDoneRef.current) return;
+    if (!settings) return;
+    autoResumeDoneRef.current = true;
+    if (!settings.isPlaying) return;
+    const track = settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack] : null;
+    const data = track ? track.data : settings.bgm;
+    const name = track ? track.name : settings.bgmName;
+    if (data) playBGM(data, name);
+  }, [settings, playBGM]);
+
   const stopBGM = useCallback(() => {
     bgmLoadTokenRef.current++; // huỷ mọi fetch đang chạy dở
+    currentPlayingDataRef.current = null;
     if (bgmAudioRef.current) { bgmAudioRef.current.pause(); bgmAudioRef.current = null; }
     if (bgmBlobUrlRef.current) { try { URL.revokeObjectURL(bgmBlobUrlRef.current); } catch {} bgmBlobUrlRef.current = null; }
     setBgmLoadState({ loading: false, progress: 0, stage: null });
@@ -3770,13 +3801,30 @@ function useMediaSettings() {
 
   // Nhạc theo tab: gọi từ App mỗi khi đổi tab. Nếu tab có tabMusic riêng thì
   // phát bài đó (ghi đè BGM); nếu không, quay lại BGM gốc/playlist hiện tại.
+  // [FIX] Trước đây hàm này LUÔN gọi playBGM mỗi lần đổi tab — kể cả khi
+  // nguồn nhạc đích giống hệt bài đang phát — khiến playBGM tạo lại
+  // `new Audio()` từ đầu (fetch lại blob, mất currentTime, giật 1 nhịp) mỗi
+  // lần chuyển tab. Giờ so sánh trước: nếu nguồn đích === nguồn đang phát
+  // (currentPlayingDataRef) VÀ audio hiện tại còn sống, không làm gì cả —
+  // để bgmAudioRef.current tiếp tục chạy liên tục, không gián đoạn.
   const playForTab = useCallback((tabIndex) => {
     if (!settings) return;
     const tabTrack = settings.tabMusic?.[tabIndex];
-    if (tabTrack) { playBGM(tabTrack, `Tab: ${TABS[tabIndex] || tabIndex}`); return; }
-    const track = settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack] : null;
-    if (track) playBGM(track.data, track.name);
-    else if (settings.bgm) playBGM(settings.bgm, settings.bgmName);
+    const targetData = tabTrack
+      || (settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack]?.data : null)
+      || settings.bgm;
+    const targetName = tabTrack
+      ? `Tab: ${TABS[tabIndex] || tabIndex}`
+      : (settings.currentTrack >= 0 ? settings.playlist?.[settings.currentTrack]?.name : settings.bgmName);
+
+    if (!targetData) return;
+
+    // Nguồn đích giống bài đang phát VÀ audio element vẫn còn sống → giữ
+    // nguyên, không restart.
+    if (targetData === currentPlayingDataRef.current && bgmAudioRef.current) {
+      return;
+    }
+    playBGM(targetData, targetName);
   }, [settings, playBGM]);
 
   const playSFX = useCallback(async (name) => {
