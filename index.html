@@ -3476,7 +3476,10 @@ const coverArtCache = new Map(); // key: original data/url string -> blobUrl | n
 async function fetchCoverArt(data) {
   if (!data) return null;
   if (coverArtCache.has(data)) return coverArtCache.get(data);
-  if (typeof window === "undefined" || !window.jsmediatags) return null;
+  if (typeof window === "undefined" || !window.jsmediatags) {
+    console.warn("[coverArt] jsmediatags chưa load được (CDN chặn/mạng lỗi) — dùng ảnh mặc định.");
+    return null;
+  }
 
   try {
     const url = resolveMediaUrl(data);
@@ -3485,24 +3488,28 @@ async function fetchCoverArt(data) {
     // đưa File/Blob vào jsmediatags (jsmediatags không tự né CORS được).
     let source = url;
     if (/^https?:\/\//i.test(url)) {
-      const { blobUrl } = await fetchAsBlobUrl(url);
-      if (!blobUrl) { coverArtCache.set(data, null); return null; }
+      const { blobUrl, error } = await fetchAsBlobUrl(url);
+      if (!blobUrl) {
+        console.warn("[coverArt] không tải được file để đọc tag (CORS/network):", error, url);
+        coverArtCache.set(data, null); return null;
+      }
       const blobRes = await fetch(blobUrl);
       source = await blobRes.blob();
     }
 
     const picture = await new Promise((resolve) => {
       // Timeout thủ công: 1 số file lỗi/quá lớn có thể khiến jsmediatags treo.
-      const timer = setTimeout(() => resolve(null), 8000);
+      const timer = setTimeout(() => { console.warn("[coverArt] timeout khi đọc tag (8s)."); resolve(null); }, 8000);
       try {
         window.jsmediatags.read(source, {
           onSuccess: (tag) => {
             clearTimeout(timer);
+            if (!tag?.tags?.picture) console.warn("[coverArt] file không có tag ảnh bìa (APIC) trong metadata.");
             resolve(tag?.tags?.picture || null);
           },
-          onError: () => { clearTimeout(timer); resolve(null); },
+          onError: (err) => { clearTimeout(timer); console.warn("[coverArt] jsmediatags lỗi đọc tag:", err?.type, err?.info); resolve(null); },
         });
-      } catch { clearTimeout(timer); resolve(null); }
+      } catch (e) { clearTimeout(timer); console.warn("[coverArt] exception khi gọi jsmediatags:", e); resolve(null); }
     });
 
     if (!picture || !picture.data || !picture.data.length) {
@@ -3515,7 +3522,8 @@ async function fetchCoverArt(data) {
     const blobUrl = URL.createObjectURL(blob);
     coverArtCache.set(data, blobUrl);
     return blobUrl;
-  } catch {
+  } catch (e) {
+    console.warn("[coverArt] exception tổng quát:", e);
     coverArtCache.set(data, null);
     return null;
   }
