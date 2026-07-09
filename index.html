@@ -7378,6 +7378,16 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     }
   };
 
+  // [FIX #310] stats30 dời lên TRƯỚC 2 early-return bên dưới. Lý do: hook
+  // (useMemo) không được phép gọi có điều kiện — nếu để sau "if (!today)
+  // return null" thì khi today/plannerOutput chưa sẵn sàng, useMemo này bị
+  // skip hẳn ở lần render đó → số lượng hook thay đổi giữa các lần render →
+  // chính là nguyên nhân gây lỗi React #310. stats30 chỉ phụ thuộc
+  // db/dayExp/skipListAll (không phụ thuộc today/plannerOutput/routeItems)
+  // nên dời lên đây không đổi kết quả tính toán, chỉ đổi thời điểm gọi hook
+  // để luôn chạy đều đặn mỗi render, đúng Rules of Hooks.
+  const stats30 = useMemo(() => analyzeLast30Days(db || {}, dayExp, skipListAll), [db, dayExp, skipListAll]);
+
   if (!today) return null; // Today chưa rotateDay xong lúc đầu — tránh nháy layout
   if (!plannerOutput || routeItems.length === 0) return null; // chưa có kế hoạch AI hôm nay → không hiện card rỗng
 
@@ -7395,10 +7405,6 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   const deadlineItem = routeItems.find(it => it.isDeadlineTask);
   const homeworkDone = homeworkItem ? !!scheduleDone[homeworkItem.key] : null; // null = hôm nay không có task học
   const deadlineDone = deadlineItem ? !!scheduleDone[deadlineItem.key] : null; // null = hôm nay không có deadline
-
-  // [PATCH v30] Phân tích 30 ngày qua — tính 1 lần mỗi render bằng
-  // useMemo, phụ thuộc db + skipListAll (đã tải ở effect phía trên).
-  const stats30 = useMemo(() => analyzeLast30Days(db || {}, dayExp, skipListAll), [db, dayExp, skipListAll]);
 
   return (
     <div style={{
