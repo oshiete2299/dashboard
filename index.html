@@ -1408,73 +1408,527 @@ function createPlannerStorage(S) {
 //   d) nếu tasks.length < 3 và có taskPool → bổ sung thêm task từ
 //      diversifyTasksWithPool() (hàm đã có sẵn, không viết lại) cho đủ đa
 //      dạng, ưu tiên task lâu chưa xuất hiện.
-function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, formGoalMode) {
-  if (!result || !Array.isArray(result.tasks)) return result;
-  let tasks = [...result.tasks];
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v33] Full rewrite of the enrichment layer per Bảo's new Task
+// Generator spec. STILL never touches aiPlannerCore.js — everything below
+// is a pure post-processing pass over result.tasks (Core's own tasks are
+// discarded here on purpose: item 12 of the spec says the enrichment layer
+// now owns "which tasks exist today" end to end, replacing Core's task
+// list with a deterministic table lookup). Core's ctx/trace and its own
+// generatePlan() output are still computed exactly as before by the
+// pipeline (untouched aiPlannerCore.js) — buildDayTasksV33() below just
+// ignores rawResult.tasks and builds a fresh task list, then Core's own
+// safety caps (rest day / energy<=2 / TikTok high-risk / 3-day-fail) are
+// re-applied afterward as an outer net (see applySafetyOverridesV33),
+// per Bảo's explicit instruction that Core's caps stay as a safety net on
+// top of the new spec's tables.
+// ════════════════════════════════════════════════════════════════════════
 
-  // (a) Sự kiện có deadline — chia nhỏ đều theo số ngày còn lại.
-  if (deadlinePlan && deadlinePlan.remainingHours > 0) {
-    const today = new Date(td + "T00:00:00");
-    const target = new Date(deadlinePlan.targetDate);
-    const daysLeft = Math.max(1, daysBetween(today, target));
-    const carryMin = Math.max(0, deadlinePlan.carryOverMinutes || 0);
-    const baseMin = Math.round((deadlinePlan.remainingHours * 60) / daysLeft);
-    const dur = Math.max(10, baseMin + carryMin);
-    tasks.push({
-      name: `Làm sự kiện: ${deadlinePlan.label}`, dur, priority: "high",
-      why: `Còn ${daysLeft} ngày đến "${deadlinePlan.label}", cần ${deadlinePlan.remainingHours}h nữa → chia đều mỗi ngày ~${Math.round(baseMin/60*10)/10}h.`
-        + (carryMin > 0 ? ` Hôm qua chưa làm đủ, cộng dồn thêm ${carryMin} phút vào hôm nay.` : ""),
-      doneWhen: `Làm đủ ${Math.round(dur)} phút cho sự kiện này hôm nay.`,
-    });
+// (spec §3) Khung giờ học thêm cố định — KHÔNG BAO GIỜ xếp task khác đè
+// lên đây. Dùng để (a) loại trừ khỏi availableMinutes tính lại ở đây theo
+// spec, và (b) feed vào ctx.fixedEvents cho buildSchedule() của Core né ra.
+function fixedClassBlocksV33(day) {
+  if (day === "Thứ 5") return [
+    { name: "Học thêm Toán", start: "17:15", end: "19:15" },
+    { name: "Học thêm Lý", start: "19:30", end: "21:00" },
+  ];
+  if (day === "Thứ 2") return [{ name: "Học thêm Lý", start: "19:30", end: "21:00" }];
+  if (day === "Thứ 7") return [{ name: "Học thêm Toán", start: "19:00", end: "21:00" }];
+  return [];
+}
+
+// [PATCH v36] BUG FIX (yêu cầu "giờ giấc phải chính xác, không ước
+// lượng"): Core's own buildSchedule() (aiPlannerCore.js, KHÔNG được sửa)
+// tính lại start/end của mọi task bằng 1 cursor chạy tuần tự từ nowTime —
+// nó không biết gì về start/end đã được enrichTasksWithContext() tính rất
+// chính xác cho từng task (đặc biệt là 8 task cố định hằng ngày §1 và mọi
+// task được §12 xếp vào khoảng trống giữa các "tường cứng"). Kết quả: khi
+// SmartSchedule hiển thị plannerOutput.schedule (do Core's buildSchedule
+// tạo ra), giờ hiển thị SAI — không khớp với start/end thật đã tính.
+//
+// Hàm này THAY THẾ việc gọi Core's buildSchedule bằng cách tự dựng lại
+// mảng `schedule` (cùng shape {type, name, start, end, dur, priority} mà
+// SmartSchedule/AIPlannerBeta đã quen đọc) trực tiếp từ result.tasks —
+// vốn đã có start/end đúng 100% rồi, không cần tính lại gì cả. Chỉ làm 2
+// việc thuần hiển thị:
+//   1. Chèn các "tường cứng" bên ngoài (Toán/Lý/Học ở trường, từ
+//      ctx.fixedEvents) vào đúng vị trí thời gian, xen giữa các task.
+//   2. Chèn 1 block "buffer" cho MỌI khoảng trống thật giữa 2 mốc
+//      start/end liền kề (kể cả tường cứng), để không có "lỗ hổng" vô
+//      hình trong danh sách hiển thị — không đụng gì đến chính task.
+// Không gọi lại Core.buildSchedule, không đụng aiPlannerCore.js.
+function buildScheduleV33(tasks, ctx) {
+  const items = [
+    ...tasks.map(t => ({
+      type: "task", name: t.name, priority: t.priority, dur: t.dur,
+      start: t.start, end: t.end,
+      color: t.color || (t.isFixedRoutine ? "#EF4444" : undefined),
+      isFixedRoutine: !!t.isFixedRoutine,
+    })),
+    ...(ctx.fixedEvents || []).map(e => ({
+      type: "fixed", name: e.name, start: e.start, end: e.end, color: "#EF4444",
+    })),
+  ].filter(it => it.start && it.end)
+   .sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start));
+
+  const schedule = [];
+  let cursor = null;
+  for (const it of items) {
+    const startMin = parseTimeToMinutesV33(it.start);
+    const endMin = parseTimeToMinutesV33(it.end);
+    if (cursor !== null && startMin > cursor) {
+      schedule.push({ type: "buffer", name: "Nghỉ giữa việc", start: minutesToHHMMV33(cursor), end: minutesToHHMMV33(startMin) });
+    }
+    schedule.push(it);
+    cursor = cursor === null ? endMin : Math.max(cursor, endMin);
+  }
+  return schedule;
+}
+
+// (spec §1) Task cố định mỗi ngày — luôn xuất hiện, không cần phân tích.
+// "Không cầm điện thoại" dur được tính riêng ở resolvePhoneFreeDurationV33
+// (spec §2) nên không cứng 15' ở đây.
+//
+// [PATCH v36] Danh sách mặc định giờ chỉ còn dùng làm SEED lần đầu cho
+// storage key "v33:fixedTasks" (xem loadFixedTasksV33/saveFixedTasksV33
+// ngay dưới) — người dùng có thể thêm/sửa/xoá qua form "Quản lý task cố
+// định" trong tab AI Planner. "Không cầm điện thoại" vẫn là trường hợp đặc
+// biệt: dur của NÓ RIÊNG luôn bị ghi đè bởi phoneFreeMin (tăng dần theo
+// streak, spec §2) bất kể người dùng đặt gì trong form — mọi task cố định
+// khác thì dùng đúng start/dur đã lưu trong storage, không tự tính lại.
+const FIXED_TASKS_DEFAULT_V33 = [
+  { id: "fx_wake",      name: "Dậy trước 7h",           start: "06:00", dur: 15, xp: 15, color: "#EF4444" },
+  { id: "fx_exercise",  name: "Tập thể dục",             start: "06:15", dur: 20, xp: 20, color: "#EF4444" },
+  { id: "fx_breakfast", name: "Ăn sáng",                 start: "06:35", dur: 10, xp: 8,  color: "#EF4444" },
+  { id: "fx_nophone",   name: "Không cầm điện thoại",    start: "06:45", dur: 15, xp: 12, color: "#EF4444" },
+  { id: "fx_lunch",     name: "Ăn trưa",                 start: "11:30", dur: 30, xp: 8,  color: "#EF4444" },
+  { id: "fx_nap",       name: "Ngủ trưa",                start: "12:30", dur: 30, xp: 10, color: "#EF4444" },
+  { id: "fx_dinner",    name: "Ăn tối",                  start: "18:00", dur: 30, xp: 8,  color: "#EF4444" },
+  { id: "fx_sleep",     name: "Ngủ trước 23:30",         start: "23:00", dur: 30, xp: 20, color: "#EF4444" },
+];
+const FIXED_TASKS_KEY_V33 = "v33:fixedTasks";
+
+// [PATCH v36] Đọc danh sách task cố định từ storage; nếu chưa có (lần đầu
+// mở app) thì ghi seed mặc định vào storage rồi trả về, để lần sau đọc lại
+// đúng list đó (kể cả khi người dùng chưa mở form quản lý task cố định).
+async function loadFixedTasksV33() {
+  try {
+    const raw = await S.get(FIXED_TASKS_KEY_V33);
+    if (raw && raw !== "null") {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length) return parsed;
+    }
+  } catch {}
+  try { await S.set(FIXED_TASKS_KEY_V33, JSON.stringify(FIXED_TASKS_DEFAULT_V33)); } catch {}
+  return FIXED_TASKS_DEFAULT_V33;
+}
+async function saveFixedTasksV33(list) {
+  await S.set(FIXED_TASKS_KEY_V33, JSON.stringify(list));
+}
+
+// [PATCH v36] customFixedTasks = list đã load sẵn (bởi runAiPlannerPipeline,
+// hàm async) từ v33:fixedTasks. enrichTasksWithContext bản thân vẫn đồng bộ
+// — không tự gọi S.get ở đây, giữ đúng quy ước cũ của file này.
+function fixedDailyTasksV33(phoneFreeMin, customFixedTasks) {
+  const list = Array.isArray(customFixedTasks) && customFixedTasks.length ? customFixedTasks : FIXED_TASKS_DEFAULT_V33;
+  return list.map(t => {
+    // "Không cầm điện thoại" (nhận diện theo id cố định fx_nophone, không
+    // theo tên, để người dùng đổi tên vẫn không phá vỡ logic streak) —
+    // dur luôn bị ghi đè bởi phoneFreeMin tăng dần theo streak (spec §2).
+    const isPhoneFree = t.id === "fx_nophone";
+    const dur = isPhoneFree ? phoneFreeMin : t.dur;
+    const start = t.start;
+    const end = minutesToHHMMV33(parseTimeToMinutesV33(start) + dur);
+    return {
+      name: t.name, start, end, dur, xp: t.xp,
+      priority: "high", icon: "⏰", isFixedRoutine: true, color: t.color || "#EF4444",
+      why: "Task cố định hằng ngày.", doneWhen: `Hoàn thành "${t.name}" đúng khung giờ.`,
+    };
+  });
+}
+
+function parseTimeToMinutesV33(hhmm) { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; }
+function minutesToHHMMV33(min) {
+  const h = Math.floor(min / 60) % 24, m = ((min % 60) + 60) % 60;
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+// [PATCH v36] dùng cho hiển thị "(30')" ở các block không tự mang sẵn
+// field dur (vd block "fixed" từ ctx.fixedEvents chỉ có start/end).
+function minutesBetweenHHMM(start, end) {
+  return Math.max(0, parseTimeToMinutesV33(end) - parseTimeToMinutesV33(start));
+}
+
+// (spec §2) Không cầm điện thoại — tăng dần theo streak, reset nếu bỏ lỡ 1
+// ngày. Streak được đọc/ghi qua storage key riêng (v33:phoneFreeStreak),
+// KHÔNG suy ra từ db vì db không lưu "đã đạt đủ phút hôm qua chưa" theo
+// từng ngưỡng tăng dần này. Caller (runAiPlannerPipeline) đọc/ghi key này
+// và truyền streak (số) vào enrichTasksWithContext — hàm này bản thân
+// không tự gọi S.get/S.set để giữ đúng quy ước "enrichment thuần input→output".
+function phoneFreeDurationForStreakV33(streak) {
+  const s = Math.max(0, streak || 0);
+  if (s >= 12) return 30;
+  if (s >= 9) return 25;
+  if (s >= 6) return 20;
+  if (s >= 3) return 15;
+  return 10;
+}
+
+// (spec §10) Danh sách task AI có thể thêm — bảng tra cứu duy nhất, thay
+// cho Core's RULES/generateTask. "Hóa/Văn/Active Recall/Học từ vựng/
+// Yoga/Đi bộ/Sắp xếp máy tính/Viết nhật ký" bị bỏ hoàn toàn (spec §10) —
+// không đưa vào bảng này nên không thể bị xếp lịch nữa.
+const TASK_CATALOG_V33 = {
+  homeworkMath:  { name: "Làm bài tập Toán",       dur: 60, xp: 25, icon: "📐", group: "study" },
+  homeworkPhys:  { name: "Làm bài tập Lý",          dur: 60, xp: 25, icon: "⚛️", group: "study" },
+  reviewOld:     { name: "Ôn bài cũ",               dur: 30, xp: 20, icon: "📖", group: "study" },
+  extraDrill:    { name: "Luyện thêm đề",           dur: 60, xp: 30, icon: "📝", group: "study" },
+  dailyMission:  { name: "Làm nhiệm vụ hằng ngày",  dur: 30, xp: 15, icon: "✅", group: "study" },
+  swim:          { name: "Đi bơi",                  dur: 45, xp: 25, icon: "🏊", group: "sport" },
+  run:           { name: "Chạy bộ",                 dur: 30, xp: 20, icon: "🏃", group: "sport" },
+  cleanRoom:     { name: "Dọn phòng",               dur: 15, xp: 8,  icon: "🧹", group: "clean" },
+  cleanDesk:     { name: "Dọn bàn học",              dur: 15, xp: 8,  icon: "🧹", group: "clean" },
+  cleanStorage:  { name: "Dọn kho ảnh/video/nhạc",  dur: 20, xp: 10, icon: "🗂️", group: "clean" },
+  music:         { name: "Nghe nhạc",                dur: 30, xp: 8,  icon: "🎵", group: "fun" },
+  reading:       { name: "Đọc sách",                 dur: 30, xp: 15, icon: "📚", group: "fun" },
+  game:          { name: "Chơi game có chủ đích",   dur: 60, xp: 15, icon: "🎮", group: "fun" },
+  phoneFree30:   { name: "Không cầm điện thoại 30p", dur: 30, xp: 12, icon: "📵", group: "other" },
+  advancedDrill: { name: "Làm thêm 1 đề nâng cao",  dur: 60, xp: 35, icon: "🏆", group: "study" },
+  teachOthers:   { name: "Dạy lại kiến thức cho người khác", dur: 30, xp: 30, icon: "🎓", group: "study" },
+  twoSubjects:   { name: "Học 2 môn trong ngày",    dur: 90, xp: 40, icon: "🔥", group: "study" },
+};
+
+// [PATCH v36] 7 màu phân loại cho task DO AI THÊM (không phải task cố
+// định — task cố định luôn #EF4444 đỏ, xem FIXED_TASKS_DEFAULT_V33 ở
+// trên). Mỗi "group" trong TASK_CATALOG_V33 ánh xạ sang đúng 1 màu cố
+// định, không đổi theo theme (giữ nhận diện nhất quán bất kể theme UI nào
+// đang chọn) — 7 màu: xanh dương, tím, cam, hồng, vàng, xanh lá, xanh biển.
+const AI_TASK_COLOR_PALETTE = {
+  study: "#3B82F6",   // xanh dương — học
+  sport: "#10B981",   // xanh lá — thể thao
+  clean: "#F59E0B",   // cam/vàng đất — dọn dẹp
+  fun:   "#EC4899",   // hồng — giải trí
+  other: "#8B5CF6",   // tím — khác (vd: không cầm điện thoại 30p)
+};
+// 2 màu dự phòng (vàng thuần, xanh biển) — dùng nếu về sau có thêm group
+// mới ngoài 5 group hiện có, để không bao giờ thiếu màu trong bảng 7 màu.
+const AI_TASK_COLOR_EXTRA = ["#EAB308", "#06B6D4"];
+function colorForTaskGroupV33(group) {
+  return AI_TASK_COLOR_PALETTE[group] || AI_TASK_COLOR_EXTRA[0];
+}
+
+function catalogTaskV33(key, whyOverride, priority) {
+  const base = TASK_CATALOG_V33[key];
+  if (!base) return null;
+  return {
+    name: base.name, dur: base.dur, xp: base.xp, icon: base.icon, group: base.group,
+    color: colorForTaskGroupV33(base.group),
+    priority: priority || "med",
+    why: whyOverride || `Task gợi ý hôm nay: ${base.name}.`,
+    doneWhen: `Hoàn thành "${base.name}".`,
+  };
+}
+
+// (spec §4) Bài tập về nhà — dựa trên db hôm qua: nếu hôm qua có Toán/Lý và
+// chưa làm bài tập → thêm task tương ứng; nếu đã làm xong → không thêm,
+// nhường chỗ cho giải trí. Vì rawState.homework chỉ là 1 boolean chung
+// (không tách theo môn — xem form check-in), ta suy ra MÔN nào cần bài tập
+// từ NGÀY HÔM QUA (yesterday's class schedule), còn "đã làm xong hay chưa"
+// lấy từ ctx.homeworkStatus như trước.
+function yesterdaySubjectsV33(day) {
+  // day = hôm nay; hôm qua là ngày trước đó trong tuần Việt Nam.
+  const order = ["Chủ nhật", "Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7"];
+  const idx = order.indexOf(day);
+  const yIdx = idx < 0 ? -1 : (idx + 6) % 7;
+  const yDay = order[yIdx];
+  const subjects = [];
+  if (yDay === "Thứ 5") subjects.push("math", "phys");
+  if (yDay === "Thứ 2") subjects.push("phys");
+  if (yDay === "Thứ 7") subjects.push("math");
+  return subjects;
+}
+
+function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, formGoalMode, phoneFreeStreak, customFixedTasks) {
+  if (!result) return result;
+  const day = ctx?.day;
+  const homeworkPending = ctx?.homeworkStatus === "chưa xong";
+  const homeworkDone = ctx?.homeworkStatus === "đã xong";
+  const tiktokMin = ctx?.tiktok || 0;
+  const energy = ctx?.energy;
+  const streak = ctx?.streakInfo?.count ?? ctx?.streak ?? 0; // best-effort — Core field name may vary
+  const phoneFreeMin = phoneFreeDurationForStreakV33(phoneFreeStreak);
+
+  let tasks = [];
+
+  // §1 — task cố định, luôn có. [PATCH v36] customFixedTasks (từ
+  // v33:fixedTasks, đã load bởi runAiPlannerPipeline) cho phép người dùng
+  // thêm/sửa/xoá qua form "Quản lý task cố định" — rơi về mặc định nếu
+  // chưa từng lưu gì.
+  tasks.push(...fixedDailyTasksV33(phoneFreeMin, customFixedTasks));
+
+  // §4 — bài tập về nhà dựa trên môn học hôm qua.
+  const ySubjects = yesterdaySubjectsV33(day);
+  if (homeworkPending) {
+    if (ySubjects.includes("math")) {
+      tasks.push(catalogTaskV33("homeworkMath",
+        "Hôm qua có Toán và bài tập chưa xong — ưu tiên làm trước.", "high"));
+    }
+    if (ySubjects.includes("phys")) {
+      tasks.push(catalogTaskV33("homeworkPhys",
+        "Hôm qua có Lý và bài tập chưa xong — ưu tiên làm trước.", "high"));
+    }
+  }
+  const homeworkFullyDone = homeworkDone || (ySubjects.length > 0 && homeworkPending === false) || (ySubjects.length === 0);
+  // homeworkOutstanding: còn bài tập treo (dùng để chặn giải trí/game bên dưới, §5 tinh thần cũ vẫn giữ).
+  const homeworkOutstanding = homeworkPending && ySubjects.length > 0;
+
+  // §5 — theo ngày trong tuần. Thứ 5 là "ngày nặng": chỉ task cố định + học
+  // thêm, không thêm gì khác — return sớm sau khi áp §6/§7/§9 an toàn ở dưới
+  // vẫn cần chạy (streak thử thách, v.v. spec không loại trừ Thứ 5 khỏi đó),
+  // nên ta dùng cờ `heavyDay` thay vì return cứng.
+  const heavyDay = day === "Thứ 5";
+  if (!heavyDay) {
+    if (day === "Thứ 2") {
+      tasks.push(catalogTaskV33("reviewOld", "Thứ 2 có Lý — ôn Lý trước.", "high"));
+      // còn thời gian thì thêm luyện đề Toán (đưa priority thấp hơn, sẽ bị
+      // cắt trước nếu không đủ thời gian rảnh — xem §7 time-budget logic).
+      tasks.push(catalogTaskV33("extraDrill", "Còn thời gian sau khi ôn Lý — luyện thêm đề Toán.", "low"));
+    } else if (day === "Thứ 3") {
+      tasks.push(catalogTaskV33("reviewOld"));
+      tasks.push(catalogTaskV33("extraDrill"));
+      tasks.push(catalogTaskV33("game", "Ngày rảnh, không học thêm."));
+    } else if (day === "Thứ 4") {
+      tasks.push(catalogTaskV33("reviewOld"));
+      tasks.push(catalogTaskV33("dailyMission"));
+    } else if (day === "Thứ 6") {
+      tasks.push(catalogTaskV33("reviewOld"));
+      tasks.push(catalogTaskV33("extraDrill"));
+      tasks.push(catalogTaskV33("cleanRoom", "Dọn dẹp cuối tuần."));
+    } else if (day === "Thứ 7") {
+      // có Toán — làm bài tập Toán trước 19h nếu còn treo (đã thêm ở §4
+      // nếu chưa xong); sau đó mới học thêm (khung giờ cố định lo phần này).
+      if (!ySubjects.includes("math") || !homeworkOutstanding) {
+        tasks.push(catalogTaskV33("reviewOld", "Bài tập Toán đã xong hoặc không treo — ôn bài trước giờ học thêm."));
+      }
+    } else if (day === "Chủ nhật") {
+      tasks.push(catalogTaskV33("reviewOld", "Chủ nhật — nghỉ ngơi nhẹ nhàng.", "low"));
+      tasks[tasks.length - 1].name = "Nghỉ ngơi";
+      tasks[tasks.length - 1].icon = "🛋️";
+      tasks.push(catalogTaskV33("game", "Giải trí cuối tuần."));
+      tasks.push(catalogTaskV33("cleanStorage", "Dọn kho ảnh/video/nhạc."));
+    }
   }
 
-  // (b) Bài tập chưa xong — đảm bảo có 1 task "Học bài" ở đầu, không trùng
-  // với task học Core đã tự sinh (khớp gần đúng theo từ khoá "bài tập"/"Toán"/"Lý").
-  if (ctx?.homeworkStatus === "chưa xong") {
-    const hasHomeworkTask = tasks.some(t => /bài tập|toán|lý/i.test(t.name || ""));
-    if (!hasHomeworkTask) {
-      tasks.unshift({
-        name: "Học bài (bài tập chưa xong)", dur: 30, priority: "high",
-        why: "Bài tập hôm nay chưa xong — ưu tiên làm trước khi chuyển sang việc khác.",
-        doneWhen: "Làm xong phần bài tập còn thiếu, hoặc ít nhất các câu tự tin làm được.",
+  // §7 — theo năng lượng. Bỏ qua hoàn toàn nếu Thứ 5 (ngày nặng, spec §5).
+  if (!heavyDay && typeof energy === "number") {
+    if (energy === 5) {
+      tasks.push(catalogTaskV33("run"));
+      tasks.push(catalogTaskV33("extraDrill"));
+      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 60 });
+    } else if (energy === 4) {
+      tasks.push(catalogTaskV33("swim"));
+      tasks.push(catalogTaskV33("reviewOld"));
+      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 45 });
+    } else if (energy === 3) {
+      tasks.push(catalogTaskV33("reviewOld"));
+      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 30 });
+    } else if (energy === 2) {
+      tasks.push(catalogTaskV33("reading", "Năng lượng thấp — chỉ 1 task nhẹ.", "low"));
+      tasks[tasks.length - 1].dur = 15;
+    }
+    // energy === 1: không thêm gì — chỉ task cố định (đã có ở §1).
+  }
+  const energyBlocksExtras = heavyDay || energy === 1;
+
+  // §6 — sự kiện game theo deadlinePlan.
+  if (deadlinePlan && deadlinePlan.remainingHours > 0 && !energyBlocksExtras) {
+    const todayDate = new Date(td + "T00:00:00");
+    const target = new Date(deadlinePlan.targetDate + "T00:00:00");
+    const daysLeft = Math.round((target - todayDate) / 86400000);
+    if (daysLeft > 0) {
+      let gameMin = 0;
+      if (daysLeft === 4 && day === "Thứ 3") gameMin = 90;
+      else if (daysLeft === 2) gameMin = 120; // "cả 2 ngày đều rảnh" — xấp xỉ bằng not-heavyDay đã lọc ở trên
+      else if (daysLeft > 2 && !heavyDay) gameMin = Math.round((deadlinePlan.remainingHours * 60) / daysLeft);
+      // ưu tiên học trước — chỉ xếp game sau khi bài tập đã xong (§11 thứ tự ưu tiên).
+      if (gameMin > 0 && !homeworkOutstanding) {
+        tasks.push({
+          name: `Làm sự kiện: ${deadlinePlan.label}`, dur: gameMin, xp: 15, icon: "🎮", group: "fun",
+          color: colorForTaskGroupV33("fun"),
+          priority: "low",
+          why: `Còn ${daysLeft} ngày đến "${deadlinePlan.label}" — xếp ${gameMin} phút hôm nay, sau khi đã học xong.`,
+          doneWhen: `Làm đủ ${gameMin} phút cho sự kiện này.`,
+          isGameEvent: true,
+        });
+      }
+    }
+  }
+
+  // §8 — TikTok.
+  const isFunOrGame = (t) => t.group === "fun" || t.isGameEvent;
+  if (tiktokMin >= 180) {
+    tasks = tasks.filter(t => !isFunOrGame(t));
+    tasks.push(catalogTaskV33("phoneFree30",
+      `Đã dùng TikTok ${tiktokMin} phút hôm nay — huỷ hết giải trí, thay bằng không cầm điện thoại 30 phút.`));
+  } else if (tiktokMin >= 90) {
+    tasks = tasks.map(t => isFunOrGame(t) ? { ...t, dur: Math.max(5, Math.round(t.dur * 0.5)),
+      why: (t.why || "") + ` (Giảm 50% vì TikTok đã ${tiktokMin} phút hôm nay.)` } : t);
+  }
+  // tiktokMin < 30: bình thường, không cần chỉnh gì thêm — task giải trí đã đủ ở trên.
+
+  // §9 — streak thử thách (best-effort: ctx không đảm bảo có streak field
+  // rõ ràng qua Core hiện tại, nên các task này chỉ thêm khi có tín hiệu).
+  if (!heavyDay && streak >= 7 && !homeworkOutstanding) tasks.push(catalogTaskV33("twoSubjects"));
+  if (!heavyDay && streak >= 14 && !homeworkOutstanding) tasks.push(catalogTaskV33("advancedDrill"));
+  if (!heavyDay && streak >= 30 && !homeworkOutstanding) tasks.push(catalogTaskV33("teachOthers"));
+
+  // §5 tiếp — bài tập chưa xong luôn chặn giải trí/game bất kể ngày (giữ
+  // tinh thần "ưu tiên học trước" của §11 dù không nêu tường minh ở §5).
+  if (homeworkOutstanding) {
+    tasks = tasks.filter(t => !isFunOrGame(t) || t.isFixedRoutine);
+  }
+
+  // §11 — sắp xếp ưu tiên: lịch học thêm cố định (buildSchedule của Core lo
+  // phần này qua ctx.fixedEvents) > cố định hàng ngày > bài tập > ôn/luyện
+  // đề > nhiệm vụ hằng ngày > thể thao > dọn dẹp > sự kiện game > giải trí.
+  const PRIORITY_ORDER_V33 = [
+    "isFixedRoutine", "homeworkMath", "homeworkPhys", "study-review", "study-drill",
+    "dailyMission", "sport", "clean", "game-event", "fun",
+  ];
+  const rank = (t) => {
+    if (t.isFixedRoutine) return 0;
+    if (/bài tập/i.test(t.name)) return 1;
+    if (t.group === "study" && /ôn|luyện/i.test(t.name)) return 2;
+    if (t.group === "study") return 3;
+    if (t.group === "sport") return 4;
+    if (t.group === "clean") return 5;
+    if (t.isGameEvent) return 6;
+    if (t.group === "fun") return 7;
+    return 3;
+  };
+  tasks.sort((a, b) => rank(a) - rank(b));
+
+  // §12 [PATCH v35 — BUG FIX] — bản cũ dùng 1 cursor chạy liên tục từ
+  // nowTime, chỉ né classBlocks (Toán/Lý) mà KHÔNG né "Học ở trường"
+  // (7:00-11:20) lẫn 8 khung cố định (ăn/ngủ/dậy) — nên task không cố định
+  // bị nhét đè lên giờ ăn trưa/ngủ trưa, ra start/end sai (vd "Ăn trưa 3
+  // phút") vì start/end hiển thị lúc đó KHÔNG PHẢI của task Ăn trưa cố định
+  // nữa mà đã bị 1 task khác chồng lấn tính toán sai. Sửa: coi TẤT CẢ
+  // khung giờ cố định (Học ở trường + 8 task §1 + Toán/Lý) là "tường cứng"
+  // duy nhất, rồi lấp các task còn lại vào ĐÚNG các khoảng trống thật giữa
+  // các tường đó theo đúng thứ tự thời gian trong ngày.
+  const nowMin = parseTimeToMinutesV33(ctx?.nowTime || "06:00");
+  const sleepAt = parseTimeToMinutesV33("23:30");
+  const schoolBlock = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6"].includes(day)
+    ? [{ name: "Học ở trường", s: parseTimeToMinutesV33("07:00"), e: parseTimeToMinutesV33("11:20") }]
+    : [];
+  const classBlocks = fixedClassBlocksV33(day)
+    .map(e => ({ name: e.name, s: parseTimeToMinutesV33(e.start), e: parseTimeToMinutesV33(e.end) }));
+
+  // Task cố định (§1) — bỏ những cái đã trôi qua giờ hiện tại (trừ "Ngủ
+  // trước 23:30" vì đó luôn là mốc cuối ngày cần giữ).
+  const fixedRoutine = tasks
+    .filter(t => t.isFixedRoutine)
+    .filter(t => parseTimeToMinutesV33(t.end) > nowMin || t.name === "Ngủ trước 23:30")
+    .map(t => ({ name: t.name, s: parseTimeToMinutesV33(t.start), e: parseTimeToMinutesV33(t.end) }));
+
+  // "Tường cứng" = mọi khung giờ không được xếp đè lên, gộp lại và sort.
+  const walls = [...schoolBlock, ...classBlocks, ...fixedRoutine].sort((a, b) => a.s - b.s);
+
+  // Task không cố định, đã sắp theo rank() ở trên — giữ nguyên thứ tự đó,
+  // chỉ tìm chỗ trống kế tiếp cho từng task một, không được chồng lên tường.
+  const flexTasks = tasks.filter(t => !t.isFixedRoutine);
+
+  function nextFreeSlot(afterMin, dur) {
+    let cursor = Math.max(afterMin, nowMin);
+    for (const w of walls) {
+      if (cursor < w.e && cursor + dur > w.s) cursor = w.e; // đụng tường → nhảy qua hết tường
+    }
+    // sau khi nhảy có thể lại đụng tường tiếp theo — lặp tới khi ổn định.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const w of walls) {
+        if (cursor < w.e && cursor + dur > w.s) { cursor = w.e; changed = true; }
+      }
+    }
+    return cursor;
+  }
+
+  const finalTasks = [];
+  // Task cố định giữ nguyên start/end gốc (đã đúng theo spec §1).
+  tasks.filter(t => t.isFixedRoutine)
+    .filter(t => parseTimeToMinutesV33(t.end) > nowMin || t.name === "Ngủ trước 23:30")
+    .forEach(t => finalTasks.push(t));
+
+  let searchFrom = nowMin;
+  for (const t of flexTasks) {
+    const start = nextFreeSlot(searchFrom, t.dur);
+    const end = start + t.dur;
+    if (end > sleepAt) continue; // quá giờ ngủ — bỏ task này (§12)
+    finalTasks.push({ ...t, start: minutesToHHMMV33(start), end: minutesToHHMMV33(end) });
+    searchFrom = end; // task kế tiếp tìm chỗ trống từ đây trở đi — giữ đúng thứ tự thời gian trong ngày (§3)
+  }
+
+  finalTasks.sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start));
+
+  return { ...result, tasks: finalTasks };
+}
+
+// [PATCH v34] Bug fix per Bảo: Core's OWN applyCapsAndBudget() (untouched,
+// inside aiPlannerCore.js) is called automatically by core.runPlannerEngine
+// — we cannot skip or edit that call. It reads `result.caps.capTasks` and
+// SLICES tasks[] down to that count, which was cutting fixed routine tasks
+// (ăn trưa/ngủ trưa/ăn tối/ngủ) whenever LOW_ENERGY (capTasks:1) or
+// REDUCE_TASK (capTasks:2, fires independently of energy — 3-day-fail
+// pattern) was active. That's the "energy=5 still gets cut" bug: REDUCE_TASK
+// doesn't check energy at all.
+//
+// Fix: this function now runs BEFORE core.runPlannerEngine (see pipeline
+// below) and (1) never removes tasks by count — only shrinks `dur` when
+// Core signals pressure, and (2) STRIPS capTasks/hardCap off the caps
+// object it hands back, so when Core's own applyCapsAndBudget runs next,
+// `if (capTasks && ...)` and `if (hardCap && ...)` are both falsy and no
+// slicing happens there either. Fixed routine tasks (ăn/ngủ/dậy) are never
+// touched by any branch here, per Bảo's rule 5.
+function applySafetyOverridesV33(enrichedResult, ctx) {
+  if (!enrichedResult || !Array.isArray(enrichedResult.tasks)) return enrichedResult;
+  let tasks = [...enrichedResult.tasks];
+  const caps = enrichedResult.caps || {};
+
+  // FULL_REST / ASK_STATUS (caps.stopped): person explicitly asked to
+  // rest, or hasn't checked in — still keep fixed routine tasks, this is
+  // not a "cut count" case, it's Core's own explicit stop signal and
+  // predates the capTasks bug, left as-is.
+  if (caps.stopped) {
+    tasks = tasks.filter(t => t.isFixedRoutine);
+  }
+
+  // Energy/TikTok pressure → shrink duration only, never drop tasks.
+  // Minimum floor of 10' so a task never gets shrunk to uselessness.
+  if (caps.capDur) {
+    tasks = tasks.map(t => (!t.isFixedRoutine && t.dur > caps.capDur)
+      ? { ...t, dur: caps.capDur, end: minutesToHHMMV33(parseTimeToMinutesV33(t.start) + caps.capDur) }
+      : t);
+  } else if (caps.capTasks) {
+    const shrinkFactor = caps.capTasks === 1 ? 0.6 : caps.capTasks === 2 ? 0.8 : 1;
+    if (shrinkFactor < 1) {
+      tasks = tasks.map(t => {
+        if (t.isFixedRoutine) return t;
+        const newDur = Math.max(10, Math.round(t.dur * shrinkFactor));
+        return { ...t, dur: newDur, end: minutesToHHMMV33(parseTimeToMinutesV33(t.start) + newDur) };
       });
     }
   }
 
-  // (c) Thay task rest-signal (dur:0, "Ngủ đủ giấc hôm nay") bằng 1 việc
-  // nhẹ có ý nghĩa — KHÔNG đổi tinh thần "ưu tiên nghỉ", chỉ đổi hiển thị.
-  const RECOVERY_TASKS = [
-    "Uống 1 cốc nước đầy", "Đi bộ nhẹ 5 phút quanh nhà", "Vươn vai + hít thở sâu 5 phút",
-    "Dọn gọn 1 góc bàn học", "Nghe 1 bài nhạc yêu thích, không làm gì khác",
-  ];
-  tasks = tasks.map(t => {
-    if (t.name === "Ngủ đủ giấc hôm nay" && (t.dur || 0) === 0) {
-      const idx = Math.abs(hashStr(td)) % RECOVERY_TASKS.length;
-      return { ...t, name: RECOVERY_TASKS[idx], dur: 5 + (idx % 2) * 5,
-        doneWhen: "Làm xong việc nhẹ này — không cần gì thêm, hôm nay ưu tiên phục hồi." };
-    }
-    return t;
-  });
+  // Strip capTasks/hardCap/capDur so Core's own applyCapsAndBudget (called
+  // inside core.runPlannerEngine right after this, unavoidably) has
+  // nothing left to slice with. capDur is cleared too since we already
+  // applied it above ourselves with fixed-task protection — leaving it in
+  // would let Core's applyCapsAndBudget apply it AGAIN, including to fixed
+  // tasks, which Core's own version does not protect.
+  const cleanCaps = { ...caps, capTasks: null, hardCap: null, capDur: null };
 
-  // (d) Bổ sung task từ taskPool nếu danh sách còn ít hơn 3.
-  // [PATCH v30 fix] goalMode KHÔNG có trong ctx (buildContext không giữ
-  // field này — nó chỉ tồn tại trên rawState/form ở lớp UI, xem
-  // MOOD_CHIPS). Nhận trực tiếp qua tham số formGoalMode thay vì đọc
-  // ctx.goalMode (luôn undefined, sẽ luôn fallback "study" một cách âm
-  // thầm và sai) — caller (runAiPlannerPipeline) truyền form.goalMode vào.
-  if (tasks.length < 3 && Array.isArray(taskPool) && taskPool.length) {
-    const extra = diversifyTasksWithPool({
-      taskPool, goalMode: formGoalMode || "study", energy: ctx?.energy,
-      tiktokMin: ctx?.tiktok || 0, historyByPoolId: {}, date: td,
-      count: 3 - tasks.length, skipCountByTaskId: {},
-    });
-    extra.forEach(t => {
-      tasks.push({ name: t.l, dur: Math.max(10, Math.round((t.e || TP_XP) * 2)), priority: t.priority || "med",
-        why: t.why || "Bổ sung từ Kho việc nhỏ cho đa dạng hôm nay.", doneWhen: `Hoàn thành "${t.l}".` });
-    });
-  }
-
-  return { ...result, tasks };
+  return { ...enrichedResult, tasks, caps: cleanCaps };
 }
 
 // [PATCH v30] hashStr — hash chuỗi nhỏ, deterministic, dùng để chọn
@@ -1524,15 +1978,67 @@ function hashStr(s) {
 // does not add or remove any error handling; that stays the caller's job,
 // exactly as it was.
 // ════════════════════════════════════════════════════════════════════════
+// [PATCH v33] Phone-free streak — key stores { count, lastDate }. On each
+// pipeline run for date `td`: if lastDate === yesterday(td) → keep count
+// (already advanced when yesterday's goal was met — see settlement below);
+// if lastDate === td → same-day re-run ("Làm lại"), keep count as-is; else
+// (gap of 2+ days, or no prior record) → reset to 0. This function only
+// READS/increments the "streak used for today's target duration" — the
+// actual "was yesterday's target met" settlement is intentionally NOT
+// modeled here (Dashboard has no per-fixed-task completion log wired to
+// this pipeline yet), so streak simply persists across consecutive daily
+// runs and resets on any detected gap day, per spec §2's "reset về 10 phút
+// nếu bỏ lỡ 1 ngày" — a gap in running the planner is treated as the
+// closest available signal for "bỏ lỡ 1 ngày" without inventing a new
+// completion-tracking field on Core or Dashboard state.
+const PHONE_FREE_STREAK_KEY = "v33:phoneFreeStreak";
+async function resolvePhoneFreeStreakV33(td) {
+  let streak = { count: 0, lastDate: null };
+  try {
+    const raw = await S.get(PHONE_FREE_STREAK_KEY);
+    if (raw && raw !== "null") streak = JSON.parse(raw);
+  } catch {}
+  const yesterday = isoDateMinusDays(td, 1);
+  let count = streak.count || 0;
+  if (streak.lastDate === td) {
+    // same-day re-run, keep count
+  } else if (streak.lastDate === yesterday) {
+    count = count + 1; // consecutive day
+  } else {
+    count = 0; // gap day or first run — reset
+  }
+  try { await S.set(PHONE_FREE_STREAK_KEY, JSON.stringify({ count, lastDate: td })); } catch {}
+  return count;
+}
+
 async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts, taskPool, deadlinePlan }) {
   const rawState = { ...form };
   const ctx = core.buildContext(rawState);
-  let { result, trace } = core.generatePlan(ctx);
-  // [PATCH v30] enrichment layer — no-op unless db/taskPool/deadlinePlan given.
-  if (db || taskPool || deadlinePlan) {
-    result = enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, form.goalMode);
-  }
+  let { result: rawResult, trace } = core.generatePlan(ctx);
+  let result = rawResult;
+  // [PATCH v34] enrichment layer builds the task list (always runs), then
+  // applySafetyOverridesV33 runs BEFORE core.runPlannerEngine — it must, so
+  // that by the time Core's own applyCapsAndBudget() executes (called
+  // internally by runPlannerEngine, unavoidably — see aiPlannerCore.js),
+  // capTasks/hardCap are already stripped and can't cut fixed tasks or any
+  // other task by count. Energy/TikTok pressure is expressed as duration
+  // shrink only now, never a task-count cut (fixes: task list getting cut
+  // even at energy=5, because REDUCE_TASK's capTasks:2 doesn't check energy).
+  const phoneFreeStreak = await resolvePhoneFreeStreakV33(td);
+  // [PATCH v36] task cố định giờ đọc từ storage (người dùng quản lý qua
+  // form trong tab AI Planner) thay vì hardcode.
+  const customFixedTasks = await loadFixedTasksV33();
+  result = enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, form.goalMode, phoneFreeStreak, customFixedTasks);
+  result = applySafetyOverridesV33(result, ctx);
   const plannerOutput = core.runPlannerEngine(ctx, result, dayLog);
+  // [PATCH v36] BUG FIX: Core's own buildSchedule() (bên trong
+  // runPlannerEngine ở trên, không sửa được) tính lại start/end bằng
+  // cursor tuần tự, làm mất giờ chính xác mà enrichTasksWithContext (§12)
+  // đã tính cho từng task — bao gồm cả 8 task cố định hằng ngày. Ghi đè
+  // schedule bằng bản dựng lại từ chính result.tasks (đã đúng giờ 100%),
+  // giữ nguyên mọi field khác của plannerOutput (confidence, backupPlan,
+  // reserveTime, warnings, ... vẫn nguyên do Core tính).
+  plannerOutput.schedule = buildScheduleV33(result.tasks, ctx);
   const prevEntry = dayLog.length ? dayLog[dayLog.length - 1] : null;
   const regenReason = core.detectRegenReason(prevEntry, ctx);
 
@@ -1646,6 +2152,198 @@ function aiPlannerPriorityClass(p) {
   return p === "high" ? "#EF4444" : p === "med" ? "#F59E0B" : "#6B7280";
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v36] QUẢN LÝ TASK CỐ ĐỊNH — form thêm/sửa/xoá trong tab AI Planner.
+// Đọc/ghi trực tiếp storage key "v33:fixedTasks" qua loadFixedTasksV33/
+// saveFixedTasksV33 (định nghĩa cùng fixedDailyTasksV33 ở phần enrichment,
+// KHÔNG đụng aiPlannerCore.js). Mỗi task cố định có: tên, giờ bắt đầu,
+// thời lượng (phút), XP, màu sắc — màu mặc định luôn đỏ #EF4444 vì "Task
+// cố định luôn có màu đỏ, không đổi" (yêu cầu §7), nhưng vẫn để field màu
+// hiển thị/chỉnh được cho trường hợp người dùng muốn phân biệt thêm giữa
+// các task cố định với nhau (không bắt buộc dùng màu khác đỏ).
+// Không giới hạn số lượng task (yêu cầu §7).
+// ════════════════════════════════════════════════════════════════════════
+function FixedTasksManager() {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [list, setList] = useState([]);
+  const [editingId, setEditingId] = useState(null); // null = không sửa gì; "new" = đang thêm mới
+  const [draft, setDraft] = useState(null); // { id, name, start, dur, xp, color }
+  const [saveMsg, setSaveMsg] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const l = await loadFixedTasksV33();
+      if (!cancelled) { setList(l); setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [open]);
+
+  const persist = async (next) => {
+    setList(next);
+    await saveFixedTasksV33(next);
+    setSaveMsg("✅ Đã lưu");
+    setTimeout(() => setSaveMsg(null), 1500);
+  };
+
+  const startAdd = () => {
+    setEditingId("new");
+    setDraft({ id: "fx_" + Date.now(), name: "", start: "07:00", dur: 15, xp: 10, color: "#EF4444" });
+  };
+  const startEdit = (t) => {
+    setEditingId(t.id);
+    setDraft({ ...t });
+  };
+  const cancelEdit = () => { setEditingId(null); setDraft(null); };
+
+  const saveDraft = async () => {
+    if (!draft || !draft.name.trim()) return;
+    const clean = {
+      ...draft,
+      name: draft.name.trim(),
+      dur: Math.max(1, Number(draft.dur) || 1),
+      xp: Math.max(0, Number(draft.xp) || 0),
+      color: draft.color || "#EF4444",
+    };
+    const exists = list.some(t => t.id === clean.id);
+    const next = exists ? list.map(t => t.id === clean.id ? clean : t) : [...list, clean];
+    next.sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start));
+    await persist(next);
+    cancelEdit();
+  };
+
+  const removeTask = async (id) => {
+    await persist(list.filter(t => t.id !== id));
+    if (editingId === id) cancelEdit();
+  };
+
+  const resetDefaults = async () => {
+    await persist(FIXED_TASKS_DEFAULT_V33);
+    cancelEdit();
+  };
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🔴 Quản lý task cố định</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở"}</span>
+      </div>
+      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+        Các task này luôn xuất hiện mỗi ngày, màu đỏ, đúng khung giờ đã đặt — không do AI chọn.
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>
+          ) : (
+            <>
+              {list.map(t => (
+                <div key={t.id} style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                  borderRadius: 10, marginBottom: 6, background: theme.bg,
+                  borderLeft: `3px solid ${t.color || "#EF4444"}`,
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>
+                      🕐 {t.start} {t.name} ({t.dur}')
+                    </div>
+                    <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>+{t.xp} XP</div>
+                  </div>
+                  <button onClick={() => startEdit(t)}
+                    style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.text, cursor: "pointer" }}>
+                    Sửa
+                  </button>
+                  <button onClick={() => removeTask(t.id)}
+                    style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.danger}55`, background: "transparent", color: theme.danger, cursor: "pointer" }}>
+                    Xoá
+                  </button>
+                </div>
+              ))}
+
+              {editingId && draft && (
+                <div style={{ padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, marginTop: 6, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+                    {editingId === "new" ? "➕ Thêm task cố định" : "✏️ Sửa task cố định"}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <input placeholder="Tên task" value={draft.name}
+                      onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+                      style={{ padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}/>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Giờ bắt đầu
+                        <input type="time" value={draft.start}
+                          onChange={e => setDraft(d => ({ ...d, start: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Thời lượng (phút)
+                        <input type="number" min="1" value={draft.dur}
+                          onChange={e => setDraft(d => ({ ...d, dur: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                    </div>
+                    <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        XP
+                        <input type="number" min="0" value={draft.xp}
+                          onChange={e => setDraft(d => ({ ...d, xp: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ fontSize: 10, color: theme.textDim }}>
+                        Màu
+                        <input type="color" value={draft.color}
+                          onChange={e => setDraft(d => ({ ...d, color: e.target.value }))}
+                          style={{ display: "block", marginTop: 2, width: 44, height: 32, padding: 0, borderRadius: 8, border: `1px solid ${theme.border}`, background: "none", cursor: "pointer" }}/>
+                      </label>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button onClick={saveDraft} disabled={!draft.name.trim()}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 12,
+                        background: accent, color: "#fff", cursor: draft.name.trim() ? "pointer" : "default",
+                        opacity: draft.name.trim() ? 1 : 0.5 }}>
+                      Lưu
+                    </button>
+                    <button onClick={cancelEdit}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 12,
+                        background: "transparent", color: theme.text, cursor: "pointer" }}>
+                      Huỷ
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!editingId && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                  <button onClick={startAdd}
+                    style={{ padding: "7px 12px", borderRadius: 999, border: "none", fontWeight: 700, fontSize: 11,
+                      background: accent, color: "#fff", cursor: "pointer" }}>
+                    ➕ Thêm task cố định
+                  </button>
+                  <button onClick={resetDefaults}
+                    style={{ padding: "7px 12px", borderRadius: 999, border: `1px solid ${theme.border}`, fontSize: 11,
+                      background: "transparent", color: theme.textDim, cursor: "pointer" }}>
+                    ↺ Về mặc định
+                  </button>
+                </div>
+              )}
+              {saveMsg && <div style={{ fontSize: 10, color: theme.success, marginTop: 8 }}>{saveMsg}</div>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
@@ -1704,7 +2402,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
         unlocks: Math.floor(Math.random() * 80),
         lo: Math.random() < 0.2,
         journal: `Ngày ${iso} – Dữ liệu test (Dev Tools)`,
-        dailyPicks: ["tp_wake", "tp_exercise", "tp_lunchnap", "tp_swim", "tp_sleep"],
+        dailyPicks: ["tp_desk", "tp_read15", "tp_photos", "tp_walk10", "tp_journal"],
         bigGoalsToday: [
           { id: `bg_test_${iso}`, text: "Test mục tiêu lớn", done: Math.random() > 0.5, fromPoolId: null },
         ],
@@ -1989,6 +2687,9 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
         <AIPlannerEntryCard key={entry.id} entry={entry} isLatest={idx === 0} theme={theme} accent={accent} />
       ))}
 
+      {/* [PATCH v36] MỤC 2: form thêm/sửa/xoá task cố định. */}
+      <FixedTasksManager/>
+
       {/* Dev Tools: công cụ tạo dữ liệu giả để test hiệu năng/giao diện.
           Ẩn nhẹ trong UI — không khung nổi bật, chỉ một dấu chấm mờ. */}
       <div style={{ marginTop: 24, textAlign: "center" }}>
@@ -2196,6 +2897,23 @@ const V24_MIGRATION_KEY = "v24:migratedAt";
 const V24_POPUP_SHOWN_KEY = "v24:popupShown";
 
 // ── V24: KHO VIỆC NHỎ — seed mặc định (chỉ tạo 1 lần lúc migration, người dùng có thể sửa/xoá) ──
+// [PATCH v32] Task cố định (ăn/ngủ/vệ sinh cá nhân) và task học lỗi thời
+// (Active Recall, Học từ vựng — đã bị thay bằng AI Planner sinh task học
+// theo môn thực tế) KHÔNG còn được random vào "Nhiệm vụ hôm nay" (5 việc
+// nhỏ). Task cố định giờ do AI Planner tự thêm vào "Lịch trình hôm nay"
+// mỗi ngày (xem FIXED_ROUTINE_TASKS trong enrichTasksWithContext).
+// Dùng danh sách id thay vì xoá thẳng khỏi TASK_POOL_SEED để KHÔNG phá vỡ
+// nguyên tắc "không đụng/xoá dữ liệu Kho việc nhỏ đã lưu của Bảo" — các
+// entry này vẫn tồn tại trong pool, chỉ bị loại khỏi việc random hằng
+// ngày (pickDailyTasks) và tự động set hidden:true ở lượt tải đầu tiên
+// sau patch này (xem đoạn load taskPool), giống hệt cơ chế "ẩn" thủ công
+// Bảo đã có sẵn trong Quản lý Kho việc nhỏ — Bảo vẫn có thể tự bật lại.
+const FIXED_OR_LEGACY_POOL_IDS = new Set([
+  "tp_wake", "tp_exercise", "tp_nophoneam", "tp_lunchnap", "tp_swim",
+  "tp_dinner", "tp_sleep", "tp_water", // task cố định — AI tự thêm vào Lịch trình
+  "tp_recall", "tp_vocab", // task học lỗi thời (Active Recall / Học từ vựng)
+]);
+
 const TASK_POOL_SEED = [
   {id:"tp_wake",     l:"Dậy trước 7 giờ",                                  e:15, i:"🌅"},
   {id:"tp_exercise", l:"Tập thể dục / vận động",                            e:20, i:"🏃"},
@@ -2241,7 +2959,11 @@ function seededRandom(seedStr) {
   return function next(){ h = (h*1103515245 + 12345) >>> 0; return (h % 100000) / 100000; };
 }
 function pickDailyTasks(pool, date, historyByPoolId, yesterdayPicks=[], count=5) {
-  const active = (pool||[]).filter(t=>!t.hidden);
+  // [PATCH v32] Loại task cố định/lỗi thời khỏi candidate — xem
+  // FIXED_OR_LEGACY_POOL_IDS. "Nhiệm vụ hôm nay" chỉ còn các việc nhỏ thật
+  // sự tự chọn (dọn dẹp, đọc sách, backup...), không còn lẫn ăn/ngủ/tập
+  // thể dục hay Active Recall/Học từ vựng.
+  const active = (pool||[]).filter(t=>!t.hidden && !FIXED_OR_LEGACY_POOL_IDS.has(t.id));
   if(active.length<=count) return active.map(t=>t.id);
   const rnd = seededRandom(date);
   // điểm ưu tiên: càng lâu chưa xuất hiện càng cao; vừa xuất hiện hôm qua thì bị giảm điểm (tránh lặp liên tục)
@@ -4227,10 +4949,23 @@ function MusicPlayer() {
   const currentName = currentTrack ? currentTrack.name : (s?.bgmName || "Nhạc nền");
   const currentData = currentTrack ? currentTrack.data : s?.bgm;
 
+  // [FIX v33] Bug: thanh progress "giật lùi" khi kéo tua trên mobile.
+  // Nguyên nhân: interval tick() (250ms) đọc audio.currentTime độc lập với
+  // việc người dùng đang kéo — ngay sau commitSeek gán audio.currentTime,
+  // 1 số trình duyệt mobile cần vài chục ms để giá trị đó thực sự áp dụng.
+  // Nếu tick() kế tiếp chạy đúng lúc đó, nó đọc lại currentTime CŨ (trước
+  // seek) → progress.current bị ghi đè ngược lại vị trí cũ trong chớp mắt
+  // rồi mới nhảy tới đúng chỗ ở tick sau → cảm giác "giật". seekingRef chặn
+  // tick() ghi đè progress trong SUỐT lúc đang kéo (từ lúc chạm tới lúc
+  // nhả tay), và commitSeek tự cập nhật progress.current ngay lập tức thay
+  // vì đợi tick kỳ sau.
+  const seekingRef = useRef(false);
+
   // Đọc progress thật từ audio element mỗi 250ms khi đang phát — tách khỏi
   // React state chính để không kéo theo re-render toàn App mỗi tick.
   useEffect(() => {
     const tick = () => {
+      if (seekingRef.current) return; // đang kéo tay — không để tick ghi đè
       const audio = bgmAudioRef?.current;
       if (audio) {
         setProgress({
@@ -4265,6 +5000,11 @@ function MusicPlayer() {
   const pct = progress.duration > 0 ? (progress.current / progress.duration) * 100 : 0;
   const displayPct = seeking !== null ? seeking : pct;
 
+  // [FIX v33] Bắt đầu kéo — chặn tick() ghi đè cho tới khi nhả tay.
+  const startSeek = (e) => {
+    seekingRef.current = true;
+    setSeeking(Number(e.target.value));
+  };
   const handleSeek = (e) => {
     const val = Number(e.target.value);
     setSeeking(val);
@@ -4273,9 +5013,21 @@ function MusicPlayer() {
     const val = Number(e.target.value);
     const audio = bgmAudioRef?.current;
     if (audio && progress.duration > 0) {
-      audio.currentTime = (val / 100) * progress.duration;
+      const newTime = (val / 100) * progress.duration;
+      audio.currentTime = newTime;
+      // Cập nhật progress ngay lập tức thay vì đợi tick() kỳ sau (250ms) —
+      // đây chính là khoảng trống khiến thanh "giật lùi" trước khi nhảy tới.
+      setProgress({ current: newTime, duration: progress.duration });
     }
     setSeeking(null);
+    // [FIX v33b] KHÔNG nhả seekingRef ngay — một số trình duyệt mobile cần
+    // vài chục ms để audio.currentTime thực sự áp dụng xong. Nếu tick()
+    // (setInterval 250ms, chạy độc lập) tình cờ rơi đúng khoảng trống đó,
+    // nó sẽ đọc lại audio.currentTime CŨ (chưa seek) và ghi đè progress về
+    // vị trí trước khi tua → đúng hiện tượng "giật lùi" đã gặp. Giữ chặn
+    // thêm 300ms (dài hơn hẳn 1 chu kỳ tick 250ms) để đảm bảo tick() kế
+    // tiếp chắc chắn đọc được currentTime đã áp dụng xong.
+    setTimeout(() => { seekingRef.current = false; }, 300);
   };
 
   // Ảnh bìa dùng chung cho cả 2 trạng thái — quay chậm liên tục khi đang
@@ -4347,6 +5099,8 @@ function MusicPlayer() {
       <div style={{ marginBottom: 4 }}>
         <input type="range" min={0} max={100} step={0.1}
           value={displayPct}
+          onMouseDown={startSeek}
+          onTouchStart={startSeek}
           onChange={handleSeek}
           onMouseUp={commitSeek}
           onTouchEnd={commitSeek}
@@ -4606,9 +5360,20 @@ function App() {
           const existing = JSON.parse(tp);
           const existingIds = new Set(existing.map(t=>t.id));
           const missing = TASK_POOL_SEED.filter(t=>!existingIds.has(t.id));
-          setTaskPool(missing.length ? [...existing, ...missing] : existing);
+          // [PATCH v32] Task cố định/lỗi thời (FIXED_OR_LEGACY_POOL_IDS) đã
+          // lưu từ trước → tự động set hidden:true 1 lần (idempotent, chỉ
+          // set nếu chưa hidden), giống hệt việc Bảo tự ẩn thủ công trong
+          // Quản lý Kho việc nhỏ. KHÔNG xoá entry, Bảo vẫn bật lại được.
+          const merged = [...existing, ...missing].map(t =>
+            FIXED_OR_LEGACY_POOL_IDS.has(t.id) && !t.hidden ? { ...t, hidden: true } : t
+          );
+          setTaskPool(merged);
         } else {
-          setTaskPool([...TASK_POOL_SEED]);
+          // Lần đầu tiên (chưa từng có Kho việc nhỏ) — seed ngay với task
+          // cố định/lỗi thời đã ẩn sẵn, vì AI Planner sẽ tự lo phần đó.
+          setTaskPool(TASK_POOL_SEED.map(t =>
+            FIXED_OR_LEGACY_POOL_IDS.has(t.id) ? { ...t, hidden: true } : t
+          ));
         }
       }catch{ setTaskPool([...TASK_POOL_SEED]); }
       try{ const gp=await S.get(GOAL_POOL_KEY); setGoalPool(gp && gp!=="null" ? JSON.parse(gp) : []); }catch{ setGoalPool([]); }
@@ -4915,7 +5680,9 @@ function App() {
     const picks = today.dailyPicks || [];
     if(!picks.includes(poolIdToReplace)) return false;
     if(today.poolDone?.[poolIdToReplace]) return false; // không đổi việc đã hoàn thành
-    const pool = taskPoolRef.current.filter(t=>!t.hidden);
+    // [PATCH v32] Loại task cố định/lỗi thời khỏi candidate khi "Đổi việc",
+    // giống pickDailyTasks — tránh đổi ra "Dậy trước 7 giờ"/"Active Recall".
+    const pool = taskPoolRef.current.filter(t=>!t.hidden && !FIXED_OR_LEGACY_POOL_IDS.has(t.id));
     const candidates = pool.filter(t=>!picks.includes(t.id));
     if(candidates.length===0) return false;
     const rnd = seededRandom(td+":"+used+":"+poolIdToReplace);
@@ -7335,13 +8102,14 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
               {tasks.map((t, i) => {
                 const checked = !!checkedTasks[i];
                 const shortWhy = summarizeReason(t.why, 90);
+                const itemColor = t.color || aiPlannerPriorityClass(t.priority);
                 return (
                   <div key={i} onClick={() => toggleTask(i)}
                     style={{
                       display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer",
                       padding: "8px 10px", borderRadius: 10, marginBottom: 6,
                       background: theme.bg, opacity: checked ? 0.6 : 1,
-                      borderLeft: `3px solid ${aiPlannerPriorityClass(t.priority)}`,
+                      borderLeft: `3px solid ${itemColor}`,
                     }}>
                     <div style={{ marginTop: 1 }}>
                       <MorningTaskCheckbox checked={checked} theme={theme} accent={accent}/>
@@ -7350,9 +8118,9 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
                       <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                         <span style={{ fontSize: 13, fontWeight: 600, color: theme.text,
                           textDecoration: checked ? "line-through" : "none" }}>
-                          {i + 1}. {t.name}
+                          {/* [PATCH v36] MỤC 1: hiện giờ cụ thể nếu task đã có start (do enrichTasksWithContext tính) */}
+                          {t.start ? `🕐 ${t.start} ` : `${i + 1}. `}{t.name}{t.dur > 0 ? ` (${t.dur}')` : ""}
                         </span>
-                        <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0 }}>{t.dur}'</span>
                       </div>
                       {shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
                     </div>
@@ -7362,16 +8130,9 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
             </div>
           )}
 
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: theme.textDim, marginBottom: 6 }}>
-            {confidence && <span>📊 Độ tin cậy: {confidence.score}%</span>}
-            {plannerOutput?.reserveTime != null && <span>⏱ Còn {plannerOutput.reserveTime}' rảnh</span>}
-          </div>
-
-          {backupPlan && (
-            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 12 }}>
-              🛟 Backup: {summarizeReason(backupPlan.label + " — " + (backupPlan.why || ""), 90)}
-            </div>
-          )}
+          {/* [PATCH v36] MỤC 6: ẩn "Độ tin cậy", "Còn X' rảnh", "Backup" ở
+              tab Hôm nay — các thông tin này vẫn hiển thị đầy đủ trong tab
+              AI Planner (AIPlannerBeta, không đụng gì ở đó). */}
 
           {errorMsg && (
             <div style={{ color: theme.danger, marginBottom: 8, padding: "8px 10px", borderRadius: 8,
@@ -7413,10 +8174,12 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
             </div>
           )}
 
+          {/* [PATCH v36] MỤC 6: đổi nhãn — không còn nhắc "reasoning trace"
+              ở tab Hôm nay (thông tin đó chỉ hiện trong tab AI Planner). */}
           <button onClick={() => onSwitchTab?.(11)}
             style={{ width: "100%", padding: "9px 12px", marginTop: 8, borderRadius: 8, border: "none",
               background: "transparent", color: theme.textDim, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-            Xem chi tiết & reasoning trace →
+            Xem chi tiết trong AI Planner →
           </button>
           </>
           )}
@@ -7530,13 +8293,13 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       tasks.forEach((t, i) => {
         if ((t.dur || 0) <= 0 && !t.doneWhen) return;
         if (t.name === oneBigWin?.label) return;
-        items.push({ key: "t" + i, name: t.name, why: t.why, doneWhen: t.doneWhen, dur: t.dur, priority: t.priority });
+        items.push({ key: "t" + i, name: t.name, why: t.why, doneWhen: t.doneWhen, dur: t.dur, priority: t.priority, color: t.color, isFixedRoutine: !!t.isFixedRoutine });
       });
       return items;
     }
     return schedule.map((b, i) => {
       if (b.type === "fixed") {
-        return { key: "fx" + i, name: b.name, start: b.start, end: b.end, isFixed: true };
+        return { key: "fx" + i, name: b.name, start: b.start, end: b.end, isFixed: true, color: b.color || "#EF4444" };
       }
       if (b.type === "buffer") {
         return { key: "buf" + i, name: "Nghỉ giữa việc", start: b.start, end: b.end, isBuffer: true };
@@ -7547,6 +8310,11 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         key: "t" + i, name: b.name, start: b.start, end: b.end, dur: b.dur,
         priority: b.priority, why: srcTask?.why || oneBigWin?.why, doneWhen: srcTask?.doneWhen || oneBigWin?.doneWhen,
         isBigWin,
+        // [PATCH v36] task cố định hằng ngày (§1) luôn màu đỏ, không đổi;
+        // task do AI thêm dùng color theo group (đã gán ở
+        // enrichTasksWithContext/catalogTaskV33, đi qua buildScheduleV33).
+        isFixedRoutine: !!b.isFixedRoutine,
+        color: b.isFixedRoutine ? "#EF4444" : (srcTask?.color || b.color),
         // [PATCH v30] đánh dấu item nào là task deadline (chèn bởi
         // enrichTasksWithContext) — dùng để hiển thị "còn X ngày" riêng
         // và để checklist cuối ngày biết "sự kiện game xong chưa?".
@@ -7737,8 +8505,10 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         if (it.isFixed) {
           return (
             <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
-              <span style={{ fontSize: 10, color: theme.textDim, minWidth: 88, flexShrink: 0 }}>{it.start}–{it.end}</span>
-              <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>🏫 {it.name} (cố định)</span>
+              <span style={{ width: 6, height: 6, borderRadius: "50%", background: it.color || "#EF4444", flexShrink: 0 }}/>
+              <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
+                🕐 {it.start} 🏫 {it.name} (cố định, {minutesBetweenHHMM(it.start, it.end)}')
+              </span>
             </div>
           );
         }
@@ -7755,13 +8525,18 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         const checked = !!scheduleDone[it.key];
         const shortWhy = summarizeReason(it.why, 90);
         const wasReduced = !!skipAnalysis[it.key]?.shouldReduce;
+        // [PATCH v36] MỤC 3: màu viền trái = màu phân loại (đỏ cho task cố
+        // định, 1 trong 7 màu bảng cho task AI thêm theo group) thay vì
+        // theo priority như cũ — priority vẫn còn dùng cho displayItems'
+        // sort ở trên, chỉ đổi phần hiển thị màu.
+        const itemColor = it.color || aiPlannerPriorityClass(it.priority);
         return (
           <div key={it.key}
             style={{
               display: "flex", gap: 10, alignItems: "flex-start",
               padding: "9px 10px", borderRadius: 10, marginBottom: 6, position: "relative",
               background: it.isBigWin ? `${accent}12` : it.isDeadlineTask ? `${theme.warning}12` : theme.bg,
-              borderLeft: `3px solid ${aiPlannerPriorityClass(it.priority)}`,
+              borderLeft: `3px solid ${itemColor}`,
               opacity: wasReduced && !checked ? 0.75 : 1,
             }}>
             <div style={{ marginTop: 1, cursor: "pointer" }} onClick={() => toggleItem(it)}>
@@ -7771,10 +8546,9 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
               <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 600, color: theme.text,
                   textDecoration: checked ? "line-through" : "none" }}>
-                  {checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}{it.name}
-                </span>
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, whiteSpace: "nowrap" }}>
-                  {it.start ? `${it.start}–${it.end}` : (it.dur > 0 ? `${it.dur}'` : "")}
+                  {checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}
+                  {/* [PATCH v36] MỤC 1: format giờ cụ thể "🕐 HH:MM Tên (dur')" */}
+                  {it.start ? `🕐 ${it.start} ` : ""}{it.name}{it.dur > 0 ? ` (${it.dur}')` : ""}
                 </span>
               </div>
               {shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
@@ -7811,7 +8585,9 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       )}
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 10, color: theme.textDim, marginTop: 6 }}>
-        <span>⏱ Tổng {totalMinutes}'{confidence ? ` · 🎯 Độ tin cậy ${confidence.score}%` : ""}</span>
+        {/* [PATCH v36] MỤC 6: ẩn "Độ tin cậy: X%" ở tab Hôm nay — vẫn còn
+            hiển thị đầy đủ trong tab AI Planner (AIPlannerBeta, không đụng). */}
+        <span>⏱ Tổng {totalMinutes}'</span>
         <button onClick={regenerate} disabled={regenerating}
           style={{ padding: "5px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: "transparent",
             color: regenerating ? theme.textDim : theme.text, fontSize: 10, fontWeight: 600,
@@ -8337,8 +9113,15 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
         {/* XP x2 + Settings row */}
         <div style={{display:"flex",gap:8}}>
           {(()=>{
-            const doneCount=TASKS.filter(t=>data.tasks?.[t.id]).length;
-            const allTasksDone=doneCount>=TASKS.length;
+            // [PATCH v32] TASKS (20 task cố định cũ) không còn UI nào trong
+            // Today để tick nữa từ V24 (đã chuyển hẳn sang Kho việc nhỏ) —
+            // data.tasks?.[t.id] ở đây luôn rỗng nên allTasksDone luôn false
+            // một cách âm thầm, vô hiệu hoá điều kiện bonus XP x2. Đổi sang
+            // đo đúng nguồn dữ liệu Today thực sự dùng: 5 việc nhỏ hôm nay
+            // (dailyPicks/poolDone) đã tick hết.
+            const picksToday = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
+            const doneCount = picksToday.filter(id=>data.poolDone?.[id]).length;
+            const allTasksDone = picksToday.length>0 && doneCount>=picksToday.length;
             const streakMilestone=str===7||str===14||str===30||str===60||str===100;
             // Achievement quan trọng đạt được HÔM NAY (không tính đã đạt từ trước)
             const IMPORTANT_ACH_IDS=["streak30","xp1000","xp5000","srank","allTasks"];
@@ -8355,7 +9138,7 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
             }
             const eligible=allTasksDone||chalDone||streakMilestone||!!importantAchToday;
             const reasons=[
-              allTasksDone&&"hoàn thành 20/20 task",
+              allTasksDone&&`hoàn thành ${picksToday.length}/${picksToday.length} nhiệm vụ hôm nay`,
               chalDone&&"hoàn thành thử thách hôm nay",
               streakMilestone&&`chuỗi ${str} ngày`,
               importantAchToday&&`mở khóa thành tựu "${importantAchToday.name}"`,
