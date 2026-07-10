@@ -320,11 +320,17 @@ function computeRemainingMinutes(nowTime, day, extraEvents){
 }
 
 /* ── CONTEXT BUILDER ────────────────────────────────────────────────── */
+// [PATCH v37] MỤC 3: lịch học thêm cố định theo đúng spec Bảo cung cấp —
+// Toán: Thứ 5 (17:15-19:15), Thứ 7 (19:00-21:00); Lý: Thứ 2 (19:30-21:00),
+// Thứ 5 (19:30-21:00). Tên môn được ghi rõ ("Học thêm Toán"/"Học thêm Lý")
+// thay vì nhãn chung "Học thêm" như trước — để hiển thị đúng trong
+// SmartSchedule/AIPlannerBeta và để buildScheduleV33 (KHÔNG đụng) chèn
+// đúng "tường cứng" theo tên. Không đụng phần còn lại của Context Builder.
 function computeFixedEvents(day){
   const events = [];
   if(day === "Thứ 5") events.push({name:"Học thêm Toán", start:"17:15", end:"19:15"}, {name:"Học thêm Lý", start:"19:30", end:"21:00"});
-  if(day === "Thứ 2") events.push({name:"Học thêm", start:"19:30", end:"21:00"});
-  if(day === "Thứ 7") events.push({name:"Học thêm", start:"19:00", end:"21:00"});
+  if(day === "Thứ 2") events.push({name:"Học thêm Lý", start:"19:30", end:"21:00"});
+  if(day === "Thứ 7") events.push({name:"Học thêm Toán", start:"19:00", end:"21:00"});
   if(["Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6"].includes(day)) events.push({name:"Học ở trường", start:"07:00", end:"11:20"});
   return events;
 }
@@ -1507,6 +1513,9 @@ const FIXED_TASKS_DEFAULT_V33 = [
   { id: "fx_sleep",     name: "Ngủ trước 23:30",         start: "23:00", dur: 30, xp: 20, color: "#EF4444" },
 ];
 const FIXED_TASKS_KEY_V33 = "v33:fixedTasks";
+// [PATCH v37] MỤC 5+6: bật/tắt "Tự động điều chỉnh" — key lưu string
+// "true"/"false", mặc định BẬT (null/"null" → coi như bật, xem skipItem).
+const AUTO_ADJUST_KEY_V37 = "v37:autoAdjustEnabled";
 
 // [PATCH v36] Đọc danh sách task cố định từ storage; nếu chưa có (lần đầu
 // mở app) thì ghi seed mặc định vào storage rồi trả về, để lần sau đọc lại
@@ -1616,8 +1625,39 @@ function colorForTaskGroupV33(group) {
   return AI_TASK_COLOR_PALETTE[group] || AI_TASK_COLOR_EXTRA[0];
 }
 
-function catalogTaskV33(key, whyOverride, priority) {
-  const base = TASK_CATALOG_V33[key];
+// [PATCH v38] DANH MỤC TASK TUỲ CHỈNH — cho phép Gia Bảo tự thêm task mới
+// vào TASK_CATALOG_V33 (tên, thời lượng, XP, icon, nhóm màu) qua form
+// "📋 Quản lý danh mục task" trong tab AI Planner, KHÔNG sửa
+// TASK_CATALOG_V33 gốc (giữ nguyên mọi key/task có sẵn — spec §10 vẫn
+// đúng, các task đã bị bỏ vẫn không quay lại được trừ khi tự thêm lại).
+// Lưu ở storage riêng "v38:customCatalog" dạng { [key]: {name,dur,xp,icon,group} },
+// merge ĐÈ LÊN TASK_CATALOG_V33 lúc dùng (custom key trùng key gốc sẽ ghi
+// đè task gốc đó — cho phép "sửa" task có sẵn; key mới hoàn toàn sẽ là
+// task mới). generatePlan()/aiPlannerCore.js không hề biết catalog này tồn
+// tại — nó chỉ được dùng bởi catalogTaskV33/enrichTasksWithContext (đã có
+// từ trước), và bởi các luật gợi ý tuỳ chỉnh (xem RULE_* bên dưới).
+const CUSTOM_CATALOG_KEY_V38 = "v38:customCatalog";
+async function loadCustomCatalogV38() {
+  try {
+    const raw = await S.get(CUSTOM_CATALOG_KEY_V38);
+    if (raw && raw !== "null") {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") return parsed;
+    }
+  } catch {}
+  return {};
+}
+async function saveCustomCatalogV38(map) {
+  await S.set(CUSTOM_CATALOG_KEY_V38, JSON.stringify(map));
+}
+// Bảng catalog "hiệu lực" = gốc + tuỳ chỉnh đè lên. Dùng ở khắp nơi cần
+// liệt kê/tra key thay vì đọc thẳng TASK_CATALOG_V33.
+function effectiveCatalogV38(customCatalog) {
+  return { ...TASK_CATALOG_V33, ...(customCatalog || {}) };
+}
+
+function catalogTaskV33(key, whyOverride, priority, customCatalog) {
+  const base = effectiveCatalogV38(customCatalog)[key];
   if (!base) return null;
   return {
     name: base.name, dur: base.dur, xp: base.xp, icon: base.icon, group: base.group,
@@ -1647,7 +1687,165 @@ function yesterdaySubjectsV33(day) {
   return subjects;
 }
 
-function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, formGoalMode, phoneFreeStreak, customFixedTasks) {
+// [PATCH v38] LUẬT GỢI Ý THEO THỨ (tuỳ chỉnh) — cho phép Gia Bảo tự chọn
+// "Thứ X thì gợi ý các task nào" bằng cách chọn từ danh mục (catalog key),
+// KHÔNG cần code. Lưu ở "v38:dayRules" dạng { [dayName]: [catalogKey, ...] }.
+// Nếu 1 thứ CÓ cấu hình (mảng tồn tại, kể cả rỗng) → THAY THẾ HOÀN TOÀN
+// nhánh hardcode §5 cũ của thứ đó (mọi task trong mảng được thêm với
+// priority mặc định "med", why mặc định). Nếu thứ đó KHÔNG có key trong
+// object (chưa từng cấu hình) → giữ nguyên logic hardcode cũ y hệt trước
+// đây, không đổi gì. Điều này đảm bảo: app cũ / chưa mở form này lần nào
+// vẫn chạy đúng 100% như trước (spec "không refactor logic cũ").
+const DAY_RULES_KEY_V38 = "v38:dayRules";
+async function loadDayRulesV38() {
+  try {
+    const raw = await S.get(DAY_RULES_KEY_V38);
+    if (raw && raw !== "null") {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") return parsed;
+    }
+  } catch {}
+  return {};
+}
+async function saveDayRulesV38(map) {
+  await S.set(DAY_RULES_KEY_V38, JSON.stringify(map));
+}
+const WEEKDAY_NAMES_V38 = ["Chủ nhật", "Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7"];
+
+// [PATCH v38] LUẬT ĐIỀU KIỆN NÂNG CAO (tuỳ chỉnh) — "Nếu [field] [so sánh]
+// [giá trị] thì thêm task [catalog key]". Chạy CỘNG THÊM vào cuối (sau §9),
+// không thay thế bất kỳ nhánh hardcode nào — an toàn tuyệt đối với logic
+// cũ. Mỗi luật có "enabled" (bật/tắt tạm, không xoá — theo yêu cầu Gia
+// Bảo) và áp dụng theo đúng thứ tự lưu trong danh sách. field có thể là:
+// "energy" (số 1-5), "tiktok" (phút), "streak" (số ngày), "day" (so sánh
+// chuỗi đúng tên thứ). Lưu ở "v38:conditionRules" dạng mảng.
+const CONDITION_RULES_KEY_V38 = "v38:conditionRules";
+async function loadConditionRulesV38() {
+  try {
+    const raw = await S.get(CONDITION_RULES_KEY_V38);
+    if (raw && raw !== "null") {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+async function saveConditionRulesV38(list) {
+  await S.set(CONDITION_RULES_KEY_V38, JSON.stringify(list));
+}
+function evalConditionRuleV38(rule, factValue) {
+  const a = rule.field === "day" ? String(factValue) : Number(factValue);
+  const b = rule.field === "day" ? String(rule.value) : Number(rule.value);
+  switch (rule.op) {
+    case "eq": return a === b;
+    case "neq": return a !== b;
+    case "gte": return a >= b;
+    case "lte": return a <= b;
+    case "gt": return a > b;
+    case "lt": return a < b;
+    default: return false;
+  }
+}
+const CONDITION_FIELD_LABELS_V38 = { energy: "Năng lượng", tiktok: "Phút TikTok", streak: "Streak (ngày)", day: "Thứ" };
+const CONDITION_OP_LABELS_V38 = { eq: "=", neq: "≠", gte: "≥", lte: "≤", gt: ">", lt: "<" };
+function ruleLabelV38(rule) {
+  const f = CONDITION_FIELD_LABELS_V38[rule.field] || rule.field;
+  const o = CONDITION_OP_LABELS_V38[rule.op] || rule.op;
+  return `${f} ${o} ${rule.value}`;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v39] MỤC 3 — PHÁT HIỆN XUNG ĐỘT LUẬT (detectRuleConflicts).
+// Helper THUẦN (pure): chỉ nhận mảng luật điều kiện (conditionRules), KHÔNG
+// đụng storage, KHÔNG có side-effect, không phụ thuộc React. Trả về mảng
+// cảnh báo { level: "warn"|"high", kind, message, ruleIds: [...] }.
+//
+// 3 loại kiểm tra (đúng theo yêu cầu):
+//  (1) Cùng field + cùng "hướng" so sánh (gte/gt cùng nhóm "tăng", lte/lt
+//      cùng nhóm "giảm") nhưng khác taskKey → "có thể trùng" (level: warn).
+//      VD: energy >= 4 → task A, energy >= 3 → task B: cùng field "energy",
+//      cùng hướng "tăng" → 2 luật dễ cùng kích hoạt chồng nhau.
+//  (2) Mâu thuẫn logic thực sự trên CÙNG field: 1 luật đòi >= X, luật kia
+//      đòi <= Y với Y < X (không bao giờ cùng đúng), hoặc eq khác giá trị
+//      cho cùng field → "mâu thuẫn logic" (level: high).
+//  (3) Task trùng lặp: 2+ luật (bất kể field/op) cùng trỏ tới 1 taskKey →
+//      cảnh báo nhẹ "task trùng lặp" (level: warn).
+//
+// Chỉ xét các luật enabled !== false (luật đã tắt không tính xung đột).
+// Hàm này được gọi ở 2 nơi: (a) ConditionRulesManager/RuleEditorFlow ngay
+// khi lưu 1 luật mới — chỉ cần lọc kết quả có chứa ruleIds của luật vừa
+// thêm; (b) PreviewModal — chạy trên toàn bộ danh sách hiện tại (kể cả
+// draft chưa lưu) để hiển thị mọi xung đột đang tồn tại.
+// ════════════════════════════════════════════════════════════════════════
+function ruleCompareDirectionV39(op) {
+  if (op === "gte" || op === "gt") return "up";
+  if (op === "lte" || op === "lt") return "down";
+  return null; // eq/neq không có "hướng" tăng/giảm
+}
+function detectRuleConflicts(conditionRules) {
+  const warnings = [];
+  const rules = (Array.isArray(conditionRules) ? conditionRules : []).filter(r => r && r.enabled !== false);
+
+  for (let i = 0; i < rules.length; i++) {
+    for (let j = i + 1; j < rules.length; j++) {
+      const a = rules[i], b = rules[j];
+      if (a.field !== b.field) continue;
+      const av = Number(a.value), bv = Number(b.value);
+      const aDir = ruleCompareDirectionV39(a.op);
+      const bDir = ruleCompareDirectionV39(b.op);
+
+      // (2) Mâu thuẫn logic thực sự — chỉ tính được khi giá trị là số
+      // (field "day" so sánh chuỗi, bỏ qua nhánh này cho "day").
+      if (a.field !== "day" && !Number.isNaN(av) && !Number.isNaN(bv)) {
+        let contradicts = false;
+        if (aDir === "up" && bDir === "down" && bv < av) contradicts = true;   // vd >=5 và <=3
+        if (aDir === "down" && bDir === "up" && av < bv) contradicts = true;   // vd <=3 và >=5 (thứ tự ngược)
+        if (a.op === "eq" && b.op === "eq" && av !== bv) contradicts = true;   // eq khác giá trị
+        if ((a.op === "eq" && bDir === "down" && av > bv) || (a.op === "eq" && bDir === "up" && av < bv)) contradicts = true;
+        if ((b.op === "eq" && aDir === "down" && bv > av) || (b.op === "eq" && aDir === "up" && bv < av)) contradicts = true;
+        if (contradicts) {
+          warnings.push({
+            level: "high",
+            kind: "contradiction",
+            message: `Mâu thuẫn logic: "${ruleLabelV38(a)}" và "${ruleLabelV38(b)}" không thể cùng đúng.`,
+            ruleIds: [a.id, b.id],
+          });
+          continue; // đã là mâu thuẫn logic thì không cần xét thêm "có thể trùng" cho cặp này
+        }
+      }
+
+      // (1) Cùng field, cùng hướng so sánh, khác task → có thể trùng.
+      if (aDir && aDir === bDir && a.taskKey !== b.taskKey) {
+        warnings.push({
+          level: "warn",
+          kind: "same_direction",
+          message: `Có thể trùng: "${ruleLabelV38(a)}" và "${ruleLabelV38(b)}" cùng hướng điều kiện trên "${CONDITION_FIELD_LABELS_V38[a.field] || a.field}", dễ cùng kích hoạt.`,
+          ruleIds: [a.id, b.id],
+        });
+      }
+    }
+  }
+
+  // (3) Task trùng lặp — gom theo taskKey, cảnh báo 1 lần cho mỗi nhóm 2+.
+  const byTaskKey = {};
+  rules.forEach(r => {
+    if (!r.taskKey) return;
+    (byTaskKey[r.taskKey] = byTaskKey[r.taskKey] || []).push(r);
+  });
+  Object.entries(byTaskKey).forEach(([taskKey, group]) => {
+    if (group.length < 2) return;
+    warnings.push({
+      level: "warn",
+      kind: "duplicate_task",
+      message: `Task trùng lặp: ${group.length} luật cùng thêm task "${taskKey}" (${group.map(r => ruleLabelV38(r)).join("; ")}).`,
+      ruleIds: group.map(r => r.id),
+    });
+  });
+
+  return warnings;
+}
+
+function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, formGoalMode, phoneFreeStreak, customFixedTasks, customCatalog, dayRules, conditionRules) {
   if (!result) return result;
   const day = ctx?.day;
   const homeworkPending = ctx?.homeworkStatus === "chưa xong";
@@ -1670,72 +1868,94 @@ function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePl
   if (homeworkPending) {
     if (ySubjects.includes("math")) {
       tasks.push(catalogTaskV33("homeworkMath",
-        "Hôm qua có Toán và bài tập chưa xong — ưu tiên làm trước.", "high"));
+        "Hôm qua có Toán và bài tập chưa xong — ưu tiên làm trước.", "high", customCatalog));
     }
     if (ySubjects.includes("phys")) {
       tasks.push(catalogTaskV33("homeworkPhys",
-        "Hôm qua có Lý và bài tập chưa xong — ưu tiên làm trước.", "high"));
+        "Hôm qua có Lý và bài tập chưa xong — ưu tiên làm trước.", "high", customCatalog));
     }
   }
   const homeworkFullyDone = homeworkDone || (ySubjects.length > 0 && homeworkPending === false) || (ySubjects.length === 0);
   // homeworkOutstanding: còn bài tập treo (dùng để chặn giải trí/game bên dưới, §5 tinh thần cũ vẫn giữ).
   const homeworkOutstanding = homeworkPending && ySubjects.length > 0;
 
-  // §5 — theo ngày trong tuần. Thứ 5 là "ngày nặng": chỉ task cố định + học
-  // thêm, không thêm gì khác — return sớm sau khi áp §6/§7/§9 an toàn ở dưới
-  // vẫn cần chạy (streak thử thách, v.v. spec không loại trừ Thứ 5 khỏi đó),
-  // nên ta dùng cờ `heavyDay` thay vì return cứng.
-  const heavyDay = day === "Thứ 5";
-  if (!heavyDay) {
+  // [PATCH v38] §5 tuỳ chỉnh — nếu Gia Bảo đã cấu hình danh sách task cho
+  // đúng `day` hôm nay qua "🗓️ Chỉnh logic gợi ý theo thứ", DÙNG DANH SÁCH
+  // ĐÓ THAY VÌ nhánh hardcode bên dưới (kể cả Thứ 5 — nếu có cấu hình cho
+  // Thứ 5 thì heavyDay không còn chặn nữa, vì người dùng đã chủ động chọn
+  // logic riêng cho hôm đó). Nếu KHÔNG có cấu hình cho `day` (key không có
+  // trong dayRules) → rơi về heavyDay + nhánh hardcode y hệt bản gốc.
+  const hasCustomDayRule = dayRules && Object.prototype.hasOwnProperty.call(dayRules, day);
+  const heavyDay = !hasCustomDayRule && day === "Thứ 5";
+
+  if (hasCustomDayRule) {
+    const keys = Array.isArray(dayRules[day]) ? dayRules[day] : [];
+    keys.forEach(k => {
+      const t = catalogTaskV33(k, undefined, undefined, customCatalog);
+      if (t) tasks.push(t);
+    });
+  } else if (!heavyDay) {
     if (day === "Thứ 2") {
-      tasks.push(catalogTaskV33("reviewOld", "Thứ 2 có Lý — ôn Lý trước.", "high"));
-      // còn thời gian thì thêm luyện đề Toán (đưa priority thấp hơn, sẽ bị
-      // cắt trước nếu không đủ thời gian rảnh — xem §7 time-budget logic).
-      tasks.push(catalogTaskV33("extraDrill", "Còn thời gian sau khi ôn Lý — luyện thêm đề Toán.", "low"));
+      tasks.push(catalogTaskV33("reviewOld", "Thứ 2 có Lý — ôn Lý trước.", "high", customCatalog));
+      tasks.push(catalogTaskV33("extraDrill", "Còn thời gian sau khi ôn Lý — luyện thêm đề Toán.", "low", customCatalog));
     } else if (day === "Thứ 3") {
-      tasks.push(catalogTaskV33("reviewOld"));
-      tasks.push(catalogTaskV33("extraDrill"));
-      tasks.push(catalogTaskV33("game", "Ngày rảnh, không học thêm."));
+      tasks.push(catalogTaskV33("reviewOld", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("extraDrill", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("game", "Ngày rảnh, không học thêm.", undefined, customCatalog));
     } else if (day === "Thứ 4") {
-      tasks.push(catalogTaskV33("reviewOld"));
-      tasks.push(catalogTaskV33("dailyMission"));
+      tasks.push(catalogTaskV33("reviewOld", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("dailyMission", undefined, undefined, customCatalog));
     } else if (day === "Thứ 6") {
-      tasks.push(catalogTaskV33("reviewOld"));
-      tasks.push(catalogTaskV33("extraDrill"));
-      tasks.push(catalogTaskV33("cleanRoom", "Dọn dẹp cuối tuần."));
+      tasks.push(catalogTaskV33("reviewOld", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("extraDrill", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("cleanRoom", "Dọn dẹp cuối tuần.", undefined, customCatalog));
     } else if (day === "Thứ 7") {
-      // có Toán — làm bài tập Toán trước 19h nếu còn treo (đã thêm ở §4
-      // nếu chưa xong); sau đó mới học thêm (khung giờ cố định lo phần này).
       if (!ySubjects.includes("math") || !homeworkOutstanding) {
-        tasks.push(catalogTaskV33("reviewOld", "Bài tập Toán đã xong hoặc không treo — ôn bài trước giờ học thêm."));
+        tasks.push(catalogTaskV33("reviewOld", "Bài tập Toán đã xong hoặc không treo — ôn bài trước giờ học thêm.", undefined, customCatalog));
       }
     } else if (day === "Chủ nhật") {
-      tasks.push(catalogTaskV33("reviewOld", "Chủ nhật — nghỉ ngơi nhẹ nhàng.", "low"));
+      tasks.push(catalogTaskV33("reviewOld", "Chủ nhật — nghỉ ngơi nhẹ nhàng.", "low", customCatalog));
       tasks[tasks.length - 1].name = "Nghỉ ngơi";
       tasks[tasks.length - 1].icon = "🛋️";
-      tasks.push(catalogTaskV33("game", "Giải trí cuối tuần."));
-      tasks.push(catalogTaskV33("cleanStorage", "Dọn kho ảnh/video/nhạc."));
+      tasks.push(catalogTaskV33("game", "Giải trí cuối tuần.", undefined, customCatalog));
+      tasks.push(catalogTaskV33("cleanStorage", "Dọn kho ảnh/video/nhạc.", undefined, customCatalog));
     }
   }
 
   // §7 — theo năng lượng. Bỏ qua hoàn toàn nếu Thứ 5 (ngày nặng, spec §5).
   if (!heavyDay && typeof energy === "number") {
     if (energy === 5) {
-      tasks.push(catalogTaskV33("run"));
-      tasks.push(catalogTaskV33("extraDrill"));
-      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 60 });
+      tasks.push(catalogTaskV33("run", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("extraDrill", undefined, undefined, customCatalog));
+      tasks.push({ ...catalogTaskV33("game", undefined, undefined, customCatalog), name: "Giải trí", dur: 60 });
     } else if (energy === 4) {
-      tasks.push(catalogTaskV33("swim"));
-      tasks.push(catalogTaskV33("reviewOld"));
-      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 45 });
+      tasks.push(catalogTaskV33("swim", undefined, undefined, customCatalog));
+      tasks.push(catalogTaskV33("reviewOld", undefined, undefined, customCatalog));
+      tasks.push({ ...catalogTaskV33("game", undefined, undefined, customCatalog), name: "Giải trí", dur: 45 });
     } else if (energy === 3) {
-      tasks.push(catalogTaskV33("reviewOld"));
-      tasks.push({ ...catalogTaskV33("game"), name: "Giải trí", dur: 30 });
+      tasks.push(catalogTaskV33("reviewOld", undefined, undefined, customCatalog));
+      tasks.push({ ...catalogTaskV33("game", undefined, undefined, customCatalog), name: "Giải trí", dur: 30 });
     } else if (energy === 2) {
-      tasks.push(catalogTaskV33("reading", "Năng lượng thấp — chỉ 1 task nhẹ.", "low"));
+      tasks.push(catalogTaskV33("reading", "Năng lượng thấp — chỉ 1 task nhẹ.", "low", customCatalog));
       tasks[tasks.length - 1].dur = 15;
     }
     // energy === 1: không thêm gì — chỉ task cố định (đã có ở §1).
+  }
+
+  // [PATCH v38] LUẬT ĐIỀU KIỆN NÂNG CAO — chạy cộng thêm, sau §7, không
+  // thay thế nhánh nào ở trên. Mỗi luật enabled=true, đúng field/op/value
+  // sẽ thêm đúng 1 task (theo catalogKey) vào cuối danh sách.
+  if (Array.isArray(conditionRules) && conditionRules.length) {
+    const facts = { energy, tiktok: tiktokMin, streak, day };
+    conditionRules.forEach(rule => {
+      if (!rule || rule.enabled === false) return;
+      const factValue = facts[rule.field];
+      if (factValue === undefined || factValue === null) return;
+      if (!evalConditionRuleV38(rule, factValue)) return;
+      const t = catalogTaskV33(rule.taskKey,
+        `Luật tuỳ chỉnh: ${ruleLabelV38(rule)}.`, rule.priority, customCatalog);
+      if (t) tasks.push(t);
+    });
   }
   const energyBlocksExtras = heavyDay || energy === 1;
 
@@ -1768,7 +1988,8 @@ function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePl
   if (tiktokMin >= 180) {
     tasks = tasks.filter(t => !isFunOrGame(t));
     tasks.push(catalogTaskV33("phoneFree30",
-      `Đã dùng TikTok ${tiktokMin} phút hôm nay — huỷ hết giải trí, thay bằng không cầm điện thoại 30 phút.`));
+      `Đã dùng TikTok ${tiktokMin} phút hôm nay — huỷ hết giải trí, thay bằng không cầm điện thoại 30 phút.`,
+      undefined, customCatalog));
   } else if (tiktokMin >= 90) {
     tasks = tasks.map(t => isFunOrGame(t) ? { ...t, dur: Math.max(5, Math.round(t.dur * 0.5)),
       why: (t.why || "") + ` (Giảm 50% vì TikTok đã ${tiktokMin} phút hôm nay.)` } : t);
@@ -1777,9 +1998,9 @@ function enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePl
 
   // §9 — streak thử thách (best-effort: ctx không đảm bảo có streak field
   // rõ ràng qua Core hiện tại, nên các task này chỉ thêm khi có tín hiệu).
-  if (!heavyDay && streak >= 7 && !homeworkOutstanding) tasks.push(catalogTaskV33("twoSubjects"));
-  if (!heavyDay && streak >= 14 && !homeworkOutstanding) tasks.push(catalogTaskV33("advancedDrill"));
-  if (!heavyDay && streak >= 30 && !homeworkOutstanding) tasks.push(catalogTaskV33("teachOthers"));
+  if (!heavyDay && streak >= 7 && !homeworkOutstanding) tasks.push(catalogTaskV33("twoSubjects", undefined, undefined, customCatalog));
+  if (!heavyDay && streak >= 14 && !homeworkOutstanding) tasks.push(catalogTaskV33("advancedDrill", undefined, undefined, customCatalog));
+  if (!heavyDay && streak >= 30 && !homeworkOutstanding) tasks.push(catalogTaskV33("teachOthers", undefined, undefined, customCatalog));
 
   // §5 tiếp — bài tập chưa xong luôn chặn giải trí/game bất kể ngày (giữ
   // tinh thần "ưu tiên học trước" của §11 dù không nêu tường minh ở §5).
@@ -2010,8 +2231,39 @@ async function resolvePhoneFreeStreakV33(td) {
   try { await S.set(PHONE_FREE_STREAK_KEY, JSON.stringify({ count, lastDate: td })); } catch {}
   return count;
 }
+// [PATCH v39] Bản chỉ-đọc của resolvePhoneFreeStreakV33, dùng riêng cho
+// previewMode — tính đúng cùng công thức nhưng KHÔNG S.set, để "Xem thử"
+// không làm lệch streak thật (streak thật chỉ được advance khi người dùng
+// thực sự chạy/lưu kế hoạch qua nhánh previewMode=false).
+async function peekPhoneFreeStreakV33(td) {
+  let streak = { count: 0, lastDate: null };
+  try {
+    const raw = await S.get(PHONE_FREE_STREAK_KEY);
+    if (raw && raw !== "null") streak = JSON.parse(raw);
+  } catch {}
+  const yesterday = isoDateMinusDays(td, 1);
+  let count = streak.count || 0;
+  if (streak.lastDate === td) {
+    // đã chạy hôm nay rồi — giữ nguyên
+  } else if (streak.lastDate === yesterday) {
+    count = count + 1;
+  } else {
+    count = 0;
+  }
+  return count;
+}
 
-async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts, taskPool, deadlinePlan }) {
+// [PATCH v39] previewMode + draftOverrides — cho phép "Xem thử lịch" chạy
+// toàn bộ pipeline với luật CHƯA LƯU (draft), không ghi bất kỳ storage nào
+// (không appendEntry, không lưu phoneFreeStreak). Khi previewMode=false
+// (mặc định, y hệt trước đây), hành vi 100% không đổi — mọi luật đọc từ
+// storage như cũ, kết quả vẫn được lưu qua storage.appendEntry.
+// draftOverrides = { dayRules, conditionRules, catalog } — field nào có
+// mặt (kể cả object/array rỗng) sẽ THAY THẾ bản đọc từ storage cho lần
+// chạy preview này; field nào không truyền → vẫn đọc từ storage như thường
+// (cho phép preview chỉ 1 trong 3 loại luật đang chỉnh, giữ 2 loại còn lại
+// đúng như đã lưu).
+async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts, taskPool, deadlinePlan, previewMode, draftOverrides }) {
   const rawState = { ...form };
   const ctx = core.buildContext(rawState);
   let { result: rawResult, trace } = core.generatePlan(ctx);
@@ -2024,11 +2276,29 @@ async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts
   // other task by count. Energy/TikTok pressure is expressed as duration
   // shrink only now, never a task-count cut (fixes: task list getting cut
   // even at energy=5, because REDUCE_TASK's capTasks:2 doesn't check energy).
-  const phoneFreeStreak = await resolvePhoneFreeStreakV33(td);
+  // [PATCH v39] preview không được phép ghi lệch streak thật — đọc mà
+  // KHÔNG lưu khi previewMode (resolvePhoneFreeStreakV33 luôn S.set; ta
+  // dùng giá trị hiện có trong storage, chưa +1, để không làm sai streak
+  // thật nếu người dùng chỉ đang xem thử chứ chưa chạy chính thức hôm nay).
+  const phoneFreeStreak = previewMode
+    ? await peekPhoneFreeStreakV33(td)
+    : await resolvePhoneFreeStreakV33(td);
   // [PATCH v36] task cố định giờ đọc từ storage (người dùng quản lý qua
   // form trong tab AI Planner) thay vì hardcode.
   const customFixedTasks = await loadFixedTasksV33();
-  result = enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, form.goalMode, phoneFreeStreak, customFixedTasks);
+  // [PATCH v38] danh mục task tuỳ chỉnh + luật gợi ý theo thứ + luật điều
+  // kiện nâng cao — đều đọc từ storage, rơi về {}/[] (= hành vi gốc y hệt
+  // trước đây) nếu Gia Bảo chưa từng mở các form quản lý mới này.
+  // [PATCH v39] draftOverrides (nếu có field tương ứng) đè lên bản đọc từ
+  // storage — chỉ dùng cho previewMode, không ghi lại storage.
+  const overrides = draftOverrides || {};
+  const customCatalog = Object.prototype.hasOwnProperty.call(overrides, "catalog")
+    ? overrides.catalog : await loadCustomCatalogV38();
+  const dayRules = Object.prototype.hasOwnProperty.call(overrides, "dayRules")
+    ? overrides.dayRules : await loadDayRulesV38();
+  const conditionRules = Object.prototype.hasOwnProperty.call(overrides, "conditionRules")
+    ? overrides.conditionRules : await loadConditionRulesV38();
+  result = enrichTasksWithContext(result, ctx, db, td, setts, taskPool, deadlinePlan, form.goalMode, phoneFreeStreak, customFixedTasks, customCatalog, dayRules, conditionRules);
   result = applySafetyOverridesV33(result, ctx);
   const plannerOutput = core.runPlannerEngine(ctx, result, dayLog);
   // [PATCH v36] BUG FIX: Core's own buildSchedule() (bên trong
@@ -2041,6 +2311,15 @@ async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts
   plannerOutput.schedule = buildScheduleV33(result.tasks, ctx);
   const prevEntry = dayLog.length ? dayLog[dayLog.length - 1] : null;
   const regenReason = core.detectRegenReason(prevEntry, ctx);
+
+  // [PATCH v39] previewMode: KHÔNG ghi storage (không appendEntry) — trả
+  // về 1 bucket "today" giả cùng shape (entries: [entry]) để UI xem thử có
+  // thể tái dùng nguyên component hiển thị cũ (AIPlannerEntryCard/schedule)
+  // mà không cần nhánh hiển thị riêng.
+  const previewEntry = { id: "preview_" + Date.now(), createdAt: new Date().toISOString(), ctx, result, trace, regenReason, plannerOutput, isPreview: true };
+  if (previewMode) {
+    return { schemaVersion: AIPLANNER_SCHEMA_VERSION, date: td, entries: [previewEntry], isPreview: true };
+  }
 
   const updatedToday = await storage.appendEntry(td, { ctx, result, trace, regenReason, plannerOutput });
   return updatedToday;
@@ -2146,6 +2425,25 @@ const AI_PLANNER_EVENT_OPTIONS = [
   { val: "slipped", label: "Đã xem nhiều nội dung ngắn" },
   { val: "noData", label: "Hôm nay hơi mệt" },
   { val: "wantsOverride", label: "Có chuyện khiến mình căng thẳng" },
+];
+
+// [PATCH v37] MỤC 1: form check-in thông minh — hằng số cho các lựa chọn
+// (a)/(d), key lưu storage cho (a)-(e), và danh sách môn học cho (c). Đây
+// là dữ liệu lớp UI thuần, KHÔNG đưa thẳng vào buildContext()/rawState mà
+// core cần — xem cách handleRun gộp các field này vào freeNote/extraEvents
+// bên dưới (giữ nguyên hợp đồng cũ của Core, không sửa aiPlannerCore.js).
+const CHECKIN_STORAGE_KEY_V37 = "v37:lastCheckin";
+const SPECIAL_PLAN_OPTIONS_V37 = [
+  { val: "swim", label: "🏊 Đi bơi / thể thao" },
+  { val: "friends", label: "🧑‍🤝‍🧑 Đi chơi với bạn bè" },
+  { val: "family", label: "👨‍👩‍👧 Có việc gia đình" },
+  { val: "chores", label: "🧹 Làm việc nhà nhiều" },
+];
+const MAIN_GOAL_OPTIONS_V37 = [
+  { val: "study", label: "📚 Học tập (ưu tiên học)" },
+  { val: "rest", label: "😌 Nghỉ ngơi (ưu tiên thư giãn)" },
+  { val: "chores", label: "🧹 Làm việc nhà (ưu tiên dọn dẹp)" },
+  { val: "fun", label: "🎮 Giải trí (game, nhạc, đọc)" },
 ];
 
 function aiPlannerPriorityClass(p) {
@@ -2344,6 +2642,1140 @@ function FixedTasksManager() {
   );
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v37] MỤC 6: "⚙️ Quản lý lịch trình" trong tab AI Planner —
+// gộp: (a) bật/tắt Tự động điều chỉnh (đọc/ghi v37:autoAdjustEnabled,
+// dùng bởi SmartSchedule.skipItem), (b) xem skipHistory (v25:skipHistory,
+// đã có sẵn qua loadSkipHistory — KHÔNG tạo storage mới, chỉ đọc lại để
+// hiển thị). Thêm/sửa/xoá task cố định vẫn ở FixedTasksManager riêng biệt
+// (đã có từ v36) — panel này KHÔNG trùng chức năng, chỉ bổ sung phần còn
+// thiếu theo spec §6.
+// ════════════════════════════════════════════════════════════════════════
+function ScheduleManagerPanel() {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [autoAdjust, setAutoAdjust] = useState(true);
+  const [skipList, setSkipList] = useState([]);
+  const [loadingSkip, setLoadingSkip] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await S.get(AUTO_ADJUST_KEY_V37);
+        if (!cancelled) setAutoAdjust(raw === null || raw === "null" || raw === "true");
+      } catch {}
+      setLoadingSkip(true);
+      try {
+        const list = await loadSkipHistory();
+        if (!cancelled) setSkipList([...list].reverse().slice(0, 30)); // gần nhất trước
+      } catch {}
+      if (!cancelled) setLoadingSkip(false);
+    })();
+    return () => { cancelled = true; };
+  }, [open]);
+
+  const toggleAutoAdjust = async () => {
+    const next = !autoAdjust;
+    setAutoAdjust(next);
+    try { await S.set(AUTO_ADJUST_KEY_V37, String(next)); } catch {}
+  };
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 14, padding: 12, marginBottom: 12 }}>
+      <div onClick={() => setOpen(o => !o)}
+        style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>⚙️ Quản lý lịch trình</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở rộng"}</span>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "8px 10px", borderRadius: 8, background: theme.bg, marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>Tự động điều chỉnh</div>
+              <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>
+                Khi bỏ 1 task (vd đi bơi/đi chơi), AI tự "Làm lại" để dồn việc còn lại vào khung giờ trống.
+              </div>
+            </div>
+            <button onClick={toggleAutoAdjust}
+              style={{ width: 40, height: 22, borderRadius: 999, border: "none", flexShrink: 0, marginLeft: 10,
+                background: autoAdjust ? accent : theme.border, position: "relative", cursor: "pointer" }}>
+              <span style={{ position: "absolute", top: 2, left: autoAdjust ? 20 : 2, width: 18, height: 18,
+                borderRadius: "50%", background: "#fff", transition: "left 0.15s ease" }}/>
+            </button>
+          </div>
+
+          <div style={{ fontSize: 12, fontWeight: 600, color: theme.text, marginBottom: 6 }}>
+            📊 Lịch sử bỏ qua ({skipList.length})
+          </div>
+          {loadingSkip && <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>}
+          {!loadingSkip && skipList.length === 0 && (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Chưa có task nào bị bỏ qua.</div>
+          )}
+          {!loadingSkip && skipList.map((s, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 11,
+              color: theme.textDim, padding: "4px 0", borderBottom: i < skipList.length - 1 ? `1px solid ${theme.border}` : "none" }}>
+              <span style={{ color: theme.text }}>{s.taskName}</span>
+              <span>{s.date} · {s.reason === "manual_skip" ? "Bỏ qua tay" : "Hết giờ"}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v38] MỤC 7: "📋 Quản lý danh mục task" — thêm/sửa/xoá task trong
+// TASK_CATALOG_V33 mà không đụng file gốc. Đọc/ghi "v38:customCatalog"
+// qua loadCustomCatalogV38/saveCustomCatalogV38. Mỗi task tuỳ chỉnh có:
+// key (định danh nội bộ, tự sinh), tên, thời lượng, XP, icon, nhóm màu
+// (chọn 1 trong 5 nhóm màu có sẵn — study/sport/clean/fun/other — để màu
+// hiển thị nhất quán với hệ thống 7 màu đã có). Task tự thêm sẽ xuất hiện
+// làm lựa chọn ở "🗓️ Chỉnh logic gợi ý theo thứ" và "🧠 Luật điều kiện
+// nâng cao" bên dưới (dùng chung 1 catalog hiệu lực = gốc + tuỳ chỉnh).
+// ════════════════════════════════════════════════════════════════════════
+const CATALOG_GROUP_OPTIONS_V38 = [
+  { key: "study", label: "📐 Học" },
+  { key: "sport", label: "🏃 Thể thao" },
+  { key: "clean", label: "🧹 Dọn dẹp" },
+  { key: "fun", label: "🎮 Giải trí" },
+  { key: "other", label: "✨ Khác" },
+];
+function CatalogManager() {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [custom, setCustom] = useState({});
+  const [editingKey, setEditingKey] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [saveMsg, setSaveMsg] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const c = await loadCustomCatalogV38();
+      if (!cancelled) { setCustom(c); setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [open]);
+
+  const persist = async (next) => {
+    setCustom(next);
+    await saveCustomCatalogV38(next);
+    setSaveMsg("✅ Đã lưu");
+    setTimeout(() => setSaveMsg(null), 1500);
+  };
+
+  const startAdd = () => {
+    setEditingKey("new");
+    setDraft({ key: "custom_" + Date.now(), name: "", dur: 30, xp: 15, icon: "⭐", group: "study" });
+  };
+  const startEdit = (key, base) => {
+    setEditingKey(key);
+    setDraft({ key, ...base });
+  };
+  const cancelEdit = () => { setEditingKey(null); setDraft(null); };
+
+  const saveDraft = async () => {
+    if (!draft || !draft.name.trim()) return;
+    const clean = {
+      name: draft.name.trim(),
+      dur: Math.max(1, Number(draft.dur) || 1),
+      xp: Math.max(0, Number(draft.xp) || 0),
+      icon: draft.icon || "⭐",
+      group: draft.group || "study",
+    };
+    const next = { ...custom, [draft.key]: clean };
+    await persist(next);
+    cancelEdit();
+  };
+
+  const removeTask = async (key) => {
+    const next = { ...custom };
+    delete next[key];
+    await persist(next);
+    if (editingKey === key) cancelEdit();
+  };
+
+  const isOverride = (key) => Object.prototype.hasOwnProperty.call(TASK_CATALOG_V33, key);
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>📋 Quản lý danh mục task</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở"}</span>
+      </div>
+      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+        Tự thêm task mới (tên, thời lượng, XP, icon, nhóm màu) để AI có thể gợi ý — dùng ở 2 mục bên dưới.
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>
+          ) : (
+            <>
+              {Object.keys(custom).length === 0 && (
+                <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 8 }}>Chưa có task tuỳ chỉnh nào.</div>
+              )}
+              {Object.entries(custom).map(([key, t]) => (
+                <div key={key} style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                  borderRadius: 10, marginBottom: 6, background: theme.bg,
+                  borderLeft: `3px solid ${colorForTaskGroupV33(t.group)}`,
+                }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>
+                      {t.icon} {t.name} ({t.dur}') {isOverride(key) && <span style={{ color: theme.textDim, fontWeight: 400 }}>· ghi đè gốc</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>
+                      +{t.xp} XP · {CATALOG_GROUP_OPTIONS_V38.find(g => g.key === t.group)?.label || t.group}
+                    </div>
+                  </div>
+                  <button onClick={() => startEdit(key, t)}
+                    style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.text, cursor: "pointer" }}>
+                    Sửa
+                  </button>
+                  <button onClick={() => removeTask(key)}
+                    style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.danger}55`, background: "transparent", color: theme.danger, cursor: "pointer" }}>
+                    Xoá
+                  </button>
+                </div>
+              ))}
+
+              {editingKey && draft && (
+                <div style={{ padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, marginTop: 6, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+                    {editingKey === "new" ? "➕ Thêm task mới vào danh mục" : "✏️ Sửa task trong danh mục"}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <input placeholder="Tên task" value={draft.name}
+                      onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+                      style={{ padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}/>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Thời lượng (phút)
+                        <input type="number" min="1" value={draft.dur}
+                          onChange={e => setDraft(d => ({ ...d, dur: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        XP
+                        <input type="number" min="0" value={draft.xp}
+                          onChange={e => setDraft(d => ({ ...d, xp: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Icon (emoji)
+                        <input value={draft.icon}
+                          onChange={e => setDraft(d => ({ ...d, icon: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 14, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ flex: 2, fontSize: 10, color: theme.textDim }}>
+                        Nhóm màu
+                        <select value={draft.group}
+                          onChange={e => setDraft(d => ({ ...d, group: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}>
+                          {CATALOG_GROUP_OPTIONS_V38.map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button onClick={saveDraft} disabled={!draft.name.trim()}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 12,
+                        background: accent, color: "#fff", cursor: draft.name.trim() ? "pointer" : "default",
+                        opacity: draft.name.trim() ? 1 : 0.5 }}>
+                      Lưu
+                    </button>
+                    <button onClick={cancelEdit}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 12,
+                        background: "transparent", color: theme.text, cursor: "pointer" }}>
+                      Huỷ
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!editingKey && (
+                <button onClick={startAdd}
+                  style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`,
+                    background: "transparent", color: accent, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>
+                  ➕ Thêm task mới vào danh mục
+                </button>
+              )}
+              {saveMsg && <div style={{ fontSize: 11, color: accent, marginTop: 8, textAlign: "center" }}>{saveMsg}</div>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CONDITION_FIELD_OPTIONS_V38 = [
+  { key: "energy", label: "Năng lượng (1-5)" },
+  { key: "tiktok", label: "Phút TikTok" },
+  { key: "streak", label: "Streak (ngày)" },
+  { key: "day", label: "Thứ trong tuần" },
+];
+const CONDITION_OP_OPTIONS_V38 = [
+  { key: "eq", label: "=" }, { key: "neq", label: "≠" },
+  { key: "gte", label: "≥" }, { key: "lte", label: "≤" },
+  { key: "gt", label: ">" }, { key: "lt", label: "<" },
+];
+
+function DayRulesManager() {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [rules, setRules] = useState({});
+  const [catalog, setCatalog] = useState({});
+  const [activeDay, setActiveDay] = useState(null);
+  const [saveMsg, setSaveMsg] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const [r, c] = await Promise.all([loadDayRulesV38(), loadCustomCatalogV38()]);
+      if (!cancelled) { setRules(r); setCatalog(effectiveCatalogV38(c)); setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [open]);
+
+  const persist = async (next) => {
+    setRules(next);
+    await saveDayRulesV38(next);
+    setSaveMsg("✅ Đã lưu");
+    setTimeout(() => setSaveMsg(null), 1500);
+  };
+
+  const enableCustomDay = async (day) => {
+    const next = { ...rules, [day]: rules[day] || [] };
+    await persist(next);
+    setActiveDay(day);
+  };
+  const resetDayToDefault = async (day) => {
+    const next = { ...rules };
+    delete next[day];
+    await persist(next);
+    if (activeDay === day) setActiveDay(null);
+  };
+  const toggleKeyForDay = async (day, key) => {
+    const cur = Array.isArray(rules[day]) ? rules[day] : [];
+    const nextList = cur.includes(key) ? cur.filter(k => k !== key) : [...cur, key];
+    await persist({ ...rules, [day]: nextList });
+  };
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🗓️ Chỉnh logic gợi ý theo thứ</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở"}</span>
+      </div>
+      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+        Chọn task cho từng thứ — bấm vào 1 thứ để tự chọn task, thay cho logic mặc định của hệ thống.
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>
+          ) : (
+            <>
+              {WEEKDAY_NAMES_V38.map(day => {
+                const isCustom = Object.prototype.hasOwnProperty.call(rules, day);
+                const selectedKeys = isCustom && Array.isArray(rules[day]) ? rules[day] : [];
+                const isExpanded = activeDay === day;
+                return (
+                  <div key={day} style={{ marginBottom: 8, borderRadius: 10, background: theme.bg, overflow: "hidden" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px", cursor: "pointer" }}
+                      onClick={() => setActiveDay(isExpanded ? null : day)}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>
+                        {day} {isCustom
+                          ? <span style={{ color: accent, fontWeight: 700 }}>· tự chọn ({selectedKeys.length})</span>
+                          : <span style={{ color: theme.textDim, fontWeight: 400 }}>· mặc định hệ thống</span>}
+                      </div>
+                      <span style={{ fontSize: 11, color: theme.textDim }}>{isExpanded ? "▲" : "▼"}</span>
+                    </div>
+                    {isExpanded && (
+                      <div style={{ padding: "0 10px 10px" }}>
+                        {!isCustom && (
+                          <button onClick={() => enableCustomDay(day)}
+                            style={{ width: "100%", padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 11,
+                              background: accent, color: "#fff", cursor: "pointer", marginBottom: 8 }}>
+                            🖊️ Dùng logic tự chọn cho {day}
+                          </button>
+                        )}
+                        {isCustom && (
+                          <>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                              {Object.entries(catalog).map(([key, t]) => {
+                                const checked = selectedKeys.includes(key);
+                                return (
+                                  <button key={key} onClick={() => toggleKeyForDay(day, key)}
+                                    style={{
+                                      padding: "6px 10px", borderRadius: 999, fontSize: 11, cursor: "pointer",
+                                      border: `1px solid ${checked ? accent : theme.border}`,
+                                      background: checked ? accent + "22" : "transparent",
+                                      color: checked ? accent : theme.text, fontWeight: checked ? 700 : 400,
+                                    }}>
+                                    {t.icon} {t.name}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            <button onClick={() => resetDayToDefault(day)}
+                              style={{ width: "100%", padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 11,
+                                background: "transparent", color: theme.textDim, cursor: "pointer" }}>
+                              ↩ Về mặc định (theo hệ thống)
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {saveMsg && <div style={{ fontSize: 11, color: accent, marginTop: 4, textAlign: "center" }}>{saveMsg}</div>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v39] MỤC 3 — ConflictWarning: component hiển thị THUẦN, nhận
+// mảng warnings (từ detectRuleConflicts) và vẽ ra danh sách cảnh báo, màu
+// theo level ("high" = đỏ/nổi bật, "warn" = vàng/nhẹ). Dùng lại ở cả
+// ConditionRulesManager (cảnh báo khi soạn 1 luật) và PreviewModal (cảnh
+// báo tổng hợp cho toàn bộ luật đang xem thử).
+// ════════════════════════════════════════════════════════════════════════
+function ConflictWarning({ warnings, theme, compact }) {
+  if (!warnings || warnings.length === 0) return null;
+  return (
+    <div style={{ marginTop: compact ? 6 : 10, marginBottom: compact ? 6 : 10, display: "flex", flexDirection: "column", gap: 6 }}>
+      {warnings.map((w, idx) => {
+        const isHigh = w.level === "high";
+        const color = isHigh ? (theme.danger || "#EF4444") : (theme.warning || "#F59E0B");
+        return (
+          <div key={idx} style={{
+            display: "flex", gap: 8, alignItems: "flex-start", padding: compact ? "6px 8px" : "8px 10px",
+            borderRadius: 8, background: color + "18", border: `1px solid ${color}55`,
+          }}>
+            <span style={{ fontSize: compact ? 12 : 14, flexShrink: 0 }}>{isHigh ? "⛔" : "⚠️"}</span>
+            <span style={{ fontSize: compact ? 10 : 11, color: theme.text, lineHeight: 1.4 }}>{w.message}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v39/v40] MỤC 2 — RuleEditorFlow: gộp luồng thao tác của
+// CatalogManager + DayRulesManager + ConditionRulesManager vào 1 flow
+// duy nhất, 5 bước:
+//   1. Chọn ngày → 2. Chọn task từ danh mục cho ngày đó (kèm "+ Thêm task
+//   mới" ngay trong picker) → 3. Xem danh sách task đã chọn → 4. (tuỳ
+//   chọn, thu gọn mặc định) Luật điều kiện nâng cao — "Nếu [field] [so
+//   sánh] [giá trị] thì thêm [task]" → 5. "Xem thử" / "Lưu".
+//
+// KHÔNG PHÁ VỠ LOGIC CŨ: flow này đọc/ghi ĐÚNG CÙNG 3 storage key mà
+// CatalogManager/DayRulesManager/ConditionRulesManager đã dùng
+// (v38:customCatalog, v38:dayRules, v38:conditionRules) — nghĩa là 3
+// panel cũ bên dưới và flow mới này là 2 GIAO DIỆN khác nhau cho CÙNG 1
+// dữ liệu, không xung đột, dùng cái nào cũng ra kết quả giống nhau, và
+// "💾 Lưu" ở flow này lưu ĐỒNG THỜI cả 3 loại luật trong 1 lần bấm.
+//
+// Props: runPreview(draftOverrides) — hàm từ AIPlannerBeta, chạy pipeline
+// ở previewMode với đúng form thật hiện tại của người dùng.
+// ════════════════════════════════════════════════════════════════════════
+function RuleEditorFlow({ runPreview }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [dayRules, setDayRules] = useState({});
+  const [customCatalog, setCustomCatalog] = useState({});
+  const [activeDay, setActiveDay] = useState(WEEKDAY_NAMES_V38[1]); // mặc định Thứ 2
+  const [saveMsg, setSaveMsg] = useState(null);
+  const [showAddTask, setShowAddTask] = useState(false);
+  const [newTaskDraft, setNewTaskDraft] = useState(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  // [PATCH v40] MỤC "gộp luật điều kiện": flow giờ quản lý luôn
+  // conditionRules — cùng storage key "v38:conditionRules" với
+  // ConditionRulesManager cũ (2 giao diện, 1 dữ liệu, y hệt cách dayRules/
+  // customCatalog đã dùng chung với DayRulesManager/CatalogManager).
+  const [conditionRules, setConditionRules] = useState([]);
+  const [condSectionOpen, setCondSectionOpen] = useState(false);
+  const [condEditingId, setCondEditingId] = useState(null);
+  const [condDraft, setCondDraft] = useState(null);
+
+  const loadAll = async () => {
+    setLoading(true);
+    const [r, c, cr] = await Promise.all([loadDayRulesV38(), loadCustomCatalogV38(), loadConditionRulesV38()]);
+    setDayRules(r);
+    setCustomCatalog(c);
+    setConditionRules(cr);
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      await loadAll();
+      if (cancelled) return;
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const catalog = effectiveCatalogV38(customCatalog);
+  const catalogKeys = Object.keys(catalog);
+  // Danh sách task đã chọn cho ngày đang active — nếu ngày này chưa từng
+  // cấu hình tuỳ chỉnh (không có key trong dayRules), coi là rỗng (flow
+  // mới luôn thao tác trên chế độ "tự chọn", giống bấm "Dùng logic tự
+  // chọn" trong DayRulesManager cũ — người dùng chọn task ở đây tức là
+  // đang chuyển ngày đó sang chế độ tự chọn).
+  const selectedKeysForDay = Array.isArray(dayRules[activeDay]) ? dayRules[activeDay] : [];
+  const isCustomDay = Object.prototype.hasOwnProperty.call(dayRules, activeDay);
+
+  const toggleTaskForDay = (key) => {
+    const cur = Array.isArray(dayRules[activeDay]) ? dayRules[activeDay] : [];
+    const nextList = cur.includes(key) ? cur.filter(k => k !== key) : [...cur, key];
+    setDayRules(prev => ({ ...prev, [activeDay]: nextList }));
+  };
+
+  const resetDayToSystemDefault = () => {
+    setDayRules(prev => {
+      const next = { ...prev };
+      delete next[activeDay];
+      return next;
+    });
+  };
+
+  const startAddTask = () => {
+    setNewTaskDraft({ key: "custom_" + Date.now(), name: "", dur: 30, xp: 15, icon: "⭐", group: "study" });
+    setShowAddTask(true);
+  };
+  const cancelAddTask = () => { setShowAddTask(false); setNewTaskDraft(null); };
+  const confirmAddTask = () => {
+    if (!newTaskDraft || !newTaskDraft.name.trim()) return;
+    const clean = {
+      name: newTaskDraft.name.trim(),
+      dur: Math.max(1, Number(newTaskDraft.dur) || 1),
+      xp: Math.max(0, Number(newTaskDraft.xp) || 0),
+      icon: newTaskDraft.icon || "⭐",
+      group: newTaskDraft.group || "study",
+    };
+    setCustomCatalog(prev => ({ ...prev, [newTaskDraft.key]: clean }));
+    // Chọn luôn task vừa thêm cho ngày đang active — đúng tinh thần
+    // "+ Thêm task mới ngay trong picker" (thêm xong dùng được ngay).
+    setDayRules(prev => {
+      const cur = Array.isArray(prev[activeDay]) ? prev[activeDay] : [];
+      return { ...prev, [activeDay]: [...cur, newTaskDraft.key] };
+    });
+    cancelAddTask();
+  };
+
+  const handleSave = async () => {
+    await Promise.all([
+      saveDayRulesV38(dayRules),
+      saveCustomCatalogV38(customCatalog),
+      saveConditionRulesV38(conditionRules),
+    ]);
+    setSaveMsg("✅ Đã lưu — áp dụng từ hôm sau (hoặc bấm 'Tạo lại kế hoạch' để áp dụng ngay hôm nay).");
+    setTimeout(() => setSaveMsg(null), 2500);
+  };
+
+  const openPreview = () => {
+    setPreviewOpen(true);
+  };
+
+  const draftOverridesForPreview = { dayRules, catalog: customCatalog, conditionRules };
+
+  // [PATCH v40] Luật điều kiện nâng cao — CRUD trên state cục bộ của flow
+  // (chưa lưu tới khi bấm "💾 Lưu" ở cuối, giống hệt cách dayRules/
+  // customCatalog đã hoạt động trong flow này). Logic y hệt
+  // ConditionRulesManager cũ, chỉ khác là thao tác trên state của
+  // RuleEditorFlow thay vì tự load/save riêng.
+  const condCatalogKeys = catalogKeys;
+  const startCondAdd = () => {
+    setCondEditingId("new");
+    setCondDraft({ id: "rule_" + Date.now(), enabled: true, field: "energy", op: "gte", value: 4, taskKey: condCatalogKeys[0] || "", priority: "med" });
+  };
+  const startCondEdit = (r) => { setCondEditingId(r.id); setCondDraft({ ...r }); };
+  const cancelCondEdit = () => { setCondEditingId(null); setCondDraft(null); };
+  const saveCondDraft = () => {
+    if (!condDraft || !condDraft.taskKey) return;
+    const clean = { ...condDraft, value: condDraft.field === "day" ? condDraft.value : Number(condDraft.value) };
+    const exists = conditionRules.some(r => r.id === clean.id);
+    setConditionRules(prev => exists ? prev.map(r => r.id === clean.id ? clean : r) : [...prev, clean]);
+    cancelCondEdit();
+  };
+  const removeCondRule = (id) => {
+    setConditionRules(prev => prev.filter(r => r.id !== id));
+    if (condEditingId === id) cancelCondEdit();
+  };
+  const toggleCondEnabled = (id) => {
+    setConditionRules(prev => prev.map(r => r.id === id ? { ...r, enabled: r.enabled === false ? true : false } : r));
+  };
+  const condConflictWarnings = useMemo(() => {
+    const draftForList = (condDraft && condDraft.taskKey) ? [condDraft] : [];
+    const others = conditionRules.filter(r => !condDraft || r.id !== condDraft.id);
+    return detectRuleConflicts([...others, ...draftForList]);
+  }, [conditionRules, condDraft]);
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `2px solid ${accent}55` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🛠️ Chỉnh luật gợi ý (flow gộp)</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở"}</span>
+      </div>
+      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+        Chọn ngày → chọn task → (tuỳ chọn) luật điều kiện → xem thử lịch ngay → lưu. Gộp cả 3 loại luật vào 1 luồng, dữ liệu dùng chung với các panel bên dưới.
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>
+          ) : (
+            <>
+              {/* Bước 1: chọn ngày */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 6 }}>1. Chọn ngày</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+                {WEEKDAY_NAMES_V38.filter(d => d !== "Chủ nhật").concat(["Chủ nhật"]).map(day => {
+                  const active = day === activeDay;
+                  const custom = Object.prototype.hasOwnProperty.call(dayRules, day);
+                  return (
+                    <button key={day} onClick={() => setActiveDay(day)}
+                      style={{
+                        padding: "6px 10px", borderRadius: 999, fontSize: 11, cursor: "pointer",
+                        border: `1px solid ${active ? accent : theme.border}`,
+                        background: active ? accent : "transparent",
+                        color: active ? "#fff" : (custom ? accent : theme.textDim),
+                        fontWeight: active || custom ? 700 : 400,
+                      }}>
+                      {day}{custom ? " •" : ""}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Bước 2: chọn task từ danh mục cho ngày đã chọn */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 6 }}>
+                2. Chọn task cho {activeDay}
+                {!isCustomDay && <span style={{ color: theme.textDim, fontWeight: 400 }}> · đang dùng mặc định hệ thống, chọn 1 task để chuyển sang tự chọn</span>}
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                {catalogKeys.map(key => {
+                  const checked = selectedKeysForDay.includes(key);
+                  return (
+                    <button key={key} onClick={() => toggleTaskForDay(key)}
+                      style={{
+                        padding: "6px 10px", borderRadius: 999, fontSize: 11, cursor: "pointer",
+                        border: `1px solid ${checked ? accent : theme.border}`,
+                        background: checked ? accent + "22" : "transparent",
+                        color: checked ? accent : theme.text, fontWeight: checked ? 700 : 400,
+                      }}>
+                      {catalog[key].icon} {catalog[key].name}
+                    </button>
+                  );
+                })}
+                {!showAddTask && (
+                  <button onClick={startAddTask}
+                    style={{ padding: "6px 10px", borderRadius: 999, fontSize: 11, cursor: "pointer",
+                      border: `1px dashed ${accent}`, background: "transparent", color: accent, fontWeight: 700 }}>
+                    + Thêm task mới
+                  </button>
+                )}
+              </div>
+
+              {showAddTask && newTaskDraft && (
+                <div style={{ padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 8 }}>➕ Thêm task mới vào danh mục</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <input placeholder="Tên task" value={newTaskDraft.name}
+                      onChange={e => setNewTaskDraft(d => ({ ...d, name: e.target.value }))}
+                      style={{ padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}/>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Thời lượng (phút)
+                        <input type="number" min="1" value={newTaskDraft.dur}
+                          onChange={e => setNewTaskDraft(d => ({ ...d, dur: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        XP
+                        <input type="number" min="0" value={newTaskDraft.xp}
+                          onChange={e => setNewTaskDraft(d => ({ ...d, xp: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                      </label>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <label style={{ flex: 1, fontSize: 10, color: theme.textDim }}>
+                        Icon (emoji)
+                        <input value={newTaskDraft.icon}
+                          onChange={e => setNewTaskDraft(d => ({ ...d, icon: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 14, boxSizing: "border-box" }}/>
+                      </label>
+                      <label style={{ flex: 2, fontSize: 10, color: theme.textDim }}>
+                        Nhóm màu
+                        <select value={newTaskDraft.group}
+                          onChange={e => setNewTaskDraft(d => ({ ...d, group: e.target.value }))}
+                          style={{ width: "100%", marginTop: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}>
+                          {CATALOG_GROUP_OPTIONS_V38.map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button onClick={confirmAddTask} disabled={!newTaskDraft.name.trim()}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 12,
+                        background: accent, color: "#fff", cursor: newTaskDraft.name.trim() ? "pointer" : "default",
+                        opacity: newTaskDraft.name.trim() ? 1 : 0.5 }}>
+                      Thêm & chọn cho {activeDay}
+                    </button>
+                    <button onClick={cancelAddTask}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 12,
+                        background: "transparent", color: theme.text, cursor: "pointer" }}>
+                      Huỷ
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {isCustomDay && (
+                <button onClick={resetDayToSystemDefault}
+                  style={{ width: "100%", padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 11,
+                    background: "transparent", color: theme.textDim, cursor: "pointer", marginBottom: 10 }}>
+                  ↩ {activeDay}: về mặc định hệ thống
+                </button>
+              )}
+
+              {/* Bước 3: danh sách task đã chọn cho ngày đó */}
+              <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 6 }}>
+                3. Task đã chọn cho {activeDay} ({selectedKeysForDay.length})
+              </div>
+              {selectedKeysForDay.length === 0 ? (
+                <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 10 }}>
+                  {isCustomDay ? "Chưa chọn task nào — ngày này sẽ không có task gợi ý tự động." : "Chưa chọn task nào — đang dùng logic mặc định của hệ thống."}
+                </div>
+              ) : (
+                <div style={{ marginBottom: 10 }}>
+                  {selectedKeysForDay.map(key => catalog[key] && (
+                    <div key={key} style={{
+                      display: "flex", alignItems: "center", gap: 8, padding: "6px 10px",
+                      borderRadius: 8, marginBottom: 4, background: theme.bg,
+                      borderLeft: `3px solid ${colorForTaskGroupV33(catalog[key].group)}`,
+                    }}>
+                      <span style={{ fontSize: 12, color: theme.text, flex: 1 }}>{catalog[key].icon} {catalog[key].name} ({catalog[key].dur}')</span>
+                      <button onClick={() => toggleTaskForDay(key)}
+                        style={{ fontSize: 10, padding: "3px 7px", borderRadius: 6, border: `1px solid ${theme.danger}55`, background: "transparent", color: theme.danger, cursor: "pointer" }}>
+                        Bỏ
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Bước 4: Luật điều kiện nâng cao (tuỳ chọn) — "Nếu [điều
+                  kiện] thì thêm [task]", cộng thêm vào cuối, không thay
+                  logic §1-§3 ở trên. Thu gọn mặc định vì không phải ai
+                  cũng cần tới bước này. */}
+              <div style={{ marginTop: 4, marginBottom: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, overflow: "hidden" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", cursor: "pointer" }}
+                  onClick={() => setCondSectionOpen(o => !o)}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: theme.text }}>
+                    4. Luật điều kiện nâng cao {conditionRules.length > 0 && <span style={{ color: accent, fontWeight: 700 }}>({conditionRules.length})</span>}
+                  </span>
+                  <span style={{ fontSize: 10, color: theme.textDim }}>{condSectionOpen ? "▲" : "▼ tuỳ chọn"}</span>
+                </div>
+                {condSectionOpen && (
+                  <div style={{ padding: "0 10px 10px" }}>
+                    <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 8 }}>
+                      "Nếu [điều kiện] thì thêm [task]" — chạy cộng thêm, không thay logic ở bước 1-3. Có thể tạm tắt mà không cần xoá.
+                    </div>
+                    {conditionRules.length === 0 && (
+                      <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 8 }}>Chưa có luật nào.</div>
+                    )}
+                    {conditionRules.map(r => {
+                      const t = catalog[r.taskKey];
+                      const off = r.enabled === false;
+                      return (
+                        <div key={r.id} style={{
+                          display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                          borderRadius: 10, marginBottom: 6, background: theme.bg, opacity: off ? 0.5 : 1,
+                        }}>
+                          <button onClick={() => toggleCondEnabled(r.id)}
+                            style={{ width: 36, height: 20, borderRadius: 999, border: "none", flexShrink: 0,
+                              background: off ? theme.border : accent, position: "relative", cursor: "pointer" }}>
+                            <span style={{ position: "absolute", top: 2, left: off ? 2 : 18, width: 16, height: 16,
+                              borderRadius: "50%", background: "#fff", transition: "left 0.15s ease" }}/>
+                          </button>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>
+                              Nếu {ruleLabelV38(r)} → {t ? `${t.icon} ${t.name}` : "(task đã bị xoá)"}
+                            </div>
+                          </div>
+                          <button onClick={() => startCondEdit(r)}
+                            style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.text, cursor: "pointer" }}>
+                            Sửa
+                          </button>
+                          <button onClick={() => removeCondRule(r.id)}
+                            style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.danger}55`, background: "transparent", color: theme.danger, cursor: "pointer" }}>
+                            Xoá
+                          </button>
+                        </div>
+                      );
+                    })}
+
+                    {condEditingId && condDraft && (
+                      <div style={{ padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, marginTop: 6, marginBottom: 10 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+                          {condEditingId === "new" ? "➕ Thêm luật mới" : "✏️ Sửa luật"}
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <div style={{ fontSize: 11, color: theme.textDim }}>Nếu</div>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <select value={condDraft.field}
+                              onChange={e => setCondDraft(d => ({ ...d, field: e.target.value, value: e.target.value === "day" ? WEEKDAY_NAMES_V38[0] : 3 }))}
+                              style={{ flex: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                              {CONDITION_FIELD_OPTIONS_V38.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
+                            </select>
+                            <select value={condDraft.op}
+                              onChange={e => setCondDraft(d => ({ ...d, op: e.target.value }))}
+                              style={{ flex: 1, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                              {CONDITION_OP_OPTIONS_V38.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+                            </select>
+                          </div>
+                          {condDraft.field === "day" ? (
+                            <select value={condDraft.value}
+                              onChange={e => setCondDraft(d => ({ ...d, value: e.target.value }))}
+                              style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                              {WEEKDAY_NAMES_V38.map(day => <option key={day} value={day}>{day}</option>)}
+                            </select>
+                          ) : (
+                            <input type="number" value={condDraft.value}
+                              onChange={e => setCondDraft(d => ({ ...d, value: e.target.value }))}
+                              placeholder="Giá trị"
+                              style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                          )}
+                          <div style={{ fontSize: 11, color: theme.textDim, marginTop: 4 }}>Thì thêm task</div>
+                          <select value={condDraft.taskKey}
+                            onChange={e => setCondDraft(d => ({ ...d, taskKey: e.target.value }))}
+                            style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                            {condCatalogKeys.map(key => <option key={key} value={key}>{catalog[key].icon} {catalog[key].name}</option>)}
+                          </select>
+                        </div>
+                        <ConflictWarning warnings={condConflictWarnings.filter(w => w.ruleIds.includes(condDraft.id))} theme={theme} compact/>
+                        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                          <button onClick={saveCondDraft} disabled={!condDraft.taskKey}
+                            style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 12,
+                              background: accent, color: "#fff", cursor: condDraft.taskKey ? "pointer" : "default",
+                              opacity: condDraft.taskKey ? 1 : 0.5 }}>
+                            Áp dụng
+                          </button>
+                          <button onClick={cancelCondEdit}
+                            style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 12,
+                              background: "transparent", color: theme.text, cursor: "pointer" }}>
+                            Huỷ
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {!condEditingId && (
+                      <button onClick={startCondAdd} disabled={condCatalogKeys.length === 0}
+                        style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`,
+                          background: "transparent", color: accent, fontWeight: 700, fontSize: 12, cursor: condCatalogKeys.length ? "pointer" : "default" }}>
+                        ➕ Thêm luật điều kiện
+                      </button>
+                    )}
+
+                    <ConflictWarning warnings={condConflictWarnings} theme={theme} compact/>
+                  </div>
+                )}
+              </div>
+
+              {/* Bước 5: Xem thử / Lưu */}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={openPreview}
+                  style={{ flex: 1, padding: 10, borderRadius: 10, border: `1px solid ${accent}`, fontWeight: 700, fontSize: 12,
+                    background: "transparent", color: accent, cursor: "pointer" }}>
+                  🔍 Xem thử
+                </button>
+                <button onClick={handleSave}
+                  style={{ flex: 1, padding: 10, borderRadius: 10, border: "none", fontWeight: 700, fontSize: 12,
+                    background: accent, color: "#fff", cursor: "pointer" }}>
+                  💾 Lưu
+                </button>
+              </div>
+              {saveMsg && <div style={{ fontSize: 11, color: accent, marginTop: 8, textAlign: "center" }}>{saveMsg}</div>}
+            </>
+          )}
+        </div>
+      )}
+
+
+      {previewOpen && (
+        <PreviewModal
+          onClose={() => setPreviewOpen(false)}
+          runPreview={runPreview}
+          draftOverrides={draftOverridesForPreview}
+          conflictWarnings={condConflictWarnings}
+          theme={theme}
+          accent={accent}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConditionRulesManager({ runPreview }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [rules, setRules] = useState([]);
+  const [catalog, setCatalog] = useState({});
+  const [editingId, setEditingId] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [saveMsg, setSaveMsg] = useState(null);
+  // [PATCH v39] MỤC 3: cảnh báo xung đột — tính lại mỗi khi draft đổi, chỉ
+  // hiển thị cảnh báo có liên quan tới đúng luật đang sửa (không làm rối
+  // mắt bằng toàn bộ xung đột trong danh sách).
+  const [conflictWarnings, setConflictWarnings] = useState([]);
+  // [PATCH v39] MỤC 1: "Xem thử lịch" cho toàn bộ conditionRules hiện tại
+  // (kể cả luật đang soạn dở, nếu có) — chỉ hiển thị khi runPreview được
+  // truyền vào (panel này vẫn hoạt động bình thường nếu không có, chỉ ẩn
+  // nút Xem thử — giữ tương thích nếu component được dùng ở nơi khác).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const allConflictWarnings = useMemo(() => {
+    const draftForList = (draft && draft.taskKey) ? [draft] : [];
+    const others = rules.filter(r => !draft || r.id !== draft.id);
+    return detectRuleConflicts([...others, ...draftForList]);
+  }, [rules, draft]);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      const [r, c] = await Promise.all([loadConditionRulesV38(), loadCustomCatalogV38()]);
+      if (!cancelled) { setRules(r); setCatalog(effectiveCatalogV38(c)); setLoading(false); }
+    })();
+    return () => { cancelled = true; };
+  }, [open]);
+
+  // [PATCH v39] MỤC 3: mỗi khi draft thay đổi, tính thử xung đột nếu draft
+  // này được thêm vào danh sách hiện có (không lưu, chỉ để cảnh báo).
+  useEffect(() => {
+    if (!draft || !draft.taskKey) { setConflictWarnings([]); return; }
+    const others = rules.filter(r => r.id !== draft.id);
+    const all = detectRuleConflicts([...others, draft]);
+    setConflictWarnings(all.filter(w => w.ruleIds.includes(draft.id)));
+  }, [draft, rules]);
+
+  const persist = async (next) => {
+    setRules(next);
+    await saveConditionRulesV38(next);
+    setSaveMsg("✅ Đã lưu");
+    setTimeout(() => setSaveMsg(null), 1500);
+  };
+
+  const catalogKeys = Object.keys(catalog);
+  const startAdd = () => {
+    setEditingId("new");
+    setDraft({ id: "rule_" + Date.now(), enabled: true, field: "energy", op: "gte", value: 4, taskKey: catalogKeys[0] || "", priority: "med" });
+  };
+  const startEdit = (r) => { setEditingId(r.id); setDraft({ ...r }); };
+  const cancelEdit = () => { setEditingId(null); setDraft(null); };
+
+  const saveDraft = async () => {
+    if (!draft || !draft.taskKey) return;
+    const clean = { ...draft, value: draft.field === "day" ? draft.value : Number(draft.value) };
+    const exists = rules.some(r => r.id === clean.id);
+    const next = exists ? rules.map(r => r.id === clean.id ? clean : r) : [...rules, clean];
+    await persist(next);
+    cancelEdit();
+  };
+
+  const removeRule = async (id) => {
+    await persist(rules.filter(r => r.id !== id));
+    if (editingId === id) cancelEdit();
+  };
+  const toggleEnabled = async (id) => {
+    await persist(rules.map(r => r.id === id ? { ...r, enabled: r.enabled === false ? true : false } : r));
+  };
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+        onClick={() => setOpen(o => !o)}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🧠 Luật điều kiện nâng cao</span>
+        <span style={{ fontSize: 11, color: theme.textDim }}>{open ? "▲ Thu gọn" : "▼ Mở"}</span>
+      </div>
+      <div style={{ fontSize: 10, color: theme.textDim, marginTop: 4 }}>
+        "Nếu [điều kiện] thì thêm [task]" — chạy cộng thêm, không thay logic có sẵn. Có thể tạm tắt mà không cần xoá.
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 11, color: theme.textDim }}>Đang tải…</div>
+          ) : (
+            <>
+              {rules.length === 0 && (
+                <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 8 }}>Chưa có luật nào.</div>
+              )}
+              {rules.map(r => {
+                const t = catalog[r.taskKey];
+                const off = r.enabled === false;
+                return (
+                  <div key={r.id} style={{
+                    display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+                    borderRadius: 10, marginBottom: 6, background: theme.bg, opacity: off ? 0.5 : 1,
+                  }}>
+                    <button onClick={() => toggleEnabled(r.id)}
+                      style={{ width: 36, height: 20, borderRadius: 999, border: "none", flexShrink: 0,
+                        background: off ? theme.border : accent, position: "relative", cursor: "pointer" }}>
+                      <span style={{ position: "absolute", top: 2, left: off ? 2 : 18, width: 16, height: 16,
+                        borderRadius: "50%", background: "#fff", transition: "left 0.15s ease" }}/>
+                    </button>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: theme.text }}>
+                        Nếu {ruleLabelV38(r)} → {t ? `${t.icon} ${t.name}` : "(task đã bị xoá)"}
+                      </div>
+                    </div>
+                    <button onClick={() => startEdit(r)}
+                      style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.text, cursor: "pointer" }}>
+                      Sửa
+                    </button>
+                    <button onClick={() => removeRule(r.id)}
+                      style={{ fontSize: 11, padding: "4px 8px", borderRadius: 8, border: `1px solid ${theme.danger}55`, background: "transparent", color: theme.danger, cursor: "pointer" }}>
+                      Xoá
+                    </button>
+                  </div>
+                );
+              })}
+
+              {editingId && draft && (
+                <div style={{ padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`, marginTop: 6, marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+                    {editingId === "new" ? "➕ Thêm luật mới" : "✏️ Sửa luật"}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ fontSize: 11, color: theme.textDim }}>Nếu</div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <select value={draft.field}
+                        onChange={e => setDraft(d => ({ ...d, field: e.target.value, value: e.target.value === "day" ? WEEKDAY_NAMES_V38[0] : 3 }))}
+                        style={{ flex: 2, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                        {CONDITION_FIELD_OPTIONS_V38.map(f => <option key={f.key} value={f.key}>{f.label}</option>)}
+                      </select>
+                      <select value={draft.op}
+                        onChange={e => setDraft(d => ({ ...d, op: e.target.value }))}
+                        style={{ flex: 1, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                        {CONDITION_OP_OPTIONS_V38.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+                      </select>
+                    </div>
+                    {draft.field === "day" ? (
+                      <select value={draft.value}
+                        onChange={e => setDraft(d => ({ ...d, value: e.target.value }))}
+                        style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                        {WEEKDAY_NAMES_V38.map(day => <option key={day} value={day}>{day}</option>)}
+                      </select>
+                    ) : (
+                      <input type="number" value={draft.value}
+                        onChange={e => setDraft(d => ({ ...d, value: e.target.value }))}
+                        placeholder="Giá trị"
+                        style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, boxSizing: "border-box" }}/>
+                    )}
+                    <div style={{ fontSize: 11, color: theme.textDim, marginTop: 4 }}>Thì thêm task</div>
+                    <select value={draft.taskKey}
+                      onChange={e => setDraft(d => ({ ...d, taskKey: e.target.value }))}
+                      style={{ padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12 }}>
+                      {catalogKeys.map(key => <option key={key} value={key}>{catalog[key].icon} {catalog[key].name}</option>)}
+                    </select>
+                  </div>
+                  <ConflictWarning warnings={conflictWarnings} theme={theme} compact/>
+                  <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                    <button onClick={saveDraft} disabled={!draft.taskKey}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", fontWeight: 700, fontSize: 12,
+                        background: accent, color: "#fff", cursor: draft.taskKey ? "pointer" : "default",
+                        opacity: draft.taskKey ? 1 : 0.5 }}>
+                      Lưu
+                    </button>
+                    <button onClick={cancelEdit}
+                      style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 12,
+                        background: "transparent", color: theme.text, cursor: "pointer" }}>
+                      Huỷ
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {!editingId && (
+                <button onClick={startAdd} disabled={catalogKeys.length === 0}
+                  style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px dashed ${theme.border}`,
+                    background: "transparent", color: accent, fontWeight: 700, fontSize: 12, cursor: catalogKeys.length ? "pointer" : "default" }}>
+                  ➕ Thêm luật mới
+                </button>
+              )}
+
+              {/* [PATCH v39] MỤC 3: xung đột hiện có trong toàn bộ danh
+                  sách (không riêng luật đang soạn) — nhắc trước khi lưu. */}
+              <ConflictWarning warnings={allConflictWarnings} theme={theme} compact/>
+
+              {runPreview && rules.length > 0 && (
+                <button onClick={() => setPreviewOpen(true)}
+                  style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px solid ${accent}`, fontWeight: 700, fontSize: 12,
+                    background: "transparent", color: accent, cursor: "pointer", marginTop: 8 }}>
+                  🔍 Xem thử lịch với các luật này
+                </button>
+              )}
+
+              {saveMsg && <div style={{ fontSize: 11, color: accent, marginTop: 8, textAlign: "center" }}>{saveMsg}</div>}
+            </>
+          )}
+        </div>
+      )}
+
+      {previewOpen && (
+        <PreviewModal
+          onClose={() => setPreviewOpen(false)}
+          runPreview={runPreview}
+          draftOverrides={{ conditionRules: rules }}
+          conflictWarnings={allConflictWarnings}
+          theme={theme}
+          accent={accent}
+        />
+      )}
+    </div>
+  );
+}
+
 function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
@@ -2455,6 +3887,21 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
         console.error("[AI Planner Beta] behaviorMetrics failed:", e);
       }
 
+      // [PATCH v37] MỤC 1: đọc lại check-in gần nhất (nếu có, cùng ngày —
+      // ví dụ người dùng bấm "Tạo lại kế hoạch" nhiều lần trong ngày) để
+      // không mất lựa chọn đã chọn trước đó. Field mới hoàn toàn ở lớp UI
+      // (specialPlans/freeStart/freeEnd/homeworkSubject/mainGoal/goalOther/
+      // specialOther) — form check-in cũ (energy/homework/tiktok/event/
+      // freeNote) GIỮ NGUYÊN, không đụng shape mà buildContext() cần.
+      let savedCheckin = null;
+      try {
+        const raw = await S.get(CHECKIN_STORAGE_KEY_V37);
+        if (raw && raw !== "null") {
+          const parsed = JSON.parse(raw);
+          if (parsed && parsed.date === td) savedCheckin = parsed;
+        }
+      } catch {}
+
       setForm({
         nowTime: bridged.nowTime,
         day: bridged.day,
@@ -2466,6 +3913,16 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
         event: "none",
         daysToExam: 60,
         freeNote: "",
+        // ── [PATCH v37] MỤC 1: field mới của form check-in thông minh ──
+        specialPlans: savedCheckin?.specialPlans || [],       // (a) mảng các lựa chọn đã tick
+        specialOther: savedCheckin?.specialOther || "",       // (a) "Khác: ..."
+        freeStart: savedCheckin?.freeStart || "",             // (b) khung giờ rảnh — để trống = AI tự tính 6:00-22:30
+        freeEnd: savedCheckin?.freeEnd || "",
+        homeworkChoice: savedCheckin?.homeworkChoice || null, // (c) "done" | "pending" | "none"
+        homeworkSubject: savedCheckin?.homeworkSubject || "", // (c) môn còn thiếu, chỉ dùng khi homeworkChoice==="pending"
+        mainGoal: savedCheckin?.mainGoal || null,              // (d) "study" | "rest" | "chores" | "fun" | "other"
+        mainGoalOther: savedCheckin?.mainGoalOther || "",      // (d) "Khác: ..."
+        checkinNote: savedCheckin?.checkinNote || "",          // (e) ô nhập tự do
       });
       setLoading(false);
     })();
@@ -2499,24 +3956,117 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
     .filter(e => e.date === td && e.start && e.end)
     .map(e => ({ name: e.name, start: e.start, end: e.end }));
 
+  // [PATCH v37] MỤC 1: gộp check-in form mới (a-e) thành input mà Core cũ
+  // đã hiểu (freeNote/event/homework/extraEvents) — KHÔNG sửa buildContext.
+  //   (a) specialPlans → câu mô tả gộp vào đầu freeNote, để
+  //       enrichTasksWithContext/reason generator "nhìn thấy" lý do bận.
+  //   (b) freeStart/freeEnd → 1 khoảng bận giả "Ngoài giờ rảnh" chèn vào
+  //       extraEvents cho phần TRƯỚC freeStart và SAU freeEnd (nếu có nhập),
+  //       để computeRemainingMinutes/buildScheduleV33 tự né đúng khung giờ.
+  //       Để trống cả 2 ô → không thêm gì, coi như rảnh 6:00–22:30 (mặc định
+  //       sẵn có của Core, không cần giả lập).
+  //   (c) homeworkChoice → map thẳng sang form.homework (true/false/null)
+  //       + homeworkSubject nối vào freeNote để AI biết môn còn thiếu.
+  //   (d) mainGoal → map sang goalMode đã có sẵn ở lớp UI (nhánh d của
+  //       runAiPlannerPipeline / enrichTasksWithContext), "rest" ánh xạ
+  //       sang event:"wantsRest" nếu người dùng chưa tự chọn event khác.
+  //   (e) checkinNote → nối vào cuối freeNote.
+  const buildCheckinExtraEvents = (f) => {
+    const evts = [];
+    const DAY_START = "06:00", DAY_END = "22:30";
+    if (f.freeStart && f.freeStart > DAY_START) {
+      evts.push({ name: "Ngoài giờ rảnh", start: DAY_START, end: f.freeStart });
+    }
+    if (f.freeEnd && f.freeEnd < DAY_END) {
+      evts.push({ name: "Ngoài giờ rảnh", start: f.freeEnd, end: DAY_END });
+    }
+    return evts;
+  };
+  const buildCheckinFreeNote = (f) => {
+    const parts = [];
+    const plansLabel = (f.specialPlans || [])
+      .map(v => SPECIAL_PLAN_OPTIONS_V37.find(o => o.val === v)?.label.replace(/^[^\s]+\s/, ""))
+      .filter(Boolean);
+    if (plansLabel.length) parts.push(`Hôm nay có: ${plansLabel.join(", ")}.`);
+    if (f.specialOther?.trim()) parts.push(`Khác: ${f.specialOther.trim()}.`);
+    if (f.homeworkChoice === "pending" && f.homeworkSubject?.trim()) {
+      parts.push(`Bài tập chưa xong môn: ${f.homeworkSubject.trim()}.`);
+    }
+    const goalOpt = MAIN_GOAL_OPTIONS_V37.find(o => o.val === f.mainGoal);
+    if (goalOpt) parts.push(`Mục tiêu chính hôm nay: ${goalOpt.label.replace(/^[^\s]+\s/, "")}.`);
+    if (f.mainGoal === "other" && f.mainGoalOther?.trim()) parts.push(`Mục tiêu khác: ${f.mainGoalOther.trim()}.`);
+    if (f.checkinNote?.trim()) parts.push(f.checkinNote.trim());
+    if (f.freeNote?.trim()) parts.push(f.freeNote.trim());
+    return parts.join(" ");
+  };
+
+  // [PATCH v39] Tách phần build runForm/deadlinePlan ra khỏi handleRun để
+  // RuleEditorFlow/PreviewModal có thể tái dùng ĐÚNG form thật hiện tại
+  // của người dùng khi chạy previewMode — tránh trùng logic, tránh preview
+  // chạy với 1 form giả lệch với form thật đang điền trên UI.
+  const buildRunFormAndDeadline = async () => {
+    const checkinExtraEvents = buildCheckinExtraEvents(form);
+    const mergedFreeNote = buildCheckinFreeNote(form);
+    const mergedHomework =
+      form.homeworkChoice === "pending" ? false :
+      form.homeworkChoice === "done" ? true :
+      form.homeworkChoice === "none" ? true : form.homework;
+    const mergedEvent = (form.mainGoal === "rest" && form.event === "none") ? "wantsRest" : form.event;
+    const runForm = {
+      ...form,
+      homework: mergedHomework,
+      event: mergedEvent,
+      freeNote: mergedFreeNote,
+      extraEvents: [...todayExtraEvents, ...checkinExtraEvents],
+      goalMode: form.mainGoal === "rest" ? "relax" : form.mainGoal === "fun" ? "relax" : "study",
+    };
+    let deadlinePlan = null;
+    try {
+      const raw = await S.get(DEADLINE_PLAN_KEY);
+      deadlinePlan = raw && raw !== "null" ? JSON.parse(raw) : null;
+    } catch {}
+    return { runForm, deadlinePlan };
+  };
+
+  // [PATCH v39] MỤC 1: chạy pipeline ở previewMode với draft rules chưa
+  // lưu — không đụng storage, không đổi `today`/streak thật. Trả về
+  // bucket "today" giả (entries: [1 entry preview]) để PreviewModal hiển
+  // thị bằng đúng component AIPlannerEntryCard/schedule đã có sẵn.
+  const runPreview = async (draftOverrides) => {
+    if (!form) return null;
+    const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
+    const dayLog = today?.entries || [];
+    return runAiPlannerPipeline({
+      core, storage, td, form: runForm, dayLog, db, deadlinePlan,
+      previewMode: true, draftOverrides,
+    });
+  };
+
   const handleRun = async () => {
     if (!form || running) return;
     setRunning(true);
     setErrorMsg(null);
     try {
       const dayLog = today?.entries || [];
-      const runForm = { ...form, extraEvents: todayExtraEvents };
       // [PATCH v30] Truyền thêm db để enrichTasksWithContext có dữ liệu
       // nếu người dùng có deadlinePlan đang hoạt động — tab này (form thủ
       // công) không có taskPool trong props nên bỏ qua nhánh (d) đa dạng
       // hoá pool, chỉ nhánh (a)(b)(c) hoạt động ở đây.
-      let deadlinePlan = null;
-      try {
-        const raw = await S.get(DEADLINE_PLAN_KEY);
-        deadlinePlan = raw && raw !== "null" ? JSON.parse(raw) : null;
-      } catch {}
+      const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
       const updatedToday = await runAiPlannerPipeline({ core, storage, td, form: runForm, dayLog, db, deadlinePlan });
       setToday(updatedToday);
+      // [PATCH v37] MỤC 1: lưu lại check-in hôm nay để lần "Tạo lại kế
+      // hoạch" tiếp theo (hoặc mở lại tab) không mất lựa chọn đã chọn.
+      try {
+        await S.set(CHECKIN_STORAGE_KEY_V37, JSON.stringify({
+          date: td,
+          specialPlans: form.specialPlans, specialOther: form.specialOther,
+          freeStart: form.freeStart, freeEnd: form.freeEnd,
+          homeworkChoice: form.homeworkChoice, homeworkSubject: form.homeworkSubject,
+          mainGoal: form.mainGoal, mainGoalOther: form.mainGoalOther,
+          checkinNote: form.checkinNote,
+        }));
+      } catch {}
     } catch (e) {
       console.error("[AI Planner Beta] run failed:", e);
       setErrorMsg("Có lỗi khi chạy AI Planner. Dữ liệu chưa được lưu — thử lại được.");
@@ -2662,6 +4212,99 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
             style={{ width: "100%", padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, resize: "vertical" }}/>
         </label>
 
+        {/* [PATCH v37] MỤC 1: FORM CHECK-IN THÔNG MINH — đặt ngay trên nút
+            "Tạo lại kế hoạch", theo đúng thứ tự (a)-(e) trong spec. */}
+        <div style={{ borderRadius: 10, border: `1px solid ${theme.border}`, padding: 10, marginBottom: 10 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+            📝 Check-in hôm nay
+          </div>
+
+          {/* (a) Kế hoạch đặc biệt — multi-select */}
+          <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 6 }}>
+            📅 Hôm nay bạn có kế hoạch đặc biệt gì không?
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+            {SPECIAL_PLAN_OPTIONS_V37.map(opt => {
+              const active = (form.specialPlans || []).includes(opt.val);
+              return (
+                <button key={opt.val}
+                  onClick={() => updateForm({
+                    specialPlans: active
+                      ? form.specialPlans.filter(v => v !== opt.val)
+                      : [...(form.specialPlans || []), opt.val],
+                  })}
+                  style={{ padding: "6px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, fontSize: 11,
+                    background: active ? accent : "transparent", color: active ? "#fff" : theme.text, cursor: "pointer" }}>
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          <input type="text" value={form.specialOther} onChange={e => updateForm({ specialOther: e.target.value })}
+            placeholder="Khác: ..."
+            style={{ width: "100%", padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 12, boxSizing: "border-box" }}/>
+
+          {/* (b) Khung giờ rảnh */}
+          <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 6 }}>
+            ⏰ Khung giờ rảnh của bạn hôm nay? <span style={{ opacity: 0.7 }}>(bỏ trống = 6:00–22:30)</span>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontSize: 11, color: theme.textDim }}>Từ</span>
+            <input type="time" value={form.freeStart} onChange={e => updateForm({ freeStart: e.target.value })}
+              style={{ flex: 1, padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
+            <span style={{ fontSize: 11, color: theme.textDim }}>Đến</span>
+            <input type="time" value={form.freeEnd} onChange={e => updateForm({ freeEnd: e.target.value })}
+              style={{ flex: 1, padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
+          </div>
+
+          {/* (c) Bài tập về nhà */}
+          <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 6 }}>📚 Bài tập về nhà hôm nay?</div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            {[["done","Đã xong hết"],["pending","Chưa xong"],["none","Không có bài tập"]].map(([val,label]) => (
+              <button key={val} onClick={() => updateForm({ homeworkChoice: val })}
+                style={{ flex: 1, padding: 7, borderRadius: 8, border: `1px solid ${theme.border}`, fontSize: 11,
+                  background: form.homeworkChoice === val ? accent : "transparent", color: form.homeworkChoice === val ? "#fff" : theme.text, cursor: "pointer" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {form.homeworkChoice === "pending" && (
+            <input type="text" value={form.homeworkSubject} onChange={e => updateForm({ homeworkSubject: e.target.value })}
+              placeholder="Môn: ..."
+              style={{ width: "100%", padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 12, boxSizing: "border-box" }}/>
+          )}
+          {form.homeworkChoice !== "pending" && <div style={{ marginBottom: 12 }} />}
+
+          {/* (d) Mục tiêu chính hôm nay */}
+          <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 6 }}>🎯 Mục tiêu chính hôm nay của bạn là?</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+            {MAIN_GOAL_OPTIONS_V37.map(opt => (
+              <button key={opt.val} onClick={() => updateForm({ mainGoal: opt.val })}
+                style={{ padding: "6px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, fontSize: 11,
+                  background: form.mainGoal === opt.val ? accent : "transparent", color: form.mainGoal === opt.val ? "#fff" : theme.text, cursor: "pointer" }}>
+                {opt.label}
+              </button>
+            ))}
+            <button onClick={() => updateForm({ mainGoal: "other" })}
+              style={{ padding: "6px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, fontSize: 11,
+                background: form.mainGoal === "other" ? accent : "transparent", color: form.mainGoal === "other" ? "#fff" : theme.text, cursor: "pointer" }}>
+              ✏️ Khác
+            </button>
+          </div>
+          {form.mainGoal === "other" && (
+            <input type="text" value={form.mainGoalOther} onChange={e => updateForm({ mainGoalOther: e.target.value })}
+              placeholder="Khác: ..."
+              style={{ width: "100%", padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 12, boxSizing: "border-box" }}/>
+          )}
+          {form.mainGoal !== "other" && <div style={{ marginBottom: 12 }} />}
+
+          {/* (e) Điều gì quan trọng AI cần biết thêm */}
+          <div style={{ fontSize: 12, color: theme.textDim, marginBottom: 6 }}>💬 Điều gì quan trọng AI cần biết thêm?</div>
+          <textarea rows={2} value={form.checkinNote} onChange={e => updateForm({ checkinNote: e.target.value })}
+            placeholder='VD: "Chiều nay phải đưa em đi học lúc 14h"'
+            style={{ width: "100%", padding: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, resize: "vertical", boxSizing: "border-box" }}/>
+        </div>
+
         {errorMsg && <div style={{ color: theme.danger, fontSize: 12, marginBottom: 10 }}>{errorMsg}</div>}
 
         <button onClick={handleRun} disabled={running}
@@ -2689,6 +4332,21 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
 
       {/* [PATCH v36] MỤC 2: form thêm/sửa/xoá task cố định. */}
       <FixedTasksManager/>
+
+      {/* [PATCH v39] MỤC 2: flow gộp mới — Chọn ngày → chọn task → xem thử
+          → lưu. Dùng chung dữ liệu (v38:dayRules/v38:customCatalog) với 3
+          panel bên dưới, không thay thế — Gia Bảo dùng cái nào cũng được. */}
+      <RuleEditorFlow runPreview={runPreview}/>
+
+      {/* [PATCH v38] MỤC 7-9: danh mục task tuỳ chỉnh + logic gợi ý theo
+          thứ + luật điều kiện nâng cao — tất cả tuỳ chọn, không đụng
+          logic mặc định nếu chưa cấu hình gì. */}
+      <CatalogManager/>
+      <DayRulesManager/>
+      <ConditionRulesManager runPreview={runPreview}/>
+
+      {/* [PATCH v37] MỤC 6: bật/tắt tự động điều chỉnh + xem skipHistory. */}
+      <ScheduleManagerPanel/>
 
       {/* Dev Tools: công cụ tạo dữ liệu giả để test hiệu năng/giao diện.
           Ẩn nhẹ trong UI — không khung nổi bật, chỉ một dấu chấm mờ. */}
@@ -2759,6 +4417,77 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PATCH v39] MỤC 1 — PreviewModal: chạy runAiPlannerPipeline({previewMode:
+// true, draftOverrides}) khi mở, hiển thị kết quả ngay bằng chính
+// AIPlannerEntryCard đã có sẵn (isPreview không đổi cách render, chỉ đổi
+// nhãn tiêu đề modal + không cho lưu). Nhận thêm `conflictWarnings` (từ
+// detectRuleConflicts trên draftOverrides.conditionRules, tính bởi cha) để
+// hiển thị NGAY TRÊN modal — không tính lại conflict ở đây (giữ component
+// này thuần về việc chạy preview + hiển thị).
+// ════════════════════════════════════════════════════════════════════════
+function PreviewModal({ onClose, runPreview, draftOverrides, conflictWarnings, theme, accent }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [previewToday, setPreviewToday] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await runPreview(draftOverrides);
+        if (!cancelled) setPreviewToday(result);
+      } catch (e) {
+        console.error("[PreviewModal] preview failed:", e);
+        if (!cancelled) setError("Không thể xem thử lịch — thử lại được, luật chưa lưu vẫn giữ nguyên.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000,
+      display: "flex", alignItems: "flex-end", justifyContent: "center",
+    }} onClick={onClose}>
+      <div style={{
+        background: theme.bg, borderRadius: "18px 18px 0 0", width: "100%", maxWidth: 520,
+        maxHeight: "88vh", overflowY: "auto", padding: 16, boxSizing: "border-box",
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: theme.text }}>🔍 Xem thử lịch (luật chưa lưu)</div>
+          <button onClick={onClose}
+            style={{ background: "none", border: "none", color: theme.textDim, fontSize: 18, cursor: "pointer", padding: 4 }}>
+            ✕
+          </button>
+        </div>
+        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 10 }}>
+          Đây là bản xem thử — chưa lưu, chưa ảnh hưởng kế hoạch/streak thật. Bấm "Lưu" ở màn trước để áp dụng chính thức.
+        </div>
+
+        <ConflictWarning warnings={conflictWarnings} theme={theme} />
+
+        {loading && <div style={{ fontSize: 12, color: theme.textDim, textAlign: "center", padding: 20 }}>Đang tính thử lịch…</div>}
+        {error && <div style={{ fontSize: 12, color: theme.danger, textAlign: "center", padding: 20 }}>{error}</div>}
+        {!loading && !error && previewToday && previewToday.entries.map(entry => (
+          <AIPlannerEntryCard key={entry.id} entry={entry} isLatest theme={theme} accent={accent} />
+        ))}
+
+        <button onClick={onClose}
+          style={{ width: "100%", padding: 10, borderRadius: 10, border: `1px solid ${theme.border}`, background: "transparent",
+            color: theme.text, fontSize: 12, fontWeight: 600, cursor: "pointer", marginTop: 6 }}>
+          Đóng
+        </button>
       </div>
     </div>
   );
@@ -3496,6 +5225,8 @@ const blank = () => ({
   scheduleXp:{},         // {[scheduleItemKey]:number} XP đã cộng cho từng item (lưu lại để dayExpFull cộng đúng, tránh tính sai nếu lịch được "Làm lại")
   // ── V30 (SmartSchedule) ──
   eveningNote:"",        // [PATCH v30] ghi chú tự do từ checklist cuối ngày trong SmartSchedule, không tính XP — thuần lưu để đọc lại/phân tích sau này
+  // ── V38 (SmartSchedule kéo-thả + giãn cách cộng dồn) ──
+  scheduleManualOrder:null, // [PATCH v38] mảng key theo THỨ TỰ sau khi người dùng kéo-thả sắp xếp lại (null = dùng thứ tự mặc định từ Core). Giờ hiển thị được tính lại cộng dồn từ thứ tự này, không còn ghi đè start trực tiếp.
 });
 
 // P-03: reusable debounced-save hook for text inputs
@@ -3999,8 +5730,14 @@ input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-
 // passes children through; kept as a named wrapper so intent stays clear at
 // every call site and swapping in a real portal later (outside Artifacts) is
 // a one-line change.
+// [FIX] ModalPortal trước đây chỉ return children tại chỗ (không portal
+// thật) — khiến modal bị kẹt trong stacking context của cây component cha,
+// nên có thể bị các phần tử position:sticky/fixed khác (VD: thanh tab
+// chính) đè lên dù zIndex cao hơn. Portal thật ra document.body để modal
+// luôn nằm ở gốc DOM, thoát khỏi mọi stacking context của tab đang mở.
 function ModalPortal({children}) {
-  return children;
+  if (typeof document === "undefined") return children;
+  return ReactDOM.createPortal(children, document.body);
 }
 
 // ── MEDIA SYSTEM (ảnh + nhạc) ────────────────────────────────────────────
@@ -8250,6 +9987,52 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
 //   3. [PATCH v30] Khối "📊 Phân tích 30 ngày qua" — gọi analyzeLast30Days()
 //      (hàm thuần, không đụng Core), hiển thị dưới lịch trình.
 // ════════════════════════════════════════════════════════════════════════
+// [PATCH v37] MỤC 5: hàng "+ Thêm task" — form nhỏ gọn (tên, giờ, thời
+// lượng) để thêm task tự chọn ngay trong lịch trình, không cần rời màn
+// hình. Component tách riêng để state input không làm re-render cả
+// SmartSchedule mỗi lần gõ phím.
+function AddManualTaskRow({ theme, accent, onAdd }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [start, setStart] = useState("");
+  const [dur, setDur] = useState(30);
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)}
+        style={{ width: "100%", marginTop: 4, padding: 8, borderRadius: 8, border: `1px dashed ${theme.border}`,
+          background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
+        + Thêm task
+      </button>
+    );
+  }
+  const submit = () => {
+    if (!name.trim() || !start) return;
+    onAdd(name, start, Number(dur) || 30);
+    setName(""); setStart(""); setDur(30); setOpen(false);
+  };
+  return (
+    <div style={{ borderRadius: 8, border: `1px solid ${theme.border}`, padding: 8, marginTop: 4 }}>
+      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Tên task"
+        style={{ width: "100%", padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 6, boxSizing: "border-box" }}/>
+      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+        <input type="time" value={start} onChange={e => setStart(e.target.value)}
+          style={{ flex: 1, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
+        <input type="number" min="5" step="5" value={dur} onChange={e => setDur(e.target.value)} placeholder="Phút"
+          style={{ width: 70, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button onClick={submit} style={{ flex: 1, padding: 6, borderRadius: 6, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
+          Thêm
+        </button>
+        <button onClick={() => setOpen(false)} style={{ flex: 1, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
+          Huỷ
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerStorage, plannerToday, onPlannerTodayChange }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
@@ -8263,6 +10046,10 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // [PATCH] XP fly-up cục bộ cho card này — key thay đổi mỗi lần tick để
   // re-trigger animation, giống cơ chế xpGain ở Today nhưng gắn theo item.
   const [xpFly, setXpFly] = useState(null); // { key, amount } | null
+  // [PATCH v38] MỤC 1: key đang được kéo (để tô sáng các ô drop-zone) và
+  // index của ô drop-zone đang được kéo-qua (để highlight riêng đúng ô).
+  const [draggingKey, setDraggingKey] = useState(null);
+  const [dragOverIndex, setDragOverIndex] = useState(null);
   // [PATCH] skip analysis cho từng item, tính 1 lần khi schedule thay đổi
   const [skipAnalysis, setSkipAnalysis] = useState({}); // {[itemKey]: {shouldReduce, shouldIncrease, reason}}
   // [PATCH v30] danh sách skip 30 ngày, tải 1 lần cho phần phân tích cuối card
@@ -8284,9 +10071,22 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
 
   const scheduleDone = data?.scheduleDone || {};
   const scheduleXp = data?.scheduleXp || {};
+  // [PATCH v37] MỤC 3+5: khai báo SỚM (trước routeItemsBase/routeItems ở
+  // dưới) vì cả 2 useMemo đó đọc trực tiếp 3 biến này trong dependency
+  // array — const là block-scoped, phải khai báo trước nơi dùng, nếu
+  // không sẽ lỗi "Cannot access before initialization" (TDZ).
+  const scheduleSkippedToday = data?.scheduleSkippedToday || {};
+  const scheduleManualTasks = data?.scheduleManualTasks || [];
+  const scheduleTimeOverride = data?.scheduleTimeOverride || {};
+  // [PATCH v38] thứ tự sau khi kéo-thả (mảng key). null = chưa kéo gì,
+  // dùng thứ tự mặc định theo giờ Core đã tính.
+  const scheduleManualOrder = data?.scheduleManualOrder || null;
+  // [PATCH v38] khoảng đệm tối thiểu (phút) tự động chèn giữa 2 task liền
+  // kề khi giãn cách cộng dồn — theo yêu cầu §2 "5-10 phút".
+  const AUTO_BUFFER_MIN = 5;
 
   // ── Gắn khung giờ thật vào từng task/oneBigWin bằng cách khớp theo tên. ──
-  const routeItems = useMemo(() => {
+  const routeItemsBase = useMemo(() => {
     if (!schedule.length) {
       const items = [];
       if (oneBigWin) items.push({ key: "obw", name: oneBigWin.label, why: oneBigWin.why, doneWhen: oneBigWin.doneWhen, dur: oneBigWin.dur, priority: "high", isBigWin: true });
@@ -8323,19 +10123,116 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     });
   }, [schedule, oneBigWin, tasks]);
 
+  // [PATCH v38] MỤC 2+3: chèn task tự chọn (scheduleManualTasks), sắp lại
+  // theo scheduleManualOrder (nếu người dùng đã kéo-thả), rồi TÍNH LẠI GIỜ
+  // KIỂU CỘNG DỒN — task đầu giữ giờ start gốc, mỗi task sau bắt đầu ngay
+  // khi task trước kết thúc (+ buffer nếu cần), tự động né các task cố
+  // định (isFixed, vd Toán/Lý) bằng cách nhảy qua hết khung giờ cố định
+  // nếu bị đè lên. Không đụng plannerOutput gốc — override chỉ ảnh hưởng
+  // lớp hiển thị SmartSchedule.
+  const routeItems = useMemo(() => {
+    const manual = scheduleManualTasks.map(t => ({
+      key: t.key, name: t.name, start: t.start, dur: t.dur,
+      end: minutesToHHMMV33(parseTimeToMinutesV33(t.start) + (t.dur || 30)),
+      priority: "med", isManual: true, color: "#3B82F6",
+    }));
+    let all = [...routeItemsBase, ...manual];
+
+    // Legacy: nếu còn scheduleTimeOverride cũ (bản trước v38) thì vẫn áp
+    // dụng trước khi sắp theo order, để không mất dữ liệu người dùng đã
+    // kéo trước khi cập nhật.
+    all = all.map(it => {
+      const overrideStart = scheduleTimeOverride[it.key];
+      if (!overrideStart || it.isBuffer) return it;
+      const dur = it.dur ?? (it.start && it.end ? minutesBetweenHHMM(it.start, it.end) : 0);
+      return { ...it, start: overrideStart, end: minutesToHHMMV33(parseTimeToMinutesV33(overrideStart) + dur) };
+    });
+
+    // ── Xác định THỨ TỰ hiển thị: ưu tiên scheduleManualOrder (do kéo-thả
+    // tạo ra), rơi về sắp theo start gốc nếu chưa kéo gì. Item mới xuất
+    // hiện (chưa có trong scheduleManualOrder, vd vừa "+ Thêm task" hoặc
+    // vừa "Làm lại") được chèn theo đúng vị trí giờ của nó. ──
+    const byKey = new Map(all.map(it => [it.key, it]));
+    let ordered;
+    if (scheduleManualOrder && scheduleManualOrder.length) {
+      ordered = [];
+      const seen = new Set();
+      scheduleManualOrder.forEach(k => {
+        if (byKey.has(k)) { ordered.push(byKey.get(k)); seen.add(k); }
+      });
+      const rest = all.filter(it => !seen.has(it.key))
+        .sort((a, b) => (a.start ? parseTimeToMinutesV33(a.start) : 0) - (b.start ? parseTimeToMinutesV33(b.start) : 0));
+      // chèn item mới vào đúng chỗ theo giờ gốc thay vì luôn luôn ở cuối
+      rest.forEach(it => {
+        const itM = it.start ? parseTimeToMinutesV33(it.start) : 0;
+        let idx = ordered.findIndex(o => o.start && parseTimeToMinutesV33(o.start) > itM);
+        if (idx === -1) idx = ordered.length;
+        ordered.splice(idx, 0, it);
+      });
+    } else {
+      ordered = [...all].sort((a, b) => (a.start ? parseTimeToMinutesV33(a.start) : 0) - (b.start ? parseTimeToMinutesV33(b.start) : 0));
+    }
+
+    // ── GIÃN CÁCH CỘNG DỒN (§2): duyệt tuần tự, mỗi item không-cố-định
+    // bắt đầu ngay sau khi item trước đó (theo thứ tự hiển thị) kết thúc.
+    // Task cố định (isFixed) giữ nguyên giờ thật của nó (không thể dời) —
+    // nếu item đang tính "cộng dồn" bị đè lên 1 task cố định, tự động đẩy
+    // sang SAU khi task cố định đó kết thúc (§3: "dồn sang khung giờ
+    // khác"). Buffer cũ (type buffer) được giữ lại nhưng KHÔNG chiếm chỗ
+    // tính toán riêng — vị trí của nó được tính lại như 1 item bình
+    // thường trong chuỗi cộng dồn.
+    const fixedBlocks = ordered.filter(it => it.isFixed)
+      .map(it => ({ s: parseTimeToMinutesV33(it.start), e: parseTimeToMinutesV33(it.end) }))
+      .sort((a, b) => a.s - b.s);
+
+    const pushPastFixed = (startM, durM) => {
+      let s = startM;
+      let moved = true;
+      while (moved) {
+        moved = false;
+        for (const fb of fixedBlocks) {
+          if (s < fb.e && s + durM > fb.s) { // overlap
+            s = fb.e + AUTO_BUFFER_MIN;
+            moved = true;
+          }
+        }
+      }
+      return s;
+    };
+
+    let cursor = null; // phút, mốc "rảnh tiếp theo" — null = chưa có mốc, dùng giờ gốc của item đầu tiên
+    const result = ordered.map(it => {
+      if (it.isFixed) {
+        const e = parseTimeToMinutesV33(it.end);
+        if (cursor === null || cursor < e) cursor = e;
+        return it;
+      }
+      const dur = it.dur ?? (it.start && it.end ? minutesBetweenHHMM(it.start, it.end) : 0);
+      let startM = cursor === null ? (it.start ? parseTimeToMinutesV33(it.start) : 0) : cursor;
+      startM = pushPastFixed(startM, dur);
+      const endM = startM + dur;
+      cursor = endM + AUTO_BUFFER_MIN;
+      const newStart = minutesToHHMMV33(startM);
+      const newEnd = minutesToHHMMV33(endM);
+      return { ...it, start: newStart, end: newEnd, dur };
+    });
+
+    return result.map(it => ({ ...it, isSkippedToday: !it.isFixed && !it.isBuffer && !!scheduleSkippedToday[it.key] }));
+  }, [routeItemsBase, scheduleManualTasks, scheduleTimeOverride, scheduleManualOrder, scheduleSkippedToday]);
+
   // [PATCH] task quan trọng (priority:"high") được đẩy lên đầu như bình
   // thường; task bị skip nhiều (shouldReduce) bị CHUYỂN XUỐNG CUỐI danh
   // sách hiển thị — đúng MỤC 3 ("chuyển xuống cuối ngày"). Không đổi giờ
   // thật của item (start/end vẫn nguyên, chỉ đổi thứ tự HIỂN THỊ) vì Core
   // vẫn là nguồn sự thật duy nhất cho khung giờ.
+  // [PATCH v37] MỤC 5: task đã "Bỏ qua" hôm nay (isSkippedToday) cũng dồn
+  // xuống cuối, giống task shouldReduce — cả 2 đều hiển thị mờ/xám ở cuối.
   const displayItems = useMemo(() => {
     const checkable = routeItems.filter(it => !it.isFixed && !it.isBuffer);
-    const reduced = checkable.filter(it => skipAnalysis[it.key]?.shouldReduce);
-    // giữ nguyên thứ tự thời gian giữa các item "bình thường" + fixed/buffer
-    // xen kẽ đúng vị trí gốc; đơn giản hoá: hiện fixed/buffer xen giữa theo
-    // thứ tự gốc, các item "normal" theo thứ tự gốc, "reduced" dồn xuống cuối.
-    const order = routeItems.filter(it => it.isFixed || it.isBuffer || !skipAnalysis[it.key]?.shouldReduce);
-    return [...order, ...reduced];
+    const pushedDown = checkable.filter(it => skipAnalysis[it.key]?.shouldReduce || it.isSkippedToday);
+    const order = routeItems.filter(it => it.isFixed || it.isBuffer ||
+      (!skipAnalysis[it.key]?.shouldReduce && !it.isSkippedToday));
+    return [...order, ...pushedDown];
   }, [routeItems, skipAnalysis]);
 
   const checkableItems = routeItems.filter(it => !it.isFixed && !it.isBuffer);
@@ -8366,14 +10263,82 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     save(td, { scheduleDone: nextDone, scheduleXp: nextXp });
   };
 
-  // [PATCH] MỤC 3: "Bỏ qua" 1 item thủ công — ghi nhận vào v25:skipHistory
-  // với reason:"manual_skip". Không tick nó (không cộng XP), chỉ ghi log
-  // để AI học cho những lần sau.
+  // [PATCH v37] MỤC 3+5: "Bỏ qua" 1 item thủ công — ghi nhận vào
+  // v25:skipHistory (KHÔNG đổi, để AI học cho lần sau) VÀ đánh dấu item đó
+  // là "đã bỏ hôm nay" trong d.scheduleSkippedToday (persist riêng theo
+  // ngày, khác skipHistory 30-ngày dùng để phân tích) để UI hiển thị đúng
+  // spec §4: màu xám, mờ đi, có dấu ⏭ — thay vì bị hạ opacity nhẹ như cũ.
+  // KHÔNG trừ/không cộng XP — chỉ ghi nhận (đúng §5: "KHÔNG phạt").
   const skipItem = async (it) => {
     await recordSkip(it.key, it.name, "manual_skip", td);
     const list = await loadSkipHistory();
     setSkipAnalysis(a => ({ ...a, [it.key]: analyzeSkipHistoryFromList(list, it.key, 7) }));
     setSkipListAll(list);
+    await save(td, { scheduleSkippedToday: { ...scheduleSkippedToday, [it.key]: true } });
+    // [PATCH v37] MỤC 5: "Tự động điều chỉnh" (bật/tắt qua Quản lý lịch
+    // trình, mặc định BẬT) — nếu task bị bỏ, tự "Làm lại" ngay để các task
+    // còn lại dồn vào khung giờ trống (regenerate() vốn đã tính lại từ
+    // nowTime hiện tại đến hết ngày, không cần logic dồn riêng).
+    try {
+      const raw = await S.get(AUTO_ADJUST_KEY_V37);
+      const enabled = raw === null || raw === "null" || raw === "true"; // mặc định bật
+      if (enabled) regenerate();
+    } catch {}
+  };
+  // [PATCH v37] MỤC 5: hoàn tác "Bỏ qua" — cho phép đổi ý, đưa task trở
+  // lại trạng thái bình thường trong lịch hôm nay.
+  const unskipItem = async (it) => {
+    const next = { ...scheduleSkippedToday };
+    delete next[it.key];
+    await save(td, { scheduleSkippedToday: next });
+  };
+
+  // [PATCH v37] MỤC 5: "+ Thêm task" — task tự chọn, thêm thẳng vào lịch
+  // hôm nay, màu xanh dương #3B82F6 theo đúng spec §4. Lưu vào
+  // d.scheduleManualTasks (mảng, mỗi phần tử { key, name, start, dur }),
+  // độc lập hoàn toàn với plannerOutput/aiPlannerCore.js — chỉ là lớp hiển
+  // thị thêm trong SmartSchedule, không đi qua Core/Rule Engine.
+  const addManualTask = async (name, start, dur) => {
+    if (!name?.trim() || !start) return;
+    const key = "manual_" + Date.now();
+    const next = [...scheduleManualTasks, { key, name: name.trim(), start, dur: dur || 30 }];
+    await save(td, { scheduleManualTasks: next });
+  };
+  const removeManualTask = async (key) => {
+    await save(td, { scheduleManualTasks: scheduleManualTasks.filter(t => t.key !== key) });
+  };
+
+  // [PATCH v38] MỤC 1+2: kéo-thả để ĐỔI THỨ TỰ (không phải đổi giờ trực
+  // tiếp nữa) — thả 1 task vào ô drop-zone ở vị trí `targetIndex`. LƯU Ý:
+  // targetIndex chỉ đếm trên các item CÓ THỂ KÉO (không cố định, không
+  // buffer, chưa tick, chưa bị bỏ qua) — đúng như cách render loop đánh số
+  // dropIdx — nên ở đây phải tách riêng draggable/non-draggable, chèn vào
+  // đúng vị trí trong danh sách draggable rồi ghép lại thành 1 mảng key
+  // đầy đủ (item cố định/buffer giữ nguyên vị trí tương đối, xen giữa các
+  // task kéo được). Lưu vào d.scheduleManualOrder — giờ hiển thị sau đó
+  // được routeItems tính lại HOÀN TOÀN kiểu cộng dồn (§2), nên không thể
+  // có 2 task trùng giờ.
+  const moveItemToPosition = async (draggedKey, targetIndex) => {
+    const isDraggableItem = (it) => !it.isFixed && !it.isBuffer && !it.isSkippedToday && !scheduleDone[it.key];
+    const draggableKeys = displayItems.filter(isDraggableItem).map(it => it.key);
+    const fromIdx = draggableKeys.indexOf(draggedKey);
+    if (fromIdx === -1) return;
+    const nextDraggable = [...draggableKeys];
+    nextDraggable.splice(fromIdx, 1);
+    let insertAt = targetIndex;
+    if (fromIdx < targetIndex) insertAt -= 1;
+    insertAt = Math.max(0, Math.min(insertAt, nextDraggable.length));
+    nextDraggable.splice(insertAt, 0, draggedKey);
+
+    // Ghép lại: duyệt displayItems theo thứ tự CŨ, thay các vị trí
+    // draggable bằng thứ tự MỚI (nextDraggable), giữ nguyên vị trí các
+    // item không-kéo-được (cố định/buffer/đã tick/đã bỏ qua).
+    let di = 0;
+    const merged = displayItems.map(it => {
+      if (isDraggableItem(it)) { const k = nextDraggable[di]; di++; return k; }
+      return it.key;
+    });
+    await save(td, { scheduleManualOrder: merged });
   };
 
   // [PATCH] MỤC 3: tự động ghi nhận "timeout" cho các item CHƯA tick khi
@@ -8501,77 +10466,152 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
           background: accent, transition: "width 0.3s ease" }}/>
       </div>
 
-      {displayItems.map((it) => {
-        if (it.isFixed) {
+      {(() => {
+        // [PATCH v38] MỤC 1: các item có thể kéo được (không cố định,
+        // không buffer, chưa tick, chưa bị bỏ qua) — chỉ những item này
+        // mới có ô drop-zone chèn TRƯỚC nó. Luôn có thêm 1 ô drop-zone ở
+        // CUỐI danh sách để thả task xuống cuối cùng.
+        const isDraggable = (it) => !it.isFixed && !it.isBuffer && !it.isSkippedToday && !scheduleDone[it.key];
+        const dropZone = (targetIndex) => {
+          const active = draggingKey && dragOverIndex === targetIndex;
           return (
-            <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
-              <span style={{ width: 6, height: 6, borderRadius: "50%", background: it.color || "#EF4444", flexShrink: 0 }}/>
-              <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
-                🕐 {it.start} 🏫 {it.name} (cố định, {minutesBetweenHHMM(it.start, it.end)}')
-              </span>
+            <div key={"dz" + targetIndex}
+              onDragOver={(e) => { if (draggingKey) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (dragOverIndex !== targetIndex) setDragOverIndex(targetIndex); } }}
+              onDragLeave={() => { setDragOverIndex(idx => idx === targetIndex ? null : idx); }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const draggedKey = e.dataTransfer.getData("text/plain");
+                setDraggingKey(null); setDragOverIndex(null);
+                if (!draggedKey) return;
+                moveItemToPosition(draggedKey, targetIndex);
+              }}
+              style={{
+                height: active ? 30 : (draggingKey ? 14 : 4),
+                margin: "2px 2px",
+                borderRadius: 8,
+                border: draggingKey ? `2px dashed ${active ? accent : theme.border}` : "2px dashed transparent",
+                background: active ? `${accent}1A` : (draggingKey ? theme.bg : "transparent"),
+                display: "flex", alignItems: "center", justifyContent: "center",
+                transition: "height 0.12s ease, background 0.12s ease, border-color 0.12s ease",
+                fontSize: 9, color: accent, fontWeight: 600, overflow: "hidden",
+              }}>
+              {active ? "Thả vào đây" : ""}
             </div>
           );
-        }
-        if (it.isBuffer) {
-          return (
-            <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "3px 10px", marginBottom: 6 }}>
-              <span style={{ fontSize: 10, color: theme.textDim, minWidth: 88, flexShrink: 0 }}>{it.start}–{it.end}</span>
-              <span style={{ fontSize: 11, color: theme.textDim }}>☕ nghỉ</span>
-            </div>
-          );
-        }
-        // [PATCH] MỤC 4h: task đã tick vẫn hiển thị, có dấu ✅ và gạch
-        // ngang tên (thay vì mờ đi như DailyRouteCard cũ).
-        const checked = !!scheduleDone[it.key];
-        const shortWhy = summarizeReason(it.why, 90);
-        const wasReduced = !!skipAnalysis[it.key]?.shouldReduce;
-        // [PATCH v36] MỤC 3: màu viền trái = màu phân loại (đỏ cho task cố
-        // định, 1 trong 7 màu bảng cho task AI thêm theo group) thay vì
-        // theo priority như cũ — priority vẫn còn dùng cho displayItems'
-        // sort ở trên, chỉ đổi phần hiển thị màu.
-        const itemColor = it.color || aiPlannerPriorityClass(it.priority);
-        return (
-          <div key={it.key}
-            style={{
-              display: "flex", gap: 10, alignItems: "flex-start",
-              padding: "9px 10px", borderRadius: 10, marginBottom: 6, position: "relative",
-              background: it.isBigWin ? `${accent}12` : it.isDeadlineTask ? `${theme.warning}12` : theme.bg,
-              borderLeft: `3px solid ${itemColor}`,
-              opacity: wasReduced && !checked ? 0.75 : 1,
-            }}>
-            <div style={{ marginTop: 1, cursor: "pointer" }} onClick={() => toggleItem(it)}>
-              <MorningTaskCheckbox checked={checked} theme={theme} accent={accent}/>
-            </div>
-            <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => toggleItem(it)}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: theme.text,
-                  textDecoration: checked ? "line-through" : "none" }}>
-                  {checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}
-                  {/* [PATCH v36] MỤC 1: format giờ cụ thể "🕐 HH:MM Tên (dur')" */}
-                  {it.start ? `🕐 ${it.start} ` : ""}{it.name}{it.dur > 0 ? ` (${it.dur}')` : ""}
+        };
+
+        const nodes = [];
+        let dropIdx = 0;
+        displayItems.forEach((it, i) => {
+          if (isDraggable(it)) { nodes.push(dropZone(dropIdx)); dropIdx++; }
+
+          if (it.isFixed) {
+            nodes.push(
+              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: it.color || "#EF4444", flexShrink: 0 }}/>
+                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
+                  🕐 {it.start} 🏫 {it.name} (cố định, {minutesBetweenHHMM(it.start, it.end)}')
                 </span>
               </div>
-              {shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
-              {it.doneWhen && <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>✓ {it.doneWhen}</div>}
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
-                <span style={{ fontSize: 9, color: theme.textDim }}>+{xpForItem(it)} XP</span>
-                {!checked && (
-                  <button onClick={(e) => { e.stopPropagation(); skipItem(it); }}
-                    style={{ background: "none", border: "none", color: theme.textDim, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
-                    Bỏ qua
-                  </button>
-                )}
+            );
+            return;
+          }
+          if (it.isBuffer) {
+            nodes.push(
+              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "3px 10px", marginBottom: 6 }}>
+                <span style={{ fontSize: 10, color: theme.textDim, minWidth: 88, flexShrink: 0 }}>{it.start}–{it.end}</span>
+                <span style={{ fontSize: 11, color: theme.textDim }}>☕ nghỉ</span>
               </div>
+            );
+            return;
+          }
+
+          // [PATCH] MỤC 4h: task đã tick vẫn hiển thị, có dấu ✅ và gạch
+          // ngang tên (thay vì mờ đi như DailyRouteCard cũ).
+          const checked = !!scheduleDone[it.key];
+          const shortWhy = summarizeReason(it.why, 90);
+          const wasReduced = !!skipAnalysis[it.key]?.shouldReduce;
+          // [PATCH v37] MỤC 4: task bị "Bỏ qua" hôm nay → xám, mờ, dấu ⏭
+          // (khác với wasReduced — chỉ là gợi ý hạ ưu tiên do skip nhiều lần
+          // trong 7 ngày qua, vẫn hiển thị bình thường, có thể tick được).
+          const skippedToday = !!it.isSkippedToday;
+          // [PATCH v36] MỤC 3: màu viền trái = màu phân loại (đỏ cho task cố
+          // định, 1 trong 7 màu bảng cho task AI thêm theo group, xanh dương
+          // cho task tự chọn — §4) thay vì theo priority như cũ.
+          const itemColor = skippedToday ? "#9CA3AF" : (it.color || aiPlannerPriorityClass(it.priority));
+          const draggableNow = isDraggable(it);
+          const isBeingDragged = draggingKey === it.key;
+          nodes.push(
+            <div key={it.key}
+              draggable={draggableNow}
+              onDragStart={(e) => {
+                e.dataTransfer.setData("text/plain", it.key);
+                e.dataTransfer.effectAllowed = "move";
+                setDraggingKey(it.key);
+              }}
+              onDragEnd={() => { setDraggingKey(null); setDragOverIndex(null); }}
+              style={{
+                display: "flex", gap: 10, alignItems: "flex-start",
+                padding: "9px 10px", borderRadius: 10, marginBottom: 6, position: "relative",
+                background: it.isBigWin ? `${accent}12` : it.isDeadlineTask ? `${theme.warning}12` : theme.bg,
+                borderLeft: `3px solid ${itemColor}`,
+                opacity: isBeingDragged ? 0.35 : skippedToday ? 0.5 : (wasReduced && !checked ? 0.75 : 1),
+                cursor: draggableNow ? "grab" : "default",
+              }}>
+              <div style={{ marginTop: 1, cursor: "pointer" }} onClick={() => toggleItem(it)}>
+                <MorningTaskCheckbox checked={checked} theme={theme} accent={accent}/>
+              </div>
+              <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => toggleItem(it)}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: skippedToday ? theme.textDim : theme.text,
+                    textDecoration: checked ? "line-through" : "none" }}>
+                    {skippedToday ? "⏭ " : checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}
+                    {/* [PATCH v38] MỤC 4: format giờ cụ thể "🕐 HH:MM - HH:MM Tên (dur')" */}
+                    {it.start ? `🕐 ${it.start}${it.end ? " - " + it.end : ""} ` : ""}{it.name}{it.dur > 0 ? ` (${it.dur}')` : ""}
+                  </span>
+                </div>
+                {!skippedToday && shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
+                {!skippedToday && it.doneWhen && <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>✓ {it.doneWhen}</div>}
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+                  <span style={{ fontSize: 9, color: theme.textDim }}>{skippedToday ? "Đã bỏ qua" : `+${xpForItem(it)} XP`}</span>
+                  <span style={{ display: "flex", gap: 8 }}>
+                    {skippedToday && (
+                      <button onClick={(e) => { e.stopPropagation(); unskipItem(it); }}
+                        style={{ background: "none", border: "none", color: theme.textDim, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
+                        Hoàn tác
+                      </button>
+                    )}
+                    {!skippedToday && !checked && (
+                      <button onClick={(e) => { e.stopPropagation(); skipItem(it); }}
+                        style={{ background: "none", border: "none", color: theme.textDim, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
+                        Bỏ qua
+                      </button>
+                    )}
+                    {it.isManual && (
+                      <button onClick={(e) => { e.stopPropagation(); removeManualTask(it.key); }}
+                        style={{ background: "none", border: "none", color: theme.danger, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
+                        Xoá
+                      </button>
+                    )}
+                  </span>
+                </div>
+              </div>
+              {/* [PATCH] MỤC 4d: XP fly-up khi tick item này */}
+              {xpFly && xpFly.key.startsWith(it.key + ":") && (
+                <span className="gb-xp-fly" style={{ position: "absolute", right: 10, top: 4, color: theme.success }}>
+                  +{xpFly.amount}
+                </span>
+              )}
             </div>
-            {/* [PATCH] MỤC 4d: XP fly-up khi tick item này */}
-            {xpFly && xpFly.key.startsWith(it.key + ":") && (
-              <span className="gb-xp-fly" style={{ position: "absolute", right: 10, top: 4, color: theme.success }}>
-                +{xpFly.amount}
-              </span>
-            )}
-          </div>
-        );
-      })}
+          );
+        });
+        // ô drop-zone cuối cùng — thả vào đây để đưa task xuống cuối danh sách
+        if (draggingKey) nodes.push(dropZone(dropIdx));
+        return nodes;
+      })()}
+
+      {/* [PATCH v37] MỤC 5: "+ Thêm task" — task tự chọn ngay trong lịch. */}
+      <AddManualTaskRow theme={theme} accent={accent} onAdd={addManualTask}/>
 
       {/* [PATCH] MỤC 3+4g: hiển thị lý do hạ ưu tiên cho các task bị skip nhiều */}
       {reduceNotices.length > 0 && (
@@ -13113,9 +15153,6 @@ function KhamPha({db,dayExp,str,txp,finTxs,setts}) {
         {[{k:"ideas",l:"💡 Ideas"},{k:"insight",l:"✨ AI Insight"},{k:"corrlab",l:"🔬 Corr. Lab"}].map(o=>(
           <button key={o.k} onClick={()=>setKhSubTab(o.k)} className="gb-ripple" onMouseDown={gbRipple} style={{position:"relative",flex:1,padding:"8px 0",borderRadius:999,border:"none",background:khSubTab===o.k?theme.accent:theme.surfaceAlt,color:khSubTab===o.k?"#fff":theme.textDim,fontSize:11,fontWeight:khSubTab===o.k?700:400,cursor:"pointer",boxShadow:khSubTab===o.k?`0 4px 16px ${theme.accent}55`:"none",transition:"all 0.2s ease"}}>
             {o.l}
-            {o.k==="insight" && (
-              <span className="gb-new-badge" style={{position:"absolute",top:-6,right:6,fontSize:7,fontWeight:800,color:"#fff",background:theme.danger||"#ef4444",borderRadius:8,padding:"1px 5px",letterSpacing:0.5,boxShadow:"0 2px 6px rgba(0,0,0,0.35)"}}>NEW</span>
-            )}
           </button>
         ))}
       </div>
