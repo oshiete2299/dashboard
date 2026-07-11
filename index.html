@@ -5365,8 +5365,9 @@ const blank = () => ({
   studyResults:[],       // [{id,text,done}] Hiểu bài nào / Giải đề nào / Hoàn thành chương nào
   shortContent:[],       // [{id,source,minutes,at}] nội dung ngắn (TikTok/Reels/Shorts) hôm nay
   // ── V25 MỤC 4 (DailySchedule) ──
-  scheduleDone:{},       // {[scheduleItemKey]:true} task trong Lịch trình chi tiết theo giờ đã tick hôm nay
-  scheduleXp:{},         // {[scheduleItemKey]:number} XP đã cộng cho từng item (lưu lại để dayExpFull cộng đúng, tránh tính sai nếu lịch được "Làm lại")
+  scheduleDone:{},       // [LEGACY — DailySchedule đã bị xoá] {[scheduleItemKey]:true} — không còn component nào ghi field này nữa, giữ lại CHỈ để dayExpFull cộng đúng XP cho các ngày cũ đã có dữ liệu, không xoá để không mất XP lịch sử.
+  scheduleXp:{},         // [LEGACY — DailySchedule đã bị xoá] {[scheduleItemKey]:number} — cùng lý do trên.
+  timelineDone:{},       // [V41] {[doneKey]:true} — tick TRỰC QUAN cho từng block trong SmartSchedule (Lịch trình hôm nay). doneKey = "start|tên task". KHÔNG cộng XP (quyết định của Bảo, để an toàn tuyệt đối cho dữ liệu XP hiện có) — hoàn toàn tách biệt khỏi dailyPicks/poolDone và bigGoalsToday.
   // ── V30 (SmartSchedule) ──
   eveningNote:"",        // [PATCH v30] ghi chú tự do từ checklist cuối ngày trong SmartSchedule, không tính XP — thuần lưu để đọc lại/phân tích sau này
   // ── V38 (SmartSchedule kéo-thả + giãn cách cộng dồn) ──
@@ -7634,55 +7635,49 @@ function App() {
     setGoalPool(p=>(p||[]).map(g=>g.id===id?{...g,skipCount:Math.max(0,(g.skipCount||0)+delta)}:g));
   },[]);
 
-  // ── Đảm bảo hôm nay đã có 5 việc nhỏ random + đưa "chuẩn bị ngày mai" của hôm qua vào hôm nay ──
-  const ensureDailyPicksRef = useRef(null); // lưu ngày (iso) đã xử lý gần nhất, để không lặp lại trong cùng ngày nhưng vẫn chạy lại khi sang ngày mới
+  // [PATCH] Today's Goals (dailyPicks) KHÔNG còn tự random mỗi ngày nữa —
+  // đây giờ là danh sách người dùng tự thêm/sửa/xoá/sắp xếp (+ AI đề
+  // xuất qua nút "Áp dụng"), không phải 5 việc random cố định. Vẫn giữ
+  // logic chuyển "chuẩn bị ngày mai" (tomorrowDraft) của hôm qua → hôm
+  // nay, vì đó là 1 tính năng độc lập không liên quan gì đến dailyPicks.
+  const ensureTomorrowPrepRef = useRef(null);
   useEffect(()=>{
-    if(taskPool===null) return; // chờ pool tải xong
     const todayData = dbRef.current[td];
-    if(todayData && Array.isArray(todayData.dailyPicks) && todayData.dailyPicks.length>0) return; // đã có rồi, không random lại
-    if(ensureDailyPicksRef.current === td) return; // đã xử lý ngày này rồi (đang chờ save() hoàn tất)
-    ensureDailyPicksRef.current = td;
-    (async()=>{
-      // lịch sử lần cuối mỗi task xuất hiện, để ưu tiên task lâu chưa ra
-      const historyByPoolId = {};
-      const sortedDates = Object.keys(dbRef.current).sort();
-      for(const iso of sortedDates){
-        const d = dbRef.current[iso];
-        (d?.dailyPicks||[]).forEach(id=>{ historyByPoolId[id]=iso; });
-      }
-      const yesterday = (()=>{ const dt=new Date(td+"T00:00:00"); dt.setDate(dt.getDate()-1); return dt.toISOString().split("T")[0]; })();
-      const yesterdayPicks = dbRef.current[yesterday]?.dailyPicks || [];
-      const picks = pickDailyTasks(taskPoolRef.current, td, historyByPoolId, yesterdayPicks, 5);
+    if(ensureTomorrowPrepRef.current === td) return;
+    ensureTomorrowPrepRef.current = td;
+    const base = todayData || blank();
+    if(base.tomorrowPrep) return; // đã có rồi
+    const yesterday = (()=>{ const dt=new Date(td+"T00:00:00"); dt.setDate(dt.getDate()-1); return dt.toISOString().split("T")[0]; })();
+    const yesterdayData = dbRef.current[yesterday];
+    if(yesterdayData?.tomorrowDraft?.text){
+      save(td, { tomorrowPrep: { text: yesterdayData.tomorrowDraft.text, createdAt: yesterdayData.tomorrowDraft.createdAt, doneAt:null } });
+    }
+  },[td]);
 
-      // chuyển "chuẩn bị ngày mai" (tomorrowDraft) mà HÔM QUA đã tạo → thành tomorrowPrep của HÔM NAY
-      const base = dbRef.current[td] || blank();
-      const patch = { dailyPicks: picks, swapsUsed: base.swapsUsed||0 };
-      const yesterdayData = dbRef.current[yesterday];
-      if(yesterdayData?.tomorrowDraft?.text && !base.tomorrowPrep){
-        patch.tomorrowPrep = { text: yesterdayData.tomorrowDraft.text, createdAt: yesterdayData.tomorrowDraft.createdAt, doneAt:null };
-      }
-      await save(td, patch);
-    })();
-  },[taskPool, td]);
-
-  // ── Đổi việc: random lại 1 việc nhỏ CHƯA hoàn thành trong 5 việc hôm nay, tối đa 2 lần/ngày ──
-  const swapDailyTask = useCallback((poolIdToReplace)=>{
+  // ── Today's Goals: thêm 1 việc thủ công (tạo taskPool entry mới rồi
+  // append vào cuối dailyPicks) — thay thế hoàn toàn cơ chế "Đổi việc"
+  // random cũ (swapDailyTask), không còn hợp lý khi danh sách giờ tự do
+  // thêm/xoá/sắp xếp thay vì 5 slot cố định.
+  const addTodayGoal = useCallback((label, xp)=>{
+    const id = addPoolTask(label, xp, "✅");
     const today = dbRef.current[td] || blank();
-    const used = today.swapsUsed || 0;
-    if(used>=2) return false;
-    const picks = today.dailyPicks || [];
-    if(!picks.includes(poolIdToReplace)) return false;
-    if(today.poolDone?.[poolIdToReplace]) return false; // không đổi việc đã hoàn thành
-    // [PATCH v32] Loại task cố định/lỗi thời khỏi candidate khi "Đổi việc",
-    // giống pickDailyTasks — tránh đổi ra "Dậy trước 7 giờ"/"Active Recall".
-    const pool = taskPoolRef.current.filter(t=>!t.hidden && !FIXED_OR_LEGACY_POOL_IDS.has(t.id));
-    const candidates = pool.filter(t=>!picks.includes(t.id));
-    if(candidates.length===0) return false;
-    const rnd = seededRandom(td+":"+used+":"+poolIdToReplace);
-    const chosen = candidates[Math.floor(rnd()*candidates.length)];
-    const newPicks = picks.map(id=>id===poolIdToReplace?chosen.id:id);
-    save(td, { dailyPicks:newPicks, swapsUsed: used+1 });
-    return true;
+    const picks = Array.isArray(today.dailyPicks) ? today.dailyPicks : [];
+    save(td, { dailyPicks: [...picks, id] });
+    return id;
+  },[td, save, addPoolTask]);
+
+  // ── Today's Goals: xoá 1 việc khỏi danh sách hôm nay (không xoá khỏi
+  // taskPool — chỉ bỏ khỏi dailyPicks của ngày hôm nay). ──
+  const removeTodayGoal = useCallback((poolId)=>{
+    const today = dbRef.current[td] || blank();
+    const picks = Array.isArray(today.dailyPicks) ? today.dailyPicks : [];
+    save(td, { dailyPicks: picks.filter(id=>id!==poolId) });
+  },[td, save]);
+
+  // ── Today's Goals: sắp xếp lại thứ tự (kéo-thả) — dailyPicks vốn đã là
+  // mảng có thứ tự, chỉ cần lưu lại mảng đã đổi vị trí. ──
+  const reorderTodayGoals = useCallback((newOrderIds)=>{
+    save(td, { dailyPicks: newOrderIds });
   },[td, save]);
 
   // ── Toggle 1 việc nhỏ trong 5 việc hôm nay ──
@@ -8090,7 +8085,8 @@ function App() {
           onAddPoolTask={addPoolTask} onEditPoolTask={editPoolTask} onDeletePoolTask={deletePoolTask} onToggleHidePoolTask={toggleHidePoolTask}
           onAddGoalPool={addGoalPool} onEditGoalPool={editGoalPool} onDeleteGoalPool={deleteGoalPool}
           onMarkGoalPicked={markGoalPicked} onBumpGoalDoneCount={bumpGoalDoneCount} onBumpGoalSkipCount={bumpGoalSkipCount}
-          onTogglePoolTask={togglePoolTaskToday} onSwapDailyTask={swapDailyTask}/>}
+          onTogglePoolTask={togglePoolTaskToday}
+          onAddTodayGoal={addTodayGoal} onRemoveTodayGoal={removeTodayGoal} onReorderTodayGoals={reorderTodayGoals}/>}
         {tab===1 && <CalTab db={db} save={save} dayExp={dayExp} td={td} weeklyReviews={weeklyReviews} targetXP={setts.targetXP||150} onOpenWeeklyReviewWeek={ws=>setReviewHistoryWeek(ws)}/>}
         {tab===2 && <Stats db={db} dayExp={dayExp} lv={lv} rt={rt} txp={txp} str={str} exportData={exportData} importData={importData} setts={setts} saveSetts={saveSetts} onReset={()=>setResetModal(true)}
           backupList={backupList} restoreFromBackup={restoreFromBackup} taskPool={taskPool}/>}
@@ -8628,56 +8624,253 @@ function DashboardHome({td,data,dayE,db,txp,str,lv,rt,dayExp,setts,finTxs,onOpen
 }
 
 // ══════════════════════════════ V24: 5 VIỆC NHỎ HÔM NAY ═══════════════════
-function DailyPicksCard({td,data,taskPool,onToggle,onSwap,onOpenManager}) {
+// ── Chuẩn hoá tên task để so trùng (bỏ khoảng trắng thừa, không phân
+// biệt hoa/thường) — dùng khi Áp dụng AI đề xuất, tránh tạo bản sao. ──
+function normalizeTaskName(s) {
+  return (s||"").trim().replace(/\s+/g," ").toLowerCase();
+}
+
+// ══════════════════════════════ AI ĐỀ XUẤT (AI Suggestions) ════════════════
+// Đọc plannerOutput.tasks (kế hoạch AI mới nhất hôm nay), LỌC BỎ Routine
+// (isFixedRoutine) — chỉ hiển thị các task AI thật sự đề xuất. Đây CHỈ là
+// gợi ý: không tự thêm vào Mục tiêu hôm nay. Bấm "Áp dụng" (từng mục hoặc
+// tất cả) mới chuyển sang data.dailyPicks (Today's Goals) — so trùng tên
+// (normalize) với các việc đã có, trùng thì bỏ qua, không tạo bản sao.
+// oneBigWin có nút Áp dụng riêng → data.bigGoalsToday (Big Goal).
+function AISuggestionsCard({ td, data, taskPool, db, plannerStorage, plannerToday, onAddPoolTask, save }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [collapsed, setCollapsed] = useState(false);
+  const [toast, setToast] = useState(null);
+
+  const entryCount = plannerToday?.entries?.length ?? 0;
+  const latestEntry = entryCount > 0 ? plannerToday.entries[entryCount - 1] : null;
+  const plannerOutput = latestEntry?.plannerOutput || null;
+  const oneBigWin = plannerOutput?.oneBigWin || null;
+  const allTasks = plannerOutput?.tasks || [];
+
+  // Chỉ AI task thật — bỏ Routine (isFixedRoutine) và bỏ chính oneBigWin
+  // (oneBigWin có nút Áp dụng riêng, không lặp lại trong danh sách dưới).
+  const suggestions = allTasks.filter(t => !t.isFixedRoutine && t.name !== oneBigWin?.label && (t.dur||0) > 0);
+
+  const todayGoals = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
+  const poolById = Object.fromEntries((taskPool||[]).map(p=>[p.id,p]));
+  const existingNames = new Set(todayGoals.map(id => normalizeTaskName(poolById[id]?.l)));
+
+  const todayBigGoals = Array.isArray(data.bigGoalsToday) ? data.bigGoalsToday : [];
+  const bigGoalNames = new Set(todayBigGoals.map(g => normalizeTaskName(g.text)));
+
+  const showToast = (msg) => { setToast(msg); setTimeout(()=>setToast(null), 2200); };
+
+  const applyOne = (t) => {
+    const norm = normalizeTaskName(t.name);
+    if (existingNames.has(norm)) {
+      showToast(`"${t.name}" đã có trong Today's Goals.`);
+      return;
+    }
+    const existingPoolEntry = (taskPool||[]).find(p => normalizeTaskName(p.l) === norm);
+    const poolId = existingPoolEntry ? existingPoolEntry.id : onAddPoolTask(t.name, t.xp, t.icon || "✅");
+    save(td, { dailyPicks: [...todayGoals, poolId] });
+    existingNames.add(norm);
+  };
+
+  const applyAll = () => {
+    let picks = [...todayGoals];
+    const seen = new Set(existingNames);
+    suggestions.forEach(t => {
+      const norm = normalizeTaskName(t.name);
+      if (seen.has(norm)) return; // trùng — bỏ qua, không tạo bản sao
+      const existingPoolEntry = (taskPool||[]).find(p => normalizeTaskName(p.l) === norm);
+      const poolId = existingPoolEntry ? existingPoolEntry.id : onAddPoolTask(t.name, t.xp, t.icon || "✅");
+      picks.push(poolId);
+      seen.add(norm);
+    });
+    if (picks.length !== todayGoals.length) save(td, { dailyPicks: picks });
+  };
+
+  const applyBigWin = () => {
+    if (!oneBigWin) return;
+    const norm = normalizeTaskName(oneBigWin.label);
+    if (bigGoalNames.has(norm)) { showToast("Mục tiêu này đã có trong Mục tiêu lớn."); return; }
+    if (todayBigGoals.length >= 1) { showToast("Mục tiêu lớn hôm nay đã đủ (tối đa 1)."); return; }
+    save(td, { bigGoalsToday: [...todayBigGoals, { id: "bg_"+Date.now(), text: oneBigWin.label, done: false }] });
+  };
+
+  if (!plannerOutput || (!suggestions.length && !oneBigWin)) return null; // chưa có kế hoạch AI hôm nay hoặc không còn gì để đề xuất
+
+  const isApplied = (t) => existingNames.has(normalizeTaskName(t.name));
+  const bigWinApplied = oneBigWin && bigGoalNames.has(normalizeTaskName(oneBigWin.label));
+
+  return (
+    <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}`, position: "relative" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: collapsed?0:10 }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🤖 AI đề xuất</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {!collapsed && suggestions.length > 0 && (
+            <button onClick={applyAll} style={{ background: "none", border: `1px solid ${accent}66`, borderRadius: 999, padding: "3px 10px", color: accent, fontSize: 10, fontWeight: 700, cursor: "pointer" }}>
+              Áp dụng tất cả
+            </button>
+          )}
+          <button onClick={()=>setCollapsed(c=>!c)} style={{ background: "none", border: "none", color: theme.textDim, cursor: "pointer", fontSize: 12, padding: "0 4px" }}>{collapsed?"▾":"▴"}</button>
+        </div>
+      </div>
+      {!collapsed && <>
+        {oneBigWin && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", marginBottom: 8, background: `${theme.primary}0F`, borderRadius: 8 }}>
+            <span style={{ fontSize: 13, flexShrink: 0 }}>⭐</span>
+            <span style={{ flex: 1, fontSize: 12, color: theme.text, minWidth: 0 }}>{oneBigWin.label}<span style={{ color: theme.textDim, fontSize: 10 }}> · Mục tiêu lớn</span></span>
+            <button disabled={bigWinApplied} onClick={applyBigWin}
+              style={{ background: "none", border: "none", color: bigWinApplied?theme.textDim:theme.primary, fontSize: 11, fontWeight: 700, cursor: bigWinApplied?"default":"pointer", flexShrink: 0 }}>
+              {bigWinApplied?"Đã thêm":"Áp dụng"}
+            </button>
+          </div>
+        )}
+        {suggestions.map((t, i) => {
+          const applied = isApplied(t);
+          return (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", marginBottom: 6, background: theme.surfaceAlt, borderRadius: 8 }}>
+              <span style={{ fontSize: 13, flexShrink: 0 }}>{t.icon || "✅"}</span>
+              <span style={{ flex: 1, fontSize: 12, color: theme.text, minWidth: 0 }}>{t.name}</span>
+              <span style={{ fontSize: 9, color: theme.textDim, flexShrink: 0 }}>+{t.xp||TP_XP}XP</span>
+              <button disabled={applied} onClick={()=>applyOne(t)}
+                style={{ background: "none", border: "none", color: applied?theme.textDim:accent, fontSize: 11, fontWeight: 700, cursor: applied?"default":"pointer", flexShrink: 0 }}>
+                {applied?"Đã thêm":"Áp dụng"}
+              </button>
+            </div>
+          );
+        })}
+        {suggestions.length === 0 && !oneBigWin && (
+          <div style={{ fontSize: 11, color: theme.textDim, padding: "6px 0" }}>Không có đề xuất mới.</div>
+        )}
+      </>}
+      {toast && (
+        <div style={{ position: "absolute", bottom: 10, left: 14, right: 14, background: theme.surfaceAlt, border: `1px solid ${theme.border}`, borderRadius: 8, padding: "6px 10px", fontSize: 11, color: theme.text, boxShadow: "0 4px 14px rgba(0,0,0,0.3)" }}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════ MỤC TIÊU HÔM NAY (Today's Goals) ═══════════
+// Thay thế DailyPicksCard cũ (5 slot random + "đổi việc" 2 lần/ngày).
+// Data vẫn dùng chung field cũ (data.dailyPicks: [taskPoolId,...],
+// data.poolDone: {[id]:bool}) — KHÔNG đổi schema, chỉ đổi cách dailyPicks
+// được tạo ra (tự do thêm/xoá/sắp xếp thay vì auto-random mỗi ngày, xem
+// App: addTodayGoal/removeTodayGoal/reorderTodayGoals).
+// Đây KHÔNG phải Routine — Routine là FIXED_TASKS_DEFAULT_V33, hiển thị
+// riêng trong SmartSchedule.
+function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onEditPoolTask,onOpenManager}) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const [collapsed,setCollapsed] = useState(false);
+  const [newLabel,setNewLabel] = useState("");
+  const [editingId,setEditingId] = useState(null);
+  const [editLabel,setEditLabel] = useState("");
+  const [draggingId,setDraggingId] = useState(null);
+  const [dragOverIdx,setDragOverIdx] = useState(null);
+
   const picks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
   const poolById = Object.fromEntries((taskPool||[]).map(t=>[t.id,t]));
   const doneCount = picks.filter(id=>data.poolDone?.[id]).length;
-  const swapsUsed = data.swapsUsed||0;
+
+  const submitAdd = () => {
+    if(!newLabel.trim()) return;
+    onAdd(newLabel.trim(), TP_XP);
+    setNewLabel("");
+  };
+  const startEdit = (t) => { setEditingId(t.id); setEditLabel(t.l); };
+  const saveEditLabel = () => {
+    if(editLabel.trim() && onEditPoolTask) onEditPoolTask(editingId, { l: editLabel.trim() });
+    setEditingId(null);
+  };
+
+  const handleDrop = (targetIdx) => {
+    if(draggingId==null) return;
+    const fromIdx = picks.indexOf(draggingId);
+    if(fromIdx===-1){ setDraggingId(null); setDragOverIdx(null); return; }
+    const next = [...picks];
+    next.splice(fromIdx,1);
+    let insertAt = targetIdx;
+    if(fromIdx<targetIdx) insertAt -= 1;
+    next.splice(Math.max(0,Math.min(insertAt,next.length)),0,draggingId);
+    onReorder(next);
+    setDraggingId(null); setDragOverIdx(null);
+  };
+
   return (
     <div style={{background:theme.surface,borderRadius:12,padding:14,marginBottom:12,boxShadow:"0 6px 20px rgba(0,0,0,0.28)"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:collapsed?0:10}}>
-        <span style={{fontSize:13,fontWeight:700,color:accent}}>📋 Nhiệm vụ hôm nay</span>
+        <span style={{fontSize:13,fontWeight:700,color:accent}}>📋 Mục tiêu hôm nay</span>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
-          <span style={{fontSize:10,color:theme.textDim}}>{doneCount}/{picks.length||5}</span>
+          <span style={{fontSize:10,color:theme.textDim}}>{doneCount}/{picks.length}</span>
           <button onClick={()=>setCollapsed(c=>!c)} style={{background:"none",border:"none",color:theme.textDim,cursor:"pointer",fontSize:12,padding:"0 4px"}}>{collapsed?"▾":"▴"}</button>
         </div>
       </div>
       {!collapsed && <>
-      {picks.length===0 && <div style={{fontSize:11,color:theme.textDim,padding:"6px 0"}}>Đang chọn việc cho hôm nay…</div>}
+      {picks.length===0 && <div style={{fontSize:11,color:theme.textDim,padding:"6px 0"}}>Chưa có việc nào cho hôm nay — thêm việc bên dưới hoặc áp dụng gợi ý từ AI.</div>}
       {picks.map((id,idx)=>{
         const t = poolById[id];
         if(!t) return null; // task đã bị xoá khỏi kho — bỏ qua an toàn, không crash
         const checked = !!data.poolDone?.[id];
-        const canSwap = swapsUsed<2 && !checked;
+        const isDragging = draggingId===id;
+        const isDragOver = dragOverIdx===idx && draggingId!=null && draggingId!==id;
+        const isEditing = editingId===id;
         return (
-          <div key={id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",marginBottom:6,background:checked?`${accent}0D`:theme.surfaceAlt,borderRadius:8,boxShadow:"0 4px 14px rgba(0,0,0,0.2)"}}>
-            <div onClick={()=>onToggle(id)} style={{cursor:"pointer",display:"flex",alignItems:"center",gap:10,flex:1,minWidth:0}}>
-              <NeonCheckbox checked={checked} onChange={()=>onToggle(id)} accent={accent}/>
-              <span style={{fontSize:14}}>{t.i||"✅"}</span>
-              <span style={{flex:1,fontSize:12,minWidth:0}}>
-                <span key={checked?"done":"undone"} className={checked?"task-text-done":""} style={{"--strike-color":accent}}>
-                  <b style={{opacity:0.6,fontWeight:600}}>{idx+1}.</b> {t.l}
-                </span>
-                {t.why && <div style={{fontSize:10,color:theme.textDim,marginTop:2,fontWeight:400}}>💡 {t.why}</div>}
-              </span>
-              <span style={{fontSize:10,padding:"2px 8px",borderRadius:999,background:checked?`${accent}22`:"rgba(255,255,255,.05)",color:checked?accent:theme.textDim,flexShrink:0}}>+{t.e||TP_XP}XP</span>
+          <div key={id}>
+            {isDragOver && <div style={{height:2,background:accent,margin:"2px 0",borderRadius:2}}/>}
+            <div
+              draggable={!isEditing}
+              onDragStart={()=>setDraggingId(id)}
+              onDragOver={(e)=>{ if(draggingId!=null){ e.preventDefault(); setDragOverIdx(idx); } }}
+              onDrop={(e)=>{ e.preventDefault(); handleDrop(idx); }}
+              onDragEnd={()=>{ setDraggingId(null); setDragOverIdx(null); }}
+              style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",marginBottom:6,background:checked?`${accent}0D`:theme.surfaceAlt,borderRadius:8,boxShadow:"0 4px 14px rgba(0,0,0,0.2)",opacity:isDragging?0.4:1}}>
+              <span style={{fontSize:12,color:theme.textDim,cursor:"grab",flexShrink:0}}>⠿</span>
+              {isEditing ? (
+                <div style={{display:"flex",gap:6,flex:1,alignItems:"center"}}>
+                  <input value={editLabel} onChange={e=>setEditLabel(e.target.value)}
+                    onKeyDown={e=>e.key==="Enter"&&saveEditLabel()}
+                    autoFocus
+                    style={{flex:1,background:theme.surface,border:`1px solid ${accent}44`,borderRadius:8,padding:"5px 8px",color:theme.text,fontSize:12,outline:"none"}}/>
+                  <button onClick={saveEditLabel} style={{background:theme.success,border:"none",borderRadius:8,padding:"4px 10px",color:"#000",fontSize:11,fontWeight:700,cursor:"pointer"}}>Lưu</button>
+                </div>
+              ):(
+                <>
+                  <div onClick={()=>onToggle(id)} style={{cursor:"pointer",display:"flex",alignItems:"center",gap:10,flex:1,minWidth:0}}>
+                    <NeonCheckbox checked={checked} onChange={()=>onToggle(id)} accent={accent}/>
+                    <span style={{fontSize:14}}>{t.i||"✅"}</span>
+                    <span style={{flex:1,fontSize:12,minWidth:0}}>
+                      <span key={checked?"done":"undone"} className={checked?"task-text-done":""} style={{"--strike-color":accent}}>{t.l}</span>
+                    </span>
+                    <span style={{fontSize:10,padding:"2px 8px",borderRadius:999,background:checked?`${accent}22`:"rgba(255,255,255,.05)",color:checked?accent:theme.textDim,flexShrink:0}}>+{t.e||TP_XP}XP</span>
+                  </div>
+                  <button onClick={()=>startEdit(t)} style={{background:"none",border:"none",color:accent,fontSize:12,cursor:"pointer",flexShrink:0}}>✏️</button>
+                  <button onClick={()=>onRemove(id)} style={{background:"none",border:"none",color:theme.danger,fontSize:16,cursor:"pointer",flexShrink:0}}>×</button>
+                </>
+              )}
             </div>
-            <button disabled={!canSwap} onClick={()=>onSwap(id)} title={swapsUsed>=2?"Đã hết lượt đổi hôm nay (2/2)":checked?"Không thể đổi việc đã hoàn thành":"Đổi việc này"}
-              style={{background:"none",border:"none",color:canSwap?theme.textDim:theme.textDim+"44",cursor:canSwap?"pointer":"not-allowed",fontSize:14,flexShrink:0}}>🔄</button>
           </div>
         );
       })}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8}}>
-        <span style={{fontSize:9,color:theme.textDim}}>🔄 Đổi việc: {swapsUsed}/2 lần hôm nay</span>
+      <div style={{display:"flex",gap:6,marginTop:8}}>
+        <input value={newLabel} onChange={e=>setNewLabel(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submitAdd()}
+          placeholder="Thêm việc cho hôm nay..."
+          style={{flex:1,background:theme.surfaceAlt,border:`1px solid ${accent}44`,borderRadius:10,padding:"7px 10px",color:theme.text,fontSize:12,outline:"none"}}/>
+        <button onClick={submitAdd} style={{background:accent,border:"none",borderRadius:10,padding:"0 14px",color:"white",fontWeight:600,fontSize:13,cursor:"pointer"}}>+</button>
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginTop:8}}>
         <button onClick={onOpenManager} style={{background:"none",border:"none",color:accent,fontSize:10,fontWeight:600,cursor:"pointer"}}>📚 Quản lý Kho việc nhỏ</button>
       </div>
       </>}
     </div>
   );
 }
+
+// [V41] DailyPicksCard (5 slot random + "đổi việc" 2 lần/ngày) đã bị thay
+// thế hoàn toàn bởi TodaysGoalsCard từ trước — component này không còn
+// được render ở đâu trong app (dead code), đã xoá. Field data.swapsUsed
+// vẫn giữ nguyên trong schema (không đụng), không có tác dụng gì nữa.
 
 // ── Modal quản lý Kho việc nhỏ: CRUD đầy đủ (thêm/sửa/xoá/ẩn/chỉnh XP), không giới hạn số lượng ──
 function TaskPoolManagerModal({taskPool,onAdd,onEdit,onDelete,onToggleHide,onClose}) {
@@ -8733,8 +8926,16 @@ function TaskPoolManagerModal({taskPool,onAdd,onEdit,onDelete,onToggleHide,onClo
   );
 }
 
-// ══════════════════════════════ V24: MỤC TIÊU LỚN ═══════════════════════════
-function BigGoalCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount}) {
+// ══════════════════════════════ V41: ONE BIG WIN ═══════════════════════════
+// [V41 REFACTOR] Đổi tên từ BigGoalCard → OneBigWinCard để khớp đúng vai trò
+// trong layout mới: "⭐ One Big Win" là 1 card RIÊNG BIỆT, tách khỏi Nhiệm vụ
+// hôm nay (TodaysGoalsCard) và Lịch trình hôm nay (SmartSchedule) — không
+// hiển thị lẫn vào 2 khu đó. KHÔNG đổi field data (vẫn data.bigGoalsToday,
+// vẫn cap tối đa 1, vẫn +15XP khi tick, vẫn cùng logic doneCount/skipCount
+// cho Kho mục tiêu lớn) — chỉ đổi tên component + copy hiển thị để đúng
+// tinh thần "One Big Win" thay vì "Mục tiêu hôm nay" (tên cũ dễ nhầm với
+// Nhiệm vụ hôm nay — TodaysGoalsCard).
+function OneBigWinCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount}) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const [quickText,setQuickText]=useState("");
@@ -8779,19 +8980,20 @@ function BigGoalCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBum
   return (
     <div style={{background:`linear-gradient(135deg,${theme.primary}14,${theme.secondary}0A)`,borderRadius:12,padding:14,marginBottom:12,boxShadow:"0 6px 20px rgba(0,0,0,0.28)"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:collapsed?0:10}}>
-        <span style={{fontSize:13,fontWeight:700,color:theme.primary}}>🎯 Mục tiêu hôm nay</span>
+        <span style={{fontSize:13,fontWeight:700,color:theme.primary}}>⭐ One Big Win</span>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
-          <span style={{fontSize:10,color:theme.textDim}}>{todayGoals.filter(g=>g.done).length}/{todayGoals.length||0} · tối đa 1</span>
+          <span style={{fontSize:10,color:theme.textDim}}>{todayGoals.filter(g=>g.done).length}/{todayGoals.length||0}</span>
           <button onClick={()=>setCollapsed(c=>!c)} style={{background:"none",border:"none",color:theme.textDim,cursor:"pointer",fontSize:12,padding:"0 4px"}}>{collapsed?"▾":"▴"}</button>
         </div>
       </div>
       {!collapsed && <>
-      {todayGoals.length===0 && <div style={{fontSize:11,color:theme.textDim,marginBottom:8}}>Chưa có mục tiêu lớn nào cho hôm nay.</div>}
+      {todayGoals.length===0 && <div style={{fontSize:11,color:theme.textDim,marginBottom:8}}>Chưa chọn One Big Win cho hôm nay — chỉ cần hoàn thành đúng 1 việc là hôm nay đã thành công.</div>}
       {todayGoals.map(g=>(
         <div key={g.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",marginBottom:6,background:g.done?`${theme.primary}14`:theme.surfaceAlt,borderRadius:8}}>
           <NeonCheckbox checked={g.done} onChange={()=>toggle(g.id)} accent={theme.primary}/>
           <span style={{flex:1,fontSize:12,minWidth:0}}>
             <span key={g.done?"done":"undone"} className={g.done?"task-text-done":""} style={{"--strike-color":theme.primary}}>{g.text}</span>
+            {!g.done && <div style={{fontSize:10,color:theme.textDim,marginTop:2,fontWeight:400}}>Chỉ cần hoàn thành việc này là hôm nay đã thành công.</div>}
           </span>
           <span style={{fontSize:9,color:theme.textDim,flexShrink:0}}>+15XP</span>
           <button onClick={()=>remove(g.id)} style={{background:"none",border:"none",color:theme.danger,fontSize:15,cursor:"pointer",flexShrink:0}}>×</button>
@@ -8800,7 +9002,7 @@ function BigGoalCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBum
       {todayGoals.length<1 && (
         <div>
           <div style={{display:"flex",gap:6,marginBottom:6}}>
-            <input value={quickText} onChange={e=>setQuickText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addQuick()} placeholder="Nhập nhanh mục tiêu..." style={{flex:1,background:theme.surfaceAlt,border:`1px solid ${theme.primary}44`,borderRadius:10,padding:"7px 10px",color:theme.text,fontSize:11,outline:"none"}}/>
+            <input value={quickText} onChange={e=>setQuickText(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addQuick()} placeholder="Nhập nhanh One Big Win..." style={{flex:1,background:theme.surfaceAlt,border:`1px solid ${theme.primary}44`,borderRadius:10,padding:"7px 10px",color:theme.text,fontSize:11,outline:"none"}}/>
             <button onClick={addQuick} style={{background:theme.primary,border:"none",borderRadius:10,padding:"0 12px",color:"white",fontWeight:600,fontSize:12,cursor:"pointer"}}>+</button>
           </div>
           <button onClick={()=>setPickerOpen(p=>!p)} style={{width:"100%",padding:"6px 0",borderRadius:999,border:`1px solid ${theme.primary}33`,background:"transparent",color:theme.primary,fontSize:10,fontWeight:600,cursor:"pointer"}}>📚 Chọn từ Kho mục tiêu lớn</button>
@@ -9151,14 +9353,18 @@ const DEADLINE_PLAN_KEY = "v25:deadlinePlan"; // { label, targetDate, createdAt,
 
 // [PATCH v30] settleDeadlineProgress — chạy 1 LẦN mỗi khi sang ngày mới
 // (gọi từ MorningWidget lúc mount/đổi ngày), đối chiếu xem hôm qua đã làm
-// đủ phút cho task "Làm sự kiện: {label}" chưa — dựa trên
-// yesterdayData.scheduleDone mà SmartSchedule đã ghi, khớp theo tên task
-// bắt đầu bằng "Làm sự kiện:". Cập nhật remainingHours + carryOverMinutes
-// cho hôm nay. Nếu remainingHours <= 0 → trả về null (tự tắt chế độ
-// deadline, đúng MỤC 3 "làm xong trước deadline → tự động tắt"). Hàm
-// THUẦN — không tự đọc/ghi storage, caller chịu trách nhiệm S.get/S.set
-// xung quanh nó.
-function settleDeadlineProgress(plan, td, yesterdayData, yesterdayRouteItems) {
+// đủ phút cho task "Làm sự kiện: {label}" chưa.
+// [PATCH] Task deadline giờ được Áp dụng vào Today's Goals (dailyPicks)
+// như mọi AI task khác (xem AISuggestionsCard) — không còn tick riêng
+// trong SmartSchedule (đã bỏ tick khỏi card đó, SmartSchedule giờ chỉ là
+// Timeline read-only). Vì vậy đối chiếu "đã làm chưa" dựa trên
+// yesterdayData.dailyPicks + yesterdayData.poolDone (khớp theo tên qua
+// taskPool), không còn dựa vào scheduleDone/yesterdayRouteItems nữa.
+// Cập nhật remainingHours + carryOverMinutes cho hôm nay. Nếu
+// remainingHours <= 0 → trả về null (tự tắt chế độ deadline, đúng MỤC 3
+// "làm xong trước deadline → tự động tắt"). Hàm THUẦN — không tự đọc/ghi
+// storage, caller chịu trách nhiệm S.get/S.set xung quanh nó.
+function settleDeadlineProgress(plan, td, yesterdayData, taskPool) {
   if (!plan) return plan;
   if (plan.settledDate === td) return plan; // đã settle hôm nay rồi, tránh trừ 2 lần
   if (!yesterdayData || !plan.assignedMinutesToday) {
@@ -9167,11 +9373,14 @@ function settleDeadlineProgress(plan, td, yesterdayData, yesterdayRouteItems) {
     return { ...plan, settledDate: td };
   }
 
-  // Tìm item deadline trong lịch hôm qua (khớp theo tên, do SmartSchedule
-  // không tạo key cố định cho task này — nó nằm cuối schedule, key dạng "tNN").
-  const deadlineItem = (yesterdayRouteItems || []).find(it => (it.name || "").startsWith("Làm sự kiện:"));
-  const doneMin = deadlineItem && yesterdayData.scheduleDone?.[deadlineItem.key]
-    ? (deadlineItem.dur || plan.assignedMinutesToday) : 0;
+  // Tìm entry deadline trong dailyPicks hôm qua (khớp theo tên task
+  // "Làm sự kiện: {label}" qua taskPool) — đây là nơi task deadline được
+  // Áp dụng vào (xem AISuggestionsCard.applyOne/applyAll).
+  const poolById = Object.fromEntries((taskPool||[]).map(p=>[p.id,p]));
+  const yesterdayPicks = Array.isArray(yesterdayData.dailyPicks) ? yesterdayData.dailyPicks : [];
+  const deadlinePoolId = yesterdayPicks.find(id => (poolById[id]?.l || "").startsWith("Làm sự kiện:"));
+  const doneMin = deadlinePoolId && yesterdayData.poolDone?.[deadlinePoolId]
+    ? plan.assignedMinutesToday : 0;
 
   const shortfall = Math.max(0, plan.assignedMinutesToday - doneMin);
   const hoursUsed = doneMin / 60;
@@ -9563,10 +9772,9 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
   const [running, setRunning] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [checkinOpen, setCheckinOpen] = useState(false);
-  // Local tick state for the checklist — purely a UI affordance mirroring
-  // studyResults' own `done` once applied; before applying, ticks just
-  // drive the progress bar so the user gets instant feedback.
-  const [checkedTasks, setCheckedTasks] = useState({});
+  // [V41 REFACTOR] checkedTasks (state tick cục bộ cho checklist "Hôm nay
+  // cần làm") đã bị xoá cùng với checklist đó — xem comment ở chỗ render
+  // "⭐ ONE BIG WIN" bên dưới để biết lý do.
   const [appliedAt, setAppliedAt] = useState(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -9634,17 +9842,10 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
         if (plan) {
           const yesterdayIso = isoDateMinusDays(td, 1);
           const yesterdayData = db?.[yesterdayIso] || null;
-          // Tìm route items hôm qua từ history (nếu có entry hôm qua) để
-          // khớp task deadline theo tên — history do plannerStorage giữ.
-          let yesterdayRouteItems = [];
-          try {
-            const history = await storage.loadHistory();
-            const dayEntry = history.days.find(d => d.date === yesterdayIso);
-            const lastEntry = dayEntry?.entries?.[dayEntry.entries.length - 1];
-            const sched = lastEntry?.plannerOutput?.schedule || [];
-            yesterdayRouteItems = sched.map((b, i) => ({ key: "t" + i, name: b.name, dur: b.dur }));
-          } catch {}
-          const settled = settleDeadlineProgress(plan, td, yesterdayData, yesterdayRouteItems);
+          // [PATCH] Task deadline giờ được Áp dụng vào dailyPicks (Today's
+          // Goals) như mọi AI task khác — đối chiếu qua taskPool thay vì
+          // đọc lại schedule/scheduleDone (SmartSchedule không còn tick).
+          const settled = settleDeadlineProgress(plan, td, yesterdayData, taskPool);
           if (settled !== plan) {
             if (settled) { try { await S.set(DEADLINE_PLAN_KEY, JSON.stringify(settled)); } catch {} }
             else { try { await S.set(DEADLINE_PLAN_KEY, "null"); } catch {} } // xong sớm → tự tắt
@@ -9845,22 +10046,20 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
     return `Mình xem dữ liệu hôm nay rồi — bắt đầu 1 việc nhỏ trước nhé.`;
   }, [quickForm]);
 
-  // ── Progress across the plan's task checklist. ──
-  const doneCount = tasks.filter((_, i) => checkedTasks[i]).length;
-  const toggleTask = (i) => {
-    const wasChecked = !!checkedTasks[i];
-    if (!wasChecked) playSound("tick");
-    setCheckedTasks(c => ({ ...c, [i]: !wasChecked }));
-  };
+  // [V41 REFACTOR] doneCount/toggleTask (dùng cho checklist tick cục bộ đã
+  // xoá) không còn cần thiết — xoá cùng checkedTasks ở trên.
 
   // ── Apply plan → Today's existing V24 data model (hybrid approach). ──
   // Both bigGoalsToday and dailyPicks/taskPool keep their exact existing
-  // shape, cap, and mechanics (swapsUsed budget, poolDone, achievements
-  // like v24_first5 which requires dailyPicks.length>=5) — this only
-  // fills them using the same save()/onAddPoolTask() calls BigGoalCard and
-  // DailyPicksCard already use. No new storage key, no new schema field.
+  // shape and mechanics (poolDone, achievements like v24_first5). This
+  // button now ONLY applies the One Big Win → bigGoalsToday. Applying
+  // individual AI tasks into Today's Goals (dailyPicks) has moved to the
+  // dedicated AISuggestionsCard (Today tab), which lets Bảo apply tasks
+  // one-by-one or all-at-once with proper duplicate detection — this
+  // avoids the old behavior of silently overwriting dailyPicks slots
+  // (including Routine tasks leaking in as "goals").
   const todayGoals = Array.isArray(data?.bigGoalsToday) ? data.bigGoalsToday : [];
-  // "Mục tiêu hôm nay" is now capped at 1 (see BigGoalCard) — same cap here.
+  // "Mục tiêu lớn" is capped at 1 (see BigGoalCard) — same cap here.
   const goalsFull = todayGoals.length >= 1;
   const goalAlreadyThere = !!(oneBigWin && todayGoals.some(g => g.text === oneBigWin.label));
   const alreadyApplied = !!appliedAt;
@@ -9869,90 +10068,9 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
     if (!plannerOutput || alreadyApplied) return;
     const patch = {};
 
-    // 1) One Big Win → bigGoalsToday (max 1/day — same cap BigGoalCard enforces)
+    // One Big Win → bigGoalsToday (max 1/day — same cap BigGoalCard enforces)
     if (oneBigWin && !goalsFull && !goalAlreadyThere) {
       patch.bigGoalsToday = [...todayGoals, { id: "bg_" + Date.now(), text: oneBigWin.label, done: false }];
-    }
-
-    // 2) Actionable tasks (dur > 0, not the One Big Win itself, not a bare
-    //    "Buffer") → dailyPicks, via the existing 5-slot taskPool mechanic.
-    //    - Slots already marked done (poolDone) are left untouched, so
-    //      completed work is never overwritten.
-    //    - Not-yet-done slots are replaced with AI tasks, oldest first.
-    //    - If there are fewer AI tasks than empty slots, the remaining
-    //      slots keep their current picks — dailyPicks always stays at
-    //      exactly 5 entries, so v24_first5 / v24_small100 still work.
-    const actionableTasks = tasks.filter(t => (t.dur || 0) > 0 && t.name !== oneBigWin?.label && !/^buffer/i.test(t.name || ""));
-    const currentPicks = Array.isArray(data?.dailyPicks) ? [...data.dailyPicks] : [];
-    const poolDone = data?.poolDone || {};
-
-    if (actionableTasks.length && onAddPoolTask) {
-      // addPoolTask() updates taskPool via React state asynchronously, so
-      // a freshly-created entry won't show up in the `taskPool` prop until
-      // next render. Track newly-created ids in this call locally so two
-      // AI tasks with the same name (within the same apply) reuse one
-      // pool entry instead of creating a duplicate.
-      const newlyCreated = {};
-      const resolvePoolId = (t) => {
-        const existing = (taskPool || []).find(p => p.l === t.name)?.id || newlyCreated[t.name];
-        if (existing) return existing;
-        const id = onAddPoolTask(t.name, t.dur, t.icon || "✅");
-        newlyCreated[t.name] = id;
-        return id;
-      };
-
-      const replaceableSlots = currentPicks
-        .map((id, idx) => ({ id, idx }))
-        .filter(({ id }) => !poolDone[id]);
-
-      let ti = 0;
-      for (const { idx } of replaceableSlots) {
-        if (ti >= actionableTasks.length) break;
-        const t = actionableTasks[ti++];
-        const poolId = resolvePoolId(t);
-        if (t.why && onEditPoolTask) onEditPoolTask(poolId, { why: t.why });
-        currentPicks[idx] = poolId;
-      }
-      // Fill still-empty slots (e.g. dailyPicks had fewer than 5 entries)
-      // with any leftover AI tasks, up to the standard 5-slot cap.
-      while (currentPicks.length < 5 && ti < actionableTasks.length) {
-        const t = actionableTasks[ti++];
-        const poolId = resolvePoolId(t);
-        if (t.why && onEditPoolTask) onEditPoolTask(poolId, { why: t.why });
-        currentPicks.push(poolId);
-      }
-
-      // [PATCH] Nếu Core chỉ sinh ra vài task (thường lặp Toán/Lý) mà vẫn
-      // còn slot trống trong 5 dailyPicks, trộn thêm 1-2 task từ Kho việc
-      // nhỏ (taskPool) cho đa dạng — KHÔNG đụng vào plannerOutput/Core,
-      // chỉ bổ sung ở bước "Áp dụng vào hôm nay" này. Ưu tiên task lâu
-      // chưa xuất hiện + phù hợp goalMode/năng lượng/TikTok hôm nay.
-      // historyByPoolId dùng CÙNG cách tính "lịch sử lần cuối mỗi task
-      // xuất hiện" mà cơ chế ensureDailyPicks (V24) vốn đã dùng, quét qua
-      // db — không phải field mới trong data model.
-      if (currentPicks.length < 5) {
-        const historyByPoolId = {};
-        const sortedDates = Object.keys(db || {}).sort();
-        for (const iso of sortedDates) {
-          const d = db[iso];
-          (d?.dailyPicks || []).forEach(id => { historyByPoolId[id] = iso; });
-        }
-        const extras = diversifyTasksWithPool({
-          taskPool,
-          goalMode: quickForm?.goalMode || "study",
-          energy: quickForm?.energy ?? null,
-          tiktokMin: quickForm?.tiktok || 0,
-          historyByPoolId,
-          date: td,
-          count: 5 - currentPicks.length,
-        }).filter(t => !currentPicks.includes(t.id));
-        extras.forEach(t => currentPicks.push(t.id));
-      }
-
-      patch.dailyPicks = currentPicks;
-      // Applying a fresh AI plan starts a new "swap budget" for the day's
-      // new task set, consistent with what a manual re-roll would do.
-      patch.swapsUsed = 0;
     }
 
     if (Object.keys(patch).length) save(td, patch);
@@ -10091,50 +10209,25 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
             </div>
           )}
 
-          {!collapsed && (
-          <>
-          {tasks.length > 0 && (
-            <div style={{ marginBottom: 10 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: theme.text }}>📋 Hôm nay cần làm</div>
-                <div style={{ fontSize: 11, color: theme.textDim }}>{doneCount}/{tasks.length}</div>
-              </div>
-              <div style={{ height: 6, borderRadius: 999, background: theme.bg, overflow: "hidden", marginBottom: 10 }}>
-                <div style={{ height: "100%", width: `${tasks.length ? (doneCount / tasks.length) * 100 : 0}%`,
-                  background: accent, transition: "width 0.3s ease" }}/>
-              </div>
-
-              {tasks.map((t, i) => {
-                const checked = !!checkedTasks[i];
-                const shortWhy = summarizeReason(t.why, 90);
-                const itemColor = t.color || aiPlannerPriorityClass(t.priority);
-                return (
-                  <div key={i} onClick={() => toggleTask(i)}
-                    style={{
-                      display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer",
-                      padding: "8px 10px", borderRadius: 10, marginBottom: 6,
-                      background: theme.bg, opacity: checked ? 0.6 : 1,
-                      borderLeft: `3px solid ${itemColor}`,
-                    }}>
-                    <div style={{ marginTop: 1 }}>
-                      <MorningTaskCheckbox checked={checked} theme={theme} accent={accent}/>
-                    </div>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: theme.text,
-                          textDecoration: checked ? "line-through" : "none" }}>
-                          {/* [PATCH v36] MỤC 1: hiện giờ cụ thể nếu task đã có start (do enrichTasksWithContext tính) */}
-                          {t.start ? `🕐 ${t.start} ` : `${i + 1}. `}{t.name}{t.dur > 0 ? ` (${t.dur}')` : ""}
-                        </span>
-                      </div>
-                      {shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
-                    </div>
-                  </div>
-                );
-              })}
+          {/* [V41 REFACTOR] Đã bỏ checklist "📋 Hôm nay cần làm" từng nằm ở
+              đây — nó lặp lại y hệt các task đã có trong AISuggestionsCard
+              (nút Áp dụng thật) và TodaysGoalsCard (tick thật, có XP thật),
+              nhưng dùng state cục bộ `checkedTasks` KHÔNG lưu storage, KHÔNG
+              cộng XP — chỉ là 1 lớp "tick giả" chạy song song gây cảm giác
+              1 task xuất hiện ở nhiều nơi với nhiều trạng thái khác nhau
+              (đúng vấn đề "lẫn lộn" trong yêu cầu V41). Card AI Planner giờ
+              chỉ làm 1 việc: hiển thị kết quả kế hoạch (One Big Win ở trên +
+              dòng tóm tắt bên dưới), không tự vẽ thêm 1 danh sách tick nữa —
+              muốn xem/áp dụng chi tiết từng task thì dùng AISuggestionsCard
+              ngay bên dưới trong Today(). */}
+          {!collapsed && tasks.length > 0 && (
+            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 12 }}>
+              📋 Kế hoạch hôm nay có {tasks.length} việc — xem và áp dụng ở mục "🤖 AI đề xuất" bên dưới.
             </div>
           )}
 
+          {!collapsed && (
+          <>
           {/* [PATCH v36] MỤC 6: ẩn "Độ tin cậy", "Còn X' rảnh", "Backup" ở
               tab Hôm nay — các thông tin này vẫn hiển thị đầy đủ trong tab
               AI Planner (AIPlannerBeta, không đụng gì ở đó). */}
@@ -10147,11 +10240,12 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
           )}
 
           <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={applyPlanToToday} disabled={alreadyApplied}
+            <button onClick={applyPlanToToday} disabled={alreadyApplied || !oneBigWin}
+              title={!oneBigWin ? "Kế hoạch hôm nay không có Mục tiêu lớn để áp dụng." : undefined}
               style={{ flex: 1, padding: 10, borderRadius: 10, border: "none", fontWeight: 700, fontSize: 12,
-                background: alreadyApplied ? theme.textDim : accent, color: "#fff",
-                cursor: alreadyApplied ? "default" : "pointer" }}>
-              {alreadyApplied ? "✓ Đã áp dụng" : "✅ Áp dụng vào hôm nay"}
+                background: (alreadyApplied || !oneBigWin) ? theme.textDim : accent, color: "#fff",
+                cursor: (alreadyApplied || !oneBigWin) ? "default" : "pointer" }}>
+              {alreadyApplied ? "✓ Đã áp dụng" : "⭐ Áp dụng Mục tiêu lớn"}
             </button>
             <button onClick={() => setCheckinOpen(o => !o)}
               style={{ flex: 1, padding: 10, borderRadius: 10, border: `1px solid ${theme.border}`, fontSize: 12,
@@ -10262,33 +10356,34 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
 function AddManualTaskRow({ theme, accent, onAdd }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  const [start, setStart] = useState("");
-  const [dur, setDur] = useState(30);
 
   if (!open) {
     return (
       <button onClick={() => setOpen(true)}
         style={{ width: "100%", marginTop: 4, padding: 8, borderRadius: 8, border: `1px dashed ${theme.border}`,
           background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
-        + Thêm task
+        + Thêm việc
       </button>
     );
   }
+  // [PATCH] Yêu cầu: danh sách chỉ hiển thị theo thứ tự công việc, không
+  // hỏi giờ/phút nữa. Vẫn cần start/dur nội bộ cho engine xếp lịch phía
+  // dưới (routeItems) nên gán mặc định "ngay bây giờ, 30 phút" — người
+  // dùng không thấy và không nhập các giá trị này, chỉ nhập tên việc rồi
+  // sắp xếp lại bằng kéo-thả nếu muốn đổi thứ tự ưu tiên.
   const submit = () => {
-    if (!name.trim() || !start) return;
-    onAdd(name, start, Number(dur) || 30);
-    setName(""); setStart(""); setDur(30); setOpen(false);
+    if (!name.trim()) return;
+    const now = new Date();
+    const nowHM = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    onAdd(name, nowHM, 30);
+    setName(""); setOpen(false);
   };
   return (
     <div style={{ borderRadius: 8, border: `1px solid ${theme.border}`, padding: 8, marginTop: 4 }}>
-      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Tên task"
+      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Tên việc"
+        autoFocus
+        onKeyDown={e => { if (e.key === "Enter") submit(); }}
         style={{ width: "100%", padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 6, boxSizing: "border-box" }}/>
-      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-        <input type="time" value={start} onChange={e => setStart(e.target.value)}
-          style={{ flex: 1, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
-        <input type="number" min="5" step="5" value={dur} onChange={e => setDur(e.target.value)} placeholder="Phút"
-          style={{ width: 70, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
-      </div>
       <div style={{ display: "flex", gap: 6 }}>
         <button onClick={submit} style={{ flex: 1, padding: 6, borderRadius: 6, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
           Thêm
@@ -10311,362 +10406,57 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
 
   const [regenerating, setRegenerating] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
-  // [PATCH] XP fly-up cục bộ cho card này — key thay đổi mỗi lần tick để
-  // re-trigger animation, giống cơ chế xpGain ở Today nhưng gắn theo item.
-  const [xpFly, setXpFly] = useState(null); // { key, amount } | null
-  // [PATCH v38] MỤC 1: key đang được kéo (để tô sáng các ô drop-zone) và
-  // index của ô drop-zone đang được kéo-qua (để highlight riêng đúng ô).
-  const [draggingKey, setDraggingKey] = useState(null);
-  const [dragOverIndex, setDragOverIndex] = useState(null);
-  // [PATCH] skip analysis cho từng item, tính 1 lần khi schedule thay đổi
-  const [skipAnalysis, setSkipAnalysis] = useState({}); // {[itemKey]: {shouldReduce, shouldIncrease, reason}}
-  // [PATCH v30] danh sách skip 30 ngày, tải 1 lần cho phần phân tích cuối card
-  const [skipListAll, setSkipListAll] = useState([]);
-  // [PATCH v30] ô ghi chú checklist cuối ngày — debounce nhẹ, lưu vào d.eveningNote
-  const [eveningNoteVal, setEveningNoteVal] = useDebounceField(
-    data?.eveningNote || "", (v) => save(td, { eveningNote: v }), 1200
-  );
 
   const entryCount = today?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? today.entries[entryCount - 1] : null;
-  const latestEntryId = latestEntry?.id ?? null;
 
   const plannerOutput = latestEntry?.plannerOutput || null;
-  const oneBigWin = plannerOutput?.oneBigWin || null;
-  const tasks = plannerOutput?.tasks || [];
   const schedule = plannerOutput?.schedule || [];
-  const confidence = plannerOutput?.confidence || null;
 
-  const scheduleDone = data?.scheduleDone || {};
-  const scheduleXp = data?.scheduleXp || {};
-  // [PATCH v37] MỤC 3+5: khai báo SỚM (trước routeItemsBase/routeItems ở
-  // dưới) vì cả 2 useMemo đó đọc trực tiếp 3 biến này trong dependency
-  // array — const là block-scoped, phải khai báo trước nơi dùng, nếu
-  // không sẽ lỗi "Cannot access before initialization" (TDZ).
-  const scheduleSkippedToday = data?.scheduleSkippedToday || {};
-  const scheduleManualTasks = data?.scheduleManualTasks || [];
-  const scheduleTimeOverride = data?.scheduleTimeOverride || {};
-  // [PATCH v38] thứ tự sau khi kéo-thả (mảng key). null = chưa kéo gì,
-  // dùng thứ tự mặc định theo giờ Core đã tính.
-  const scheduleManualOrder = data?.scheduleManualOrder || null;
-  // [PATCH v38] khoảng đệm tối thiểu (phút) tự động chèn giữa 2 task liền
-  // kề khi giãn cách cộng dồn — theo yêu cầu §2 "5-10 phút".
-  const AUTO_BUFFER_MIN = 5;
+  // [PATCH] SmartSchedule giờ CHỈ trả lời "hôm nay đến mấy giờ thì làm
+  // gì?" — Timeline theo giờ thật, gồm Routine (isFixedRoutine, từ
+  // v33:fixedTasks/enrichTasksWithContext) + lịch học thêm cố định
+  // (type:"fixed", từ ctx.fixedEvents, vd Toán/Lý). KHÔNG còn danh sách
+  // "Nhiệm vụ/Mục tiêu" để tick/thêm/kéo-thả trong card này nữa — việc đó
+  // đã chuyển hẳn sang TodaysGoalsCard/OneBigWinCard (Today.js). Buffer
+  // ("Nghỉ giữa việc") vẫn hiển thị để không có khoảng trống vô hình
+  // trong timeline.
+  // [V41 REFACTOR] Thêm `doneKey` ổn định (start+tên, KHÔNG dùng index vì
+  // index đổi mỗi lần "Làm lại") để checkbox mới trong mỗi block giữ đúng
+  // trạng thái tick khi lịch được tính lại, miễn tên+giờ task đó không đổi.
+  const timelineItems = useMemo(() => {
+    return schedule
+      .filter(b => b.type === "fixed" || b.type === "buffer" || (b.type === "task" && b.isFixedRoutine))
+      .map((b, i) => ({
+        key: (b.type === "fixed" ? "fx" : b.type === "buffer" ? "buf" : "rt") + i,
+        doneKey: `${b.start}|${b.name}`,
+        name: b.name, start: b.start, end: b.end,
+        isBuffer: b.type === "buffer",
+        isFixed: b.type === "fixed",
+        color: b.type === "buffer" ? theme.textDim : (b.color || "#EF4444"),
+      }));
+  }, [schedule, theme.textDim]);
 
-  // ── Gắn khung giờ thật vào từng task/oneBigWin bằng cách khớp theo tên. ──
-  const routeItemsBase = useMemo(() => {
-    if (!schedule.length) {
-      const items = [];
-      if (oneBigWin) items.push({ key: "obw", name: oneBigWin.label, why: oneBigWin.why, doneWhen: oneBigWin.doneWhen, dur: oneBigWin.dur, priority: "high", isBigWin: true });
-      tasks.forEach((t, i) => {
-        if ((t.dur || 0) <= 0 && !t.doneWhen) return;
-        if (t.name === oneBigWin?.label) return;
-        items.push({ key: "t" + i, name: t.name, why: t.why, doneWhen: t.doneWhen, dur: t.dur, priority: t.priority, color: t.color, isFixedRoutine: !!t.isFixedRoutine });
-      });
-      return items;
-    }
-    return schedule.map((b, i) => {
-      if (b.type === "fixed") {
-        return { key: "fx" + i, name: b.name, start: b.start, end: b.end, isFixed: true, color: b.color || "#EF4444" };
-      }
-      if (b.type === "buffer") {
-        return { key: "buf" + i, name: "Nghỉ giữa việc", start: b.start, end: b.end, isBuffer: true };
-      }
-      const srcTask = tasks.find(t => t.name === b.name);
-      const isBigWin = b.name === oneBigWin?.label;
-      return {
-        key: "t" + i, name: b.name, start: b.start, end: b.end, dur: b.dur,
-        priority: b.priority, why: srcTask?.why || oneBigWin?.why, doneWhen: srcTask?.doneWhen || oneBigWin?.doneWhen,
-        isBigWin,
-        // [PATCH v36] task cố định hằng ngày (§1) luôn màu đỏ, không đổi;
-        // task do AI thêm dùng color theo group (đã gán ở
-        // enrichTasksWithContext/catalogTaskV33, đi qua buildScheduleV33).
-        isFixedRoutine: !!b.isFixedRoutine,
-        color: b.isFixedRoutine ? "#EF4444" : (srcTask?.color || b.color),
-        // [PATCH v30] đánh dấu item nào là task deadline (chèn bởi
-        // enrichTasksWithContext) — dùng để hiển thị "còn X ngày" riêng
-        // và để checklist cuối ngày biết "sự kiện game xong chưa?".
-        isDeadlineTask: (b.name || "").startsWith("Làm sự kiện:"),
-      };
-    });
-  }, [schedule, oneBigWin, tasks]);
-
-  // [PATCH v38] MỤC 2+3: chèn task tự chọn (scheduleManualTasks), sắp lại
-  // theo scheduleManualOrder (nếu người dùng đã kéo-thả), rồi TÍNH LẠI GIỜ
-  // KIỂU CỘNG DỒN — task đầu giữ giờ start gốc, mỗi task sau bắt đầu ngay
-  // khi task trước kết thúc (+ buffer nếu cần), tự động né các task cố
-  // định (isFixed, vd Toán/Lý) bằng cách nhảy qua hết khung giờ cố định
-  // nếu bị đè lên. Không đụng plannerOutput gốc — override chỉ ảnh hưởng
-  // lớp hiển thị SmartSchedule.
-  const routeItems = useMemo(() => {
-    const manual = scheduleManualTasks.map(t => ({
-      key: t.key, name: t.name, start: t.start, dur: t.dur,
-      end: minutesToHHMMV33(parseTimeToMinutesV33(t.start) + (t.dur || 30)),
-      priority: "med", isManual: true, color: "#3B82F6",
-    }));
-    let all = [...routeItemsBase, ...manual];
-
-    // Legacy: nếu còn scheduleTimeOverride cũ (bản trước v38) thì vẫn áp
-    // dụng trước khi sắp theo order, để không mất dữ liệu người dùng đã
-    // kéo trước khi cập nhật.
-    all = all.map(it => {
-      const overrideStart = scheduleTimeOverride[it.key];
-      if (!overrideStart || it.isBuffer) return it;
-      const dur = it.dur ?? (it.start && it.end ? minutesBetweenHHMM(it.start, it.end) : 0);
-      return { ...it, start: overrideStart, end: minutesToHHMMV33(parseTimeToMinutesV33(overrideStart) + dur) };
-    });
-
-    // ── Xác định THỨ TỰ hiển thị: ưu tiên scheduleManualOrder (do kéo-thả
-    // tạo ra), rơi về sắp theo start gốc nếu chưa kéo gì. Item mới xuất
-    // hiện (chưa có trong scheduleManualOrder, vd vừa "+ Thêm task" hoặc
-    // vừa "Làm lại") được chèn theo đúng vị trí giờ của nó. ──
-    const byKey = new Map(all.map(it => [it.key, it]));
-    let ordered;
-    if (scheduleManualOrder && scheduleManualOrder.length) {
-      ordered = [];
-      const seen = new Set();
-      scheduleManualOrder.forEach(k => {
-        if (byKey.has(k)) { ordered.push(byKey.get(k)); seen.add(k); }
-      });
-      const rest = all.filter(it => !seen.has(it.key))
-        .sort((a, b) => (a.start ? parseTimeToMinutesV33(a.start) : 0) - (b.start ? parseTimeToMinutesV33(b.start) : 0));
-      // chèn item mới vào đúng chỗ theo giờ gốc thay vì luôn luôn ở cuối
-      rest.forEach(it => {
-        const itM = it.start ? parseTimeToMinutesV33(it.start) : 0;
-        let idx = ordered.findIndex(o => o.start && parseTimeToMinutesV33(o.start) > itM);
-        if (idx === -1) idx = ordered.length;
-        ordered.splice(idx, 0, it);
-      });
-    } else {
-      ordered = [...all].sort((a, b) => (a.start ? parseTimeToMinutesV33(a.start) : 0) - (b.start ? parseTimeToMinutesV33(b.start) : 0));
-    }
-
-    // ── GIÃN CÁCH CỘNG DỒN (§2): duyệt tuần tự, mỗi item không-cố-định
-    // bắt đầu ngay sau khi item trước đó (theo thứ tự hiển thị) kết thúc.
-    // Task cố định (isFixed) giữ nguyên giờ thật của nó (không thể dời) —
-    // nếu item đang tính "cộng dồn" bị đè lên 1 task cố định, tự động đẩy
-    // sang SAU khi task cố định đó kết thúc (§3: "dồn sang khung giờ
-    // khác"). Buffer cũ (type buffer) được giữ lại nhưng KHÔNG chiếm chỗ
-    // tính toán riêng — vị trí của nó được tính lại như 1 item bình
-    // thường trong chuỗi cộng dồn.
-    const fixedBlocks = ordered.filter(it => it.isFixed)
-      .map(it => ({ s: parseTimeToMinutesV33(it.start), e: parseTimeToMinutesV33(it.end) }))
-      .sort((a, b) => a.s - b.s);
-
-    const pushPastFixed = (startM, durM) => {
-      let s = startM;
-      let moved = true;
-      while (moved) {
-        moved = false;
-        for (const fb of fixedBlocks) {
-          if (s < fb.e && s + durM > fb.s) { // overlap
-            s = fb.e + AUTO_BUFFER_MIN;
-            moved = true;
-          }
-        }
-      }
-      return s;
-    };
-
-    let cursor = null; // phút, mốc "rảnh tiếp theo" — null = chưa có mốc, dùng giờ gốc của item đầu tiên
-    const result = ordered.map(it => {
-      if (it.isFixed) {
-        const e = parseTimeToMinutesV33(it.end);
-        if (cursor === null || cursor < e) cursor = e;
-        return it;
-      }
-      const dur = it.dur ?? (it.start && it.end ? minutesBetweenHHMM(it.start, it.end) : 0);
-      let startM = cursor === null ? (it.start ? parseTimeToMinutesV33(it.start) : 0) : cursor;
-      startM = pushPastFixed(startM, dur);
-      const endM = startM + dur;
-      cursor = endM + AUTO_BUFFER_MIN;
-      const newStart = minutesToHHMMV33(startM);
-      const newEnd = minutesToHHMMV33(endM);
-      return { ...it, start: newStart, end: newEnd, dur };
-    });
-
-    return result.map(it => ({ ...it, isSkippedToday: !it.isFixed && !it.isBuffer && !!scheduleSkippedToday[it.key] }));
-  }, [routeItemsBase, scheduleManualTasks, scheduleTimeOverride, scheduleManualOrder, scheduleSkippedToday]);
-
-  // [PATCH] task quan trọng (priority:"high") được đẩy lên đầu như bình
-  // thường; task bị skip nhiều (shouldReduce) bị CHUYỂN XUỐNG CUỐI danh
-  // sách hiển thị — đúng MỤC 3 ("chuyển xuống cuối ngày"). Không đổi giờ
-  // thật của item (start/end vẫn nguyên, chỉ đổi thứ tự HIỂN THỊ) vì Core
-  // vẫn là nguồn sự thật duy nhất cho khung giờ.
-  // [PATCH v37] MỤC 5: task đã "Bỏ qua" hôm nay (isSkippedToday) cũng dồn
-  // xuống cuối, giống task shouldReduce — cả 2 đều hiển thị mờ/xám ở cuối.
-  const displayItems = useMemo(() => {
-    const checkable = routeItems.filter(it => !it.isFixed && !it.isBuffer);
-    const pushedDown = checkable.filter(it => skipAnalysis[it.key]?.shouldReduce || it.isSkippedToday);
-    const order = routeItems.filter(it => it.isFixed || it.isBuffer ||
-      (!skipAnalysis[it.key]?.shouldReduce && !it.isSkippedToday));
-    return [...order, ...pushedDown];
-  }, [routeItems, skipAnalysis]);
-
-  const checkableItems = routeItems.filter(it => !it.isFixed && !it.isBuffer);
-  const totalMinutes = checkableItems.reduce((s, it) => s + (it.dur || 0), 0);
-  const doneCount = checkableItems.filter(it => scheduleDone[it.key]).length;
-
-  // [PATCH] XP mỗi item = dựa trên thời lượng (dur phút), tối thiểu 5 —
-  // deterministic, tính lại giống nhau mỗi lần (không random), giữ đơn
-  // giản và minh bạch cho người dùng.
-  const xpForItem = (it) => Math.max(5, Math.round((it.dur || 10) * 0.5));
-
-  // [PATCH] MỤC 3+4: tick 1 item = cộng XP thật (lưu qua save(td,…), dùng
-  // được ngay bởi dayExpFull) + phát âm thanh + XP fly-up. Bỏ tick lại =
-  // trừ XP đã cộng (đối xứng, tránh cộng dồn sai nếu tick nhầm).
-  const toggleItem = (it) => {
-    const wasDone = !!scheduleDone[it.key];
-    const nextDone = { ...scheduleDone, [it.key]: !wasDone };
-    const nextXp = { ...scheduleXp };
-    if (!wasDone) {
-      const amount = xpForItem(it);
-      nextXp[it.key] = amount;
-      playSound("tick");
-      setXpFly({ key: it.key + ":" + Date.now(), amount });
-      setTimeout(() => setXpFly(null), 700);
-    } else {
-      delete nextXp[it.key];
-    }
-    save(td, { scheduleDone: nextDone, scheduleXp: nextXp });
+  // [V41] Trạng thái tick trực quan CHO RIÊNG Timeline — field data MỚI,
+  // tách biệt hoàn toàn khỏi data.dailyPicks/poolDone (Nhiệm vụ hôm nay)
+  // và data.bigGoalsToday (One Big Win). KHÔNG cộng XP (Routine/Fixed đã
+  // được tính XP qua cơ chế khác — xem dayExpFull) — tick ở đây CHỈ để
+  // đánh dấu trực quan "đã làm xong khối giờ này", theo đúng quyết định
+  // của Bảo (an toàn tuyệt đối cho dữ liệu XP hiện có, không tạo nguồn
+  // cộng dồn XP mới). KHÔNG tái dùng field cũ data.scheduleDone/scheduleXp
+  // (thuộc DailySchedule đã bị xoá) để tránh vô tình cộng XP cho những
+  // ngày cũ đã có dữ liệu ở field đó.
+  const timelineDone = data.timelineDone || {};
+  const toggleTimelineItem = (doneKey) => {
+    const wasDone = !!timelineDone[doneKey];
+    if (!wasDone) playSound("tick");
+    save(td, { timelineDone: { ...timelineDone, [doneKey]: !wasDone } });
   };
 
-  // [PATCH v37] MỤC 3+5: "Bỏ qua" 1 item thủ công — ghi nhận vào
-  // v25:skipHistory (KHÔNG đổi, để AI học cho lần sau) VÀ đánh dấu item đó
-  // là "đã bỏ hôm nay" trong d.scheduleSkippedToday (persist riêng theo
-  // ngày, khác skipHistory 30-ngày dùng để phân tích) để UI hiển thị đúng
-  // spec §4: màu xám, mờ đi, có dấu ⏭ — thay vì bị hạ opacity nhẹ như cũ.
-  // KHÔNG trừ/không cộng XP — chỉ ghi nhận (đúng §5: "KHÔNG phạt").
-  const skipItem = async (it) => {
-    await recordSkip(it.key, it.name, "manual_skip", td);
-    const list = await loadSkipHistory();
-    setSkipAnalysis(a => ({ ...a, [it.key]: analyzeSkipHistoryFromList(list, it.key, 7) }));
-    setSkipListAll(list);
-    await save(td, { scheduleSkippedToday: { ...scheduleSkippedToday, [it.key]: true } });
-    // [PATCH v37] MỤC 5: "Tự động điều chỉnh" (bật/tắt qua Quản lý lịch
-    // trình, mặc định BẬT) — nếu task bị bỏ, tự "Làm lại" ngay để các task
-    // còn lại dồn vào khung giờ trống (regenerate() vốn đã tính lại từ
-    // nowTime hiện tại đến hết ngày, không cần logic dồn riêng).
-    try {
-      const raw = await S.get(AUTO_ADJUST_KEY_V37);
-      const enabled = raw === null || raw === "null" || raw === "true"; // mặc định bật
-      if (enabled) regenerate();
-    } catch {}
-  };
-  // [PATCH v37] MỤC 5: hoàn tác "Bỏ qua" — cho phép đổi ý, đưa task trở
-  // lại trạng thái bình thường trong lịch hôm nay.
-  const unskipItem = async (it) => {
-    const next = { ...scheduleSkippedToday };
-    delete next[it.key];
-    await save(td, { scheduleSkippedToday: next });
-  };
-
-  // [PATCH v37] MỤC 5: "+ Thêm task" — task tự chọn, thêm thẳng vào lịch
-  // hôm nay, màu xanh dương #3B82F6 theo đúng spec §4. Lưu vào
-  // d.scheduleManualTasks (mảng, mỗi phần tử { key, name, start, dur }),
-  // độc lập hoàn toàn với plannerOutput/aiPlannerCore.js — chỉ là lớp hiển
-  // thị thêm trong SmartSchedule, không đi qua Core/Rule Engine.
-  const addManualTask = async (name, start, dur) => {
-    if (!name?.trim() || !start) return;
-    const key = "manual_" + Date.now();
-    const next = [...scheduleManualTasks, { key, name: name.trim(), start, dur: dur || 30 }];
-    await save(td, { scheduleManualTasks: next });
-  };
-  const removeManualTask = async (key) => {
-    await save(td, { scheduleManualTasks: scheduleManualTasks.filter(t => t.key !== key) });
-  };
-
-  // [PATCH v38] MỤC 1+2: kéo-thả để ĐỔI THỨ TỰ (không phải đổi giờ trực
-  // tiếp nữa) — thả 1 task vào ô drop-zone ở vị trí `targetIndex`. LƯU Ý:
-  // targetIndex chỉ đếm trên các item CÓ THỂ KÉO (không cố định, không
-  // buffer, chưa tick, chưa bị bỏ qua) — đúng như cách render loop đánh số
-  // dropIdx — nên ở đây phải tách riêng draggable/non-draggable, chèn vào
-  // đúng vị trí trong danh sách draggable rồi ghép lại thành 1 mảng key
-  // đầy đủ (item cố định/buffer giữ nguyên vị trí tương đối, xen giữa các
-  // task kéo được). Lưu vào d.scheduleManualOrder — giờ hiển thị sau đó
-  // được routeItems tính lại HOÀN TOÀN kiểu cộng dồn (§2), nên không thể
-  // có 2 task trùng giờ.
-  const moveItemToPosition = async (draggedKey, targetIndex) => {
-    const isDraggableItem = (it) => !it.isFixed && !it.isBuffer && !it.isSkippedToday && !scheduleDone[it.key];
-    const draggableKeys = displayItems.filter(isDraggableItem).map(it => it.key);
-    const fromIdx = draggableKeys.indexOf(draggedKey);
-    if (fromIdx === -1) return;
-    const nextDraggable = [...draggableKeys];
-    nextDraggable.splice(fromIdx, 1);
-    let insertAt = targetIndex;
-    if (fromIdx < targetIndex) insertAt -= 1;
-    insertAt = Math.max(0, Math.min(insertAt, nextDraggable.length));
-    nextDraggable.splice(insertAt, 0, draggedKey);
-
-    // Ghép lại: duyệt displayItems theo thứ tự CŨ, thay các vị trí
-    // draggable bằng thứ tự MỚI (nextDraggable), giữ nguyên vị trí các
-    // item không-kéo-được (cố định/buffer/đã tick/đã bỏ qua).
-    let di = 0;
-    const merged = displayItems.map(it => {
-      if (isDraggableItem(it)) { const k = nextDraggable[di]; di++; return k; }
-      return it.key;
-    });
-    await save(td, { scheduleManualOrder: merged });
-  };
-
-  // [PATCH] MỤC 3: tự động ghi nhận "timeout" cho các item CHƯA tick khi
-  // sang ngày mới (tức là bị bỏ qua cả ngày mà không thao tác gì) — chạy
-  // 1 lần khi latestEntryId đổi SANG plan mới (kế hoạch cũ đã kết thúc),
-  // dựa trên state của lần trước lưu trong ref để không ghi trùng.
-  const prevScheduleRef = useRef({ entryId: null, items: [], done: {} });
-  useEffect(() => {
-    const prev = prevScheduleRef.current;
-    if (prev.entryId && prev.entryId !== latestEntryId && prev.items.length) {
-      const undone = prev.items.filter(it => !it.isFixed && !it.isBuffer && !prev.done[it.key]);
-      undone.forEach(it => { recordSkip(it.key, it.name, "timeout", td).catch(() => {}); });
-    }
-    prevScheduleRef.current = { entryId: latestEntryId, items: routeItems, done: scheduleDone };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [latestEntryId]);
-
-  // [PATCH] Tải + phân tích skipHistory cho từng item hiện có trong lịch,
-  // để hiển thị "💡 Task này đã bị bỏ qua N lần → …" và để quyết định
-  // reduce/increase ưu tiên (MỤC 3). Chạy lại mỗi khi danh sách item đổi.
-  // [PATCH v30] cũng lưu lại toàn bộ skipList vào skipListAll để phần
-  // "📊 Phân tích 30 ngày qua" phía dưới dùng chung, không tải 2 lần.
-  //
-  // [FIX FREEZE] BUG NGHIÊM TRỌNG đã sửa: effect này trước đây phụ thuộc
-  // trực tiếp vào `routeItems` — nhưng routeItems là kết quả useMemo tạo
-  // MẢNG MỚI mỗi lần render (đặc biệt khi chưa có plan: routeItemsBase trả
-  // về `[]` mới toanh mỗi lần, vì `[] !== []` trong JS dù nội dung giống
-  // hệt nhau). Hậu quả: MỌI lần re-render của SmartSchedule (tức là MỌI
-  // lần bấm bất kỳ nút nào trong toàn app, vì Today re-render kéo theo)
-  // đều khiến effect này chạy lại → gọi loadSkipHistory() (đọc storage,
-  // bất đồng bộ) → setSkipAnalysis/setSkipListAll → gây re-render → lại
-  // tạo routeItems mới → effect chạy lại → ... → vòng lặp vô hạn, mỗi
-  // vòng đều gọi storage, khiến trang bị đơ hoàn toàn chỉ sau 1 lần chạm.
-  // Sửa: đổi dependency sang latestEntryId (chỉ đổi khi THỰC SỰ có kế
-  // hoạch AI mới) kèm số lượng item (đề phòng kéo-thả/thêm task thủ công
-  // đổi thứ tự/số lượng mà không đổi latestEntryId) — cả hai đều là giá
-  // trị nguyên thuỷ ổn định, không tạo reference mới mỗi render.
-  const routeItemsSignature = routeItems.length + ":" + routeItems.map(it => it.key).join(",");
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const list = await loadSkipHistory();
-      if (cancelled) return;
-      const next = {};
-      routeItems.forEach(it => {
-        if (it.isFixed || it.isBuffer) return;
-        next[it.key] = analyzeSkipHistoryFromList(list, it.key, 7);
-      });
-      setSkipAnalysis(next);
-      setSkipListAll(list);
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [latestEntryId, routeItemsSignature]);
 
   // ── "Làm lại" — tính lại toàn bộ lịch từ giờ hiện tại. Gọi thẳng cùng
   // pipeline MorningWidget dùng (runAiPlannerPipeline → aiPlannerCore.js),
-  // không viết lại logic xếp lịch ở đây. [PATCH v30] giờ cũng đọc
-  // deadlinePlan + truyền db/setts/taskPool vào, để enrichTasksWithContext
-  // chạy được y hệt lúc "Làm lại" từ MorningWidget. ──
+  // không viết lại logic xếp lịch ở đây. ──
   const regenerate = async () => {
     if (regenerating) return;
     setRegenerating(true);
@@ -10705,214 +10495,58 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     }
   };
 
-  // [FIX #310] stats30 dời lên TRƯỚC 2 early-return bên dưới. Lý do: hook
-  // (useMemo) không được phép gọi có điều kiện — nếu để sau "if (!today)
-  // return null" thì khi today/plannerOutput chưa sẵn sàng, useMemo này bị
-  // skip hẳn ở lần render đó → số lượng hook thay đổi giữa các lần render →
-  // chính là nguyên nhân gây lỗi React #310. stats30 chỉ phụ thuộc
-  // db/dayExp/skipListAll (không phụ thuộc today/plannerOutput/routeItems)
-  // nên dời lên đây không đổi kết quả tính toán, chỉ đổi thời điểm gọi hook
-  // để luôn chạy đều đặn mỗi render, đúng Rules of Hooks.
-  const stats30 = useMemo(() => analyzeLast30Days(db || {}, dayExp, skipListAll), [db, dayExp, skipListAll]);
-
   if (!today) return null; // Today chưa rotateDay xong lúc đầu — tránh nháy layout
-  if (!plannerOutput || routeItems.length === 0) return null; // chưa có kế hoạch AI hôm nay → không hiện card rỗng
-
-  // [PATCH] gom các dòng skip-analysis cần hiển thị (chỉ những item có
-  // shouldReduce=true, đúng ví dụ mẫu trong yêu cầu MỤC 4g)
-  const reduceNotices = displayItems.filter(it => !it.isFixed && !it.isBuffer && skipAnalysis[it.key]?.shouldReduce);
-
-  // [PATCH v30] Checklist cuối ngày — chỉ hiện sau 22:30 giờ hệ thống,
-  // dùng chính scheduleDone đã có (không hỏi lại thứ đã biết): tìm task
-  // học/bài tập (khớp từ khoá) và task deadline (isDeadlineTask) trong
-  // routeItems để suy ra trạng thái, chỉ hỏi thêm 1 ô ghi chú tự do.
-  const nowHM = new Date();
-  const showEveningChecklist = nowHM.getHours() >= 22 && nowHM.getMinutes() >= 30 || nowHM.getHours() >= 23;
-  const homeworkItem = routeItems.find(it => !it.isFixed && !it.isBuffer && /bài tập|toán|lý/i.test(it.name || ""));
-  const deadlineItem = routeItems.find(it => it.isDeadlineTask);
-  const homeworkDone = homeworkItem ? !!scheduleDone[homeworkItem.key] : null; // null = hôm nay không có task học
-  const deadlineDone = deadlineItem ? !!scheduleDone[deadlineItem.key] : null; // null = hôm nay không có deadline
+  if (!plannerOutput || timelineItems.length === 0) return null; // chưa có kế hoạch AI hôm nay → không hiện card rỗng
 
   return (
     <div style={{
       background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14,
       border: `1px solid ${theme.border}`, position: "relative",
     }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🗓️ Lịch trình hôm nay (phân tích từ 30 ngày qua)</span>
-        <span style={{ fontSize: 10, color: theme.textDim }}>{doneCount}/{checkableItems.length}</span>
+      <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+        📅 LỊCH TRÌNH HÔM NAY
       </div>
-      <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 10 }}>
-        Tick từng việc kèm giờ cụ thể để nhận XP — bỏ qua sẽ được AI ghi nhận để điều chỉnh lần sau.
-      </div>
-
-      <div style={{ height: 6, borderRadius: 999, background: theme.bg, overflow: "hidden", marginBottom: 10 }}>
-        <div style={{ height: "100%", width: `${checkableItems.length ? (doneCount / checkableItems.length) * 100 : 0}%`,
-          background: accent, transition: "width 0.3s ease" }}/>
-      </div>
-
-      {(() => {
-        // [PATCH v38] MỤC 1: các item có thể kéo được (không cố định,
-        // không buffer, chưa tick, chưa bị bỏ qua) — chỉ những item này
-        // mới có ô drop-zone chèn TRƯỚC nó. Luôn có thêm 1 ô drop-zone ở
-        // CUỐI danh sách để thả task xuống cuối cùng.
-        const isDraggable = (it) => !it.isFixed && !it.isBuffer && !it.isSkippedToday && !scheduleDone[it.key];
-        const dropZone = (targetIndex) => {
-          const active = draggingKey && dragOverIndex === targetIndex;
-          return (
-            <div key={"dz" + targetIndex}
-              onDragOver={(e) => { if (draggingKey) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; if (dragOverIndex !== targetIndex) setDragOverIndex(targetIndex); } }}
-              onDragLeave={() => { setDragOverIndex(idx => idx === targetIndex ? null : idx); }}
-              onDrop={(e) => {
-                e.preventDefault();
-                const draggedKey = e.dataTransfer.getData("text/plain");
-                setDraggingKey(null); setDragOverIndex(null);
-                if (!draggedKey) return;
-                moveItemToPosition(draggedKey, targetIndex);
-              }}
-              style={{
-                height: active ? 30 : (draggingKey ? 14 : 4),
-                margin: "2px 2px",
-                borderRadius: 8,
-                border: draggingKey ? `2px dashed ${active ? accent : theme.border}` : "2px dashed transparent",
-                background: active ? `${accent}1A` : (draggingKey ? theme.bg : "transparent"),
-                display: "flex", alignItems: "center", justifyContent: "center",
-                transition: "height 0.12s ease, background 0.12s ease, border-color 0.12s ease",
-                fontSize: 9, color: accent, fontWeight: 600, overflow: "hidden",
-              }}>
-              {active ? "Thả vào đây" : ""}
-            </div>
-          );
-        };
-
-        const nodes = [];
-        let dropIdx = 0;
-        displayItems.forEach((it, i) => {
-          if (isDraggable(it)) { nodes.push(dropZone(dropIdx)); dropIdx++; }
-
-          if (it.isFixed) {
-            nodes.push(
-              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
-                <span style={{ width: 6, height: 6, borderRadius: "50%", background: it.color || "#EF4444", flexShrink: 0 }}/>
-                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
-                  🕐 {it.start} 🏫 {it.name} (cố định, {minutesBetweenHHMM(it.start, it.end)}')
-                </span>
-              </div>
-            );
-            return;
-          }
+      <div>
+        {timelineItems.map((it) => {
+          const done = !!timelineDone[it.doneKey];
+          // Buffer ("Nghỉ giữa việc") không phải task thật — không cho tick,
+          // vẫn hiển thị mờ như cũ để thấy khoảng trống trong lịch.
           if (it.isBuffer) {
-            nodes.push(
-              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "3px 10px", marginBottom: 6 }}>
-                <span style={{ fontSize: 10, color: theme.textDim, minWidth: 88, flexShrink: 0 }}>{it.start}–{it.end}</span>
-                <span style={{ fontSize: 11, color: theme.textDim }}>☕ nghỉ</span>
+            return (
+              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                  {it.start}–{it.end}
+                </span>
+                <span style={{ width: 4, height: 4, borderRadius: "50%", background: it.color, flexShrink: 0 }} />
+                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>{it.name}</span>
               </div>
             );
-            return;
           }
-
-          // [PATCH] MỤC 4h: task đã tick vẫn hiển thị, có dấu ✅ và gạch
-          // ngang tên (thay vì mờ đi như DailyRouteCard cũ).
-          const checked = !!scheduleDone[it.key];
-          const shortWhy = summarizeReason(it.why, 90);
-          const wasReduced = !!skipAnalysis[it.key]?.shouldReduce;
-          // [PATCH v37] MỤC 4: task bị "Bỏ qua" hôm nay → xám, mờ, dấu ⏭
-          // (khác với wasReduced — chỉ là gợi ý hạ ưu tiên do skip nhiều lần
-          // trong 7 ngày qua, vẫn hiển thị bình thường, có thể tick được).
-          const skippedToday = !!it.isSkippedToday;
-          // [PATCH v36] MỤC 3: màu viền trái = màu phân loại (đỏ cho task cố
-          // định, 1 trong 7 màu bảng cho task AI thêm theo group, xanh dương
-          // cho task tự chọn — §4) thay vì theo priority như cũ.
-          const itemColor = skippedToday ? "#9CA3AF" : (it.color || aiPlannerPriorityClass(it.priority));
-          const draggableNow = isDraggable(it);
-          const isBeingDragged = draggingKey === it.key;
-          nodes.push(
-            <div key={it.key}
-              draggable={draggableNow}
-              onDragStart={(e) => {
-                e.dataTransfer.setData("text/plain", it.key);
-                e.dataTransfer.effectAllowed = "move";
-                setDraggingKey(it.key);
-              }}
-              onDragEnd={() => { setDraggingKey(null); setDragOverIndex(null); }}
+          return (
+            <div key={it.key} onClick={() => toggleTimelineItem(it.doneKey)}
               style={{
-                display: "flex", gap: 10, alignItems: "flex-start",
-                padding: "9px 10px", borderRadius: 10, marginBottom: 6, position: "relative",
-                background: it.isBigWin ? `${accent}12` : it.isDeadlineTask ? `${theme.warning}12` : theme.bg,
-                borderLeft: `3px solid ${itemColor}`,
-                opacity: isBeingDragged ? 0.35 : skippedToday ? 0.5 : (wasReduced && !checked ? 0.75 : 1),
-                cursor: draggableNow ? "grab" : "default",
+                display: "flex", gap: 10, alignItems: "center", cursor: "pointer",
+                padding: "9px 10px", marginBottom: 6, borderRadius: 10,
+                background: done ? `${it.color}12` : theme.surfaceAlt,
+                borderLeft: `3px solid ${it.color}`,
+                opacity: done ? 0.65 : 1,
               }}>
-              <div style={{ marginTop: 1, cursor: "pointer" }} onClick={() => toggleItem(it)}>
-                <MorningTaskCheckbox checked={checked} theme={theme} accent={accent}/>
-              </div>
-              <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => toggleItem(it)}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: skippedToday ? theme.textDim : theme.text,
-                    textDecoration: checked ? "line-through" : "none" }}>
-                    {skippedToday ? "⏭ " : checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}
-                    {/* [PATCH v38] MỤC 4: format giờ cụ thể "🕐 HH:MM - HH:MM Tên (dur')" */}
-                    {it.start ? `🕐 ${it.start}${it.end ? " - " + it.end : ""} ` : ""}{it.name}{it.dur > 0 ? ` (${it.dur}')` : ""}
-                  </span>
-                </div>
-                {!skippedToday && shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
-                {!skippedToday && it.doneWhen && <div style={{ fontSize: 10, color: theme.textDim, marginTop: 2 }}>✓ {it.doneWhen}</div>}
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
-                  <span style={{ fontSize: 9, color: theme.textDim }}>{skippedToday ? "Đã bỏ qua" : `+${xpForItem(it)} XP`}</span>
-                  <span style={{ display: "flex", gap: 8 }}>
-                    {skippedToday && (
-                      <button onClick={(e) => { e.stopPropagation(); unskipItem(it); }}
-                        style={{ background: "none", border: "none", color: theme.textDim, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
-                        Hoàn tác
-                      </button>
-                    )}
-                    {!skippedToday && !checked && (
-                      <button onClick={(e) => { e.stopPropagation(); skipItem(it); }}
-                        style={{ background: "none", border: "none", color: theme.textDim, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
-                        Bỏ qua
-                      </button>
-                    )}
-                    {it.isManual && (
-                      <button onClick={(e) => { e.stopPropagation(); removeManualTask(it.key); }}
-                        style={{ background: "none", border: "none", color: theme.danger, fontSize: 9, cursor: "pointer", textDecoration: "underline" }}>
-                        Xoá
-                      </button>
-                    )}
-                  </span>
-                </div>
-              </div>
-              {/* [PATCH] MỤC 4d: XP fly-up khi tick item này */}
-              {xpFly && xpFly.key.startsWith(it.key + ":") && (
-                <span className="gb-xp-fly" style={{ position: "absolute", right: 10, top: 4, color: theme.success }}>
-                  +{xpFly.amount}
+              <NeonCheckbox checked={done} onChange={() => toggleTimelineItem(it.doneKey)} accent={it.color}/>
+              <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                {it.start}–{it.end}
+              </span>
+              <span style={{ fontSize: 13 }}>{it.isFixed ? "📌" : "⏰"}</span>
+              <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
+                <span key={done ? "done" : "undone"} className={done ? "task-text-done" : ""} style={{ "--strike-color": it.color, color: theme.text }}>
+                  {it.name}
                 </span>
-              )}
+              </span>
             </div>
           );
-        });
-        // ô drop-zone cuối cùng — thả vào đây để đưa task xuống cuối danh sách
-        if (draggingKey) nodes.push(dropZone(dropIdx));
-        return nodes;
-      })()}
+        })}
+      </div>
 
-      {/* [PATCH v37] MỤC 5: "+ Thêm task" — task tự chọn ngay trong lịch. */}
-      <AddManualTaskRow theme={theme} accent={accent} onAdd={addManualTask}/>
-
-      {/* [PATCH] MỤC 3+4g: hiển thị lý do hạ ưu tiên cho các task bị skip nhiều */}
-      {reduceNotices.length > 0 && (
-        <div style={{ marginTop: 8, marginBottom: 4 }}>
-          {reduceNotices.map(it => (
-            <div key={it.key} style={{ fontSize: 10, color: theme.warning, marginBottom: 4, lineHeight: 1.4 }}>
-              💡 Task "{it.name}" {skipAnalysis[it.key].reason}
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 10, color: theme.textDim, marginTop: 6 }}>
-        {/* [PATCH v36] MỤC 6: ẩn "Độ tin cậy: X%" ở tab Hôm nay — vẫn còn
-            hiển thị đầy đủ trong tab AI Planner (AIPlannerBeta, không đụng). */}
-        <span>⏱ Tổng {totalMinutes}'</span>
+      <div style={{ marginTop: 10 }}>
         <button onClick={regenerate} disabled={regenerating}
           style={{ padding: "5px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: "transparent",
             color: regenerating ? theme.textDim : theme.text, fontSize: 10, fontWeight: 600,
@@ -10921,45 +10555,6 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         </button>
       </div>
       {errorMsg && <div style={{ fontSize: 10, color: theme.danger, marginTop: 6 }}>⚠ {errorMsg}</div>}
-
-      {/* [PATCH v30] Checklist cuối ngày — chỉ hiện sau 22:30. Câu 1+2 là
-          TRẠNG THÁI ĐÃ BIẾT (đọc từ scheduleDone, không hỏi lại), chỉ có
-          ô ghi chú là thật sự cần người dùng nhập. */}
-      {showEveningChecklist && (
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${theme.border}` }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>📋 Kiểm tra cuối ngày</div>
-          {homeworkItem && (
-            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>
-              {homeworkDone ? "✅" : "⬜"} Bài tập hôm nay: {homeworkDone ? "đã xong" : "chưa xong"}
-            </div>
-          )}
-          {deadlineItem && (
-            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>
-              {deadlineDone ? "✅" : "⬜"} Sự kiện "{deadlineItem.name.replace('Làm sự kiện: ','')}": {deadlineDone ? "đã làm đủ hôm nay" : "chưa làm hôm nay"}
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: theme.textDim, margin: "8px 0 4px" }}>Hôm nay bạn có gì muốn ghi chú không?</div>
-          <textarea value={eveningNoteVal} onChange={e => setEveningNoteVal(e.target.value)}
-            placeholder="Vd: hôm nay hơi mệt, mai làm bù…" rows={2}
-            style={{ width: "100%", padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`,
-              background: theme.bg, color: theme.text, fontSize: 12, resize: "vertical", boxSizing: "border-box" }}/>
-        </div>
-      )}
-
-      {/* [PATCH v30] Phân tích 30 ngày qua — số liệu thật từ db, không có
-          "giờ vàng" vì hệ thống chưa lưu timestamp lúc tick từng task. */}
-      {stats30.daysWithData > 0 && (
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${theme.border}` }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 6 }}>📊 Phân tích 30 ngày qua</div>
-          <div style={{ fontSize: 10, color: theme.textDim, lineHeight: 1.8 }}>
-            {stats30.mostDoneTask && <div>✅ Nhiệm vụ làm nhiều nhất: {stats30.mostDoneTask.name} ({stats30.mostDoneTask.count} lần)</div>}
-            {stats30.mostSkippedTask && <div>⏭️ Nhiệm vụ bị bỏ qua nhiều nhất: {stats30.mostSkippedTask.name} ({stats30.mostSkippedTask.count} lần)</div>}
-            {stats30.bestDay && <div>📅 Ngày hiệu quả nhất: {stats30.bestDay.label} (trung bình {stats30.bestDay.avgXp} XP/ngày)</div>}
-            <div>📈 XP trung bình 30 ngày: {stats30.avgXp} XP/ngày ({stats30.daysWithData} ngày có dữ liệu)</div>
-            <div>🔥 Streak tốt nhất: {stats30.bestStreak} ngày</div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -11096,7 +10691,7 @@ function QuickStats({ str, dayE, txp, lv, rt, targetXP }) {
   );
 }
 
-function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStudy,startStudy,challenge,chalDone,str,db,txp,dayExp,lv,rt,finTxs,onOpenPomodoro,onSwitchTab,showWeeklyBanner,onOpenWeeklyReview,onSkipWeeklyReview,taskPool,goalPool,onAddPoolTask,onEditPoolTask,onDeletePoolTask,onToggleHidePoolTask,onAddGoalPool,onEditGoalPool,onDeleteGoalPool,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount,onTogglePoolTask,onSwapDailyTask}) {
+function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStudy,startStudy,challenge,chalDone,str,db,txp,dayExp,lv,rt,finTxs,onOpenPomodoro,onSwitchTab,showWeeklyBanner,onOpenWeeklyReview,onSkipWeeklyReview,taskPool,goalPool,onAddPoolTask,onEditPoolTask,onDeletePoolTask,onToggleHidePoolTask,onAddGoalPool,onEditGoalPool,onDeleteGoalPool,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount,onTogglePoolTask,onAddTodayGoal,onRemoveTodayGoal,onReorderTodayGoals}) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const [newTask,setNewTask]=useState("");
@@ -11239,18 +10834,32 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
           PHẦN 2 — KẾ HOẠCH & NHIỆM VỤ CHÍNH (mở rộng mặc định)
           ══════════════════════════════════════════════════════════════════ */}
       <Section title="Kế hoạch & Nhiệm vụ chính" icon="🎯" theme={theme} defaultOpen={true}>
-        {/* Morning Widget (AI Planner) */}
+        {/* Morning Widget (AI Planner check-in) */}
         <MorningWidget td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} onSwitchTab={onSwitchTab} taskPool={taskPool} onAddPoolTask={onAddPoolTask} onEditPoolTask={onEditPoolTask}
           plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}/>
 
-        {/* Mục tiêu lớn */}
-        <BigGoalCard td={td} data={data} goalPool={goalPool} save={save} onOpenManager={()=>setGoalManagerOpen(true)}
+        {/* AI đề xuất — chỉ hiển thị gợi ý, không tự thêm vào Today's Goals.
+            Người dùng bấm "Áp dụng" (từng mục hoặc tất cả) mới chuyển sang
+            Big Goal / Today's Goals bên dưới. */}
+        <AISuggestionsCard td={td} data={data} taskPool={taskPool} db={db}
+          plannerStorage={plannerStorage} plannerToday={plannerToday}
+          onAddPoolTask={onAddPoolTask} save={save}/>
+
+        {/* Mục tiêu lớn — "nếu hôm nay chỉ hoàn thành được 1 việc thì đó là việc gì" */}
+        <OneBigWinCard td={td} data={data} goalPool={goalPool} save={save} onOpenManager={()=>setGoalManagerOpen(true)}
           onMarkGoalPicked={onMarkGoalPicked} onBumpGoalDoneCount={onBumpGoalDoneCount} onBumpGoalSkipCount={onBumpGoalSkipCount}/>
 
-        {/* 5 việc nhỏ hôm nay */}
-        <DailyPicksCard td={td} data={data} taskPool={taskPool} onToggle={onTogglePoolTask} onSwap={onSwapDailyTask} onOpenManager={()=>setPoolManagerOpen(true)}/>
+        {/* Mục tiêu hôm nay — danh sách nhiều việc cần hoàn thành trong ngày,
+            KHÔNG phải Routine. AI có thể đề xuất (qua AISuggestionsCard ở
+            trên), người dùng tự thêm/sửa/xoá/sắp xếp (kéo-thả) tự do. */}
+        <TodaysGoalsCard td={td} data={data} taskPool={taskPool}
+          onToggle={onTogglePoolTask} onAdd={onAddTodayGoal} onRemove={onRemoveTodayGoal}
+          onReorder={onReorderTodayGoals} onEditPoolTask={onEditPoolTask} onOpenManager={()=>setPoolManagerOpen(true)}/>
 
-        {/* Lịch trình thông minh theo giờ — đọc từ kế hoạch AI hôm nay, tự ẩn nếu chưa có kế hoạch */}
+        {/* Lịch trình thông minh theo giờ — CHỈ trả lời "hôm nay đến mấy giờ
+            thì làm gì?" (Routine + lịch học thêm cố định theo giờ thật).
+            Không còn danh sách nhiệm vụ/mục tiêu để tick trong card này nữa —
+            việc đó đã chuyển hẳn sang TodaysGoalsCard/OneBigWinCard ở trên. */}
         <SmartSchedule td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} taskPool={taskPool}
           plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}/>
 
