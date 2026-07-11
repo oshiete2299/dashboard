@@ -10319,6 +10319,8 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // index của ô drop-zone đang được kéo-qua (để highlight riêng đúng ô).
   const [draggingKey, setDraggingKey] = useState(null);
   const [dragOverIndex, setDragOverIndex] = useState(null);
+  // [PATCH] ô nhập "Thêm nhiệm vụ" trong khu LINH HOẠT.
+  const [newTaskName, setNewTaskName] = useState("");
   // [PATCH] skip analysis cho từng item, tính 1 lần khi schedule thay đổi
   const [skipAnalysis, setSkipAnalysis] = useState({}); // {[itemKey]: {shouldReduce, shouldIncrease, reason}}
   // [PATCH v30] danh sách skip 30 ngày, tải 1 lần cho phần phân tích cuối card
@@ -10752,7 +10754,25 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     "Ngủ trước 23:30",
   ];
 
-  const flexDisplayItems = displayItems.filter(it => !it.isFixed && !it.isBuffer);
+  // [PATCH] Khu LINH HOẠT chỉ hiện tối đa 5 task, không phân biệt "việc
+  // nhỏ" hay "mục tiêu lớn" nữa — mọi thứ AI đề xuất đều là 1 danh sách
+  // phẳng, kéo-thả được, thêm/xoá được. Task đã tick vẫn tính vào 5 slot
+  // (để không "biến mất" khỏi list khi vừa tick xong), chỉ ẩn phần vượt
+  // quá slot thứ 5.
+  const flexDisplayItems = displayItems.filter(it => !it.isFixed && !it.isBuffer).slice(0, 5);
+  const isDraggableItem = (it) => !it.isSkippedToday && !scheduleDone[it.key];
+
+  // [PATCH] "Tổng XP" của khu LINH HOẠT hôm nay — cộng dồn scheduleXp của
+  // đúng các item đang hiển thị (đã tick), 1 dòng duy nhất, không hiện
+  // XP riêng từng task.
+  const flexTotalXp = flexDisplayItems.reduce((s, it) => s + (scheduleXp[it.key] || 0), 0);
+
+  const submitNewTask = () => {
+    if (!newTaskName.trim()) return;
+    const nowStr = `${String(new Date().getHours()).padStart(2, "0")}:${String(new Date().getMinutes()).padStart(2, "0")}`;
+    addManualTask(newTaskName, nowStr, 30);
+    setNewTaskName("");
+  };
 
   return (
     <div style={{
@@ -10760,7 +10780,7 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       border: `1px solid ${theme.border}`, position: "relative",
     }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
-        ===== CỐ ĐỊNH HÀNG NGÀY =====
+        CỐ ĐỊNH HÀNG NGÀY
       </div>
       <div style={{ marginBottom: 14 }}>
         {FIXED_ROUTINE_ITEMS.map((name, i) => {
@@ -10780,23 +10800,84 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       </div>
 
       <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
-        ===== LINH HOẠT (AI đề xuất theo ngày) =====
+        NHIỆM VỤ / MỤC TIÊU
       </div>
       <div>
-        {flexDisplayItems.map(it => {
+        {flexDisplayItems.map((it, idx) => {
           const checked = !!scheduleDone[it.key];
+          const draggable = isDraggableItem(it);
+          const isDragging = draggingKey === it.key;
+          const isDragOver = dragOverIndex === idx && draggingKey && draggingKey !== it.key;
           return (
-            <div key={it.key}
-              onClick={() => toggleItem(it)}
-              style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "4px 0", cursor: "pointer" }}>
-              <span style={{ fontSize: 13, color: theme.text }}>–</span>
-              <span style={{ fontSize: 13, color: theme.text, textDecoration: checked ? "line-through" : "none" }}>
-                {it.name}
-              </span>
+            <div key={it.key}>
+              {isDragOver && (
+                <div style={{ height: 2, background: accent, margin: "2px 0", borderRadius: 2 }} />
+              )}
+              <div
+                draggable={draggable}
+                onDragStart={() => draggable && setDraggingKey(it.key)}
+                onDragOver={(e) => { if (draggingKey) { e.preventDefault(); setDragOverIndex(idx); } }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (draggingKey) moveItemToPosition(draggingKey, idx);
+                  setDraggingKey(null); setDragOverIndex(null);
+                }}
+                onDragEnd={() => { setDraggingKey(null); setDragOverIndex(null); }}
+                style={{
+                  display: "flex", gap: 10, alignItems: "center", padding: "4px 0",
+                  opacity: isDragging ? 0.4 : 1,
+                }}
+              >
+                {draggable && (
+                  <span style={{ fontSize: 12, color: theme.textDim, cursor: "grab", flexShrink: 0 }}>⠿</span>
+                )}
+                <span
+                  onClick={() => toggleItem(it)}
+                  style={{ display: "flex", gap: 10, alignItems: "flex-start", flex: 1, cursor: "pointer", minWidth: 0 }}
+                >
+                  <span style={{ fontSize: 13, color: theme.text }}>–</span>
+                  <span style={{ fontSize: 13, color: theme.text, textDecoration: checked ? "line-through" : "none" }}>
+                    {it.name}
+                  </span>
+                </span>
+                {it.isManual && (
+                  <button onClick={() => removeManualTask(it.key)}
+                    style={{ background: "none", border: "none", color: theme.danger, fontSize: 14, cursor: "pointer", flexShrink: 0 }}>
+                    ×
+                  </button>
+                )}
+              </div>
             </div>
           );
         })}
+        {flexDisplayItems.length === 0 && (
+          <div style={{ fontSize: 12, color: theme.textDim, padding: "4px 0" }}>Chưa có nhiệm vụ nào.</div>
+        )}
       </div>
+
+      {flexDisplayItems.length < 5 && (
+        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+          <input
+            value={newTaskName}
+            onChange={(e) => setNewTaskName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submitNewTask()}
+            placeholder="Thêm nhiệm vụ..."
+            style={{ flex: 1, background: theme.surfaceAlt, border: `1px solid ${theme.border}`, borderRadius: 8,
+              padding: "6px 10px", color: theme.text, fontSize: 12, outline: "none" }}
+          />
+          <button onClick={submitNewTask}
+            style={{ background: accent, border: "none", borderRadius: 8, padding: "0 12px",
+              color: "white", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+            +
+          </button>
+        </div>
+      )}
+
+      {flexTotalXp > 0 && (
+        <div style={{ fontSize: 11, color: theme.textDim, marginTop: 10 }}>
+          Tổng XP: {flexTotalXp}
+        </div>
+      )}
 
       <div style={{ marginTop: 10 }}>
         <button onClick={regenerate} disabled={regenerating}
@@ -11090,12 +11171,19 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
         <MorningWidget td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} onSwitchTab={onSwitchTab} taskPool={taskPool} onAddPoolTask={onAddPoolTask} onEditPoolTask={onEditPoolTask}
           plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}/>
 
-        {/* Mục tiêu lớn */}
-        <BigGoalCard td={td} data={data} goalPool={goalPool} save={save} onOpenManager={()=>setGoalManagerOpen(true)}
-          onMarkGoalPicked={onMarkGoalPicked} onBumpGoalDoneCount={onBumpGoalDoneCount} onBumpGoalSkipCount={onBumpGoalSkipCount}/>
-
-        {/* 5 việc nhỏ hôm nay */}
-        <DailyPicksCard td={td} data={data} taskPool={taskPool} onToggle={onTogglePoolTask} onSwap={onSwapDailyTask} onOpenManager={()=>setPoolManagerOpen(true)}/>
+        {/* [PATCH] Ẩn khỏi giao diện theo yêu cầu định dạng mới: mọi "Nhiệm vụ/
+            Mục tiêu hôm nay" giờ hiển thị gộp chung trong 1 danh sách LINH HOẠT
+            bên trong SmartSchedule ở dưới (kéo-thả/thêm/xoá/cap 5, không XP/giờ
+            từng task). KHÔNG xoá — giữ nguyên logic bigGoalsToday/dailyPicks +
+            data-Pool phía sau (achievements, insight, streak vẫn đọc các field
+            này bình thường), chỉ không render JSX của 2 card cũ nữa. */}
+        {false && (
+          <BigGoalCard td={td} data={data} goalPool={goalPool} save={save} onOpenManager={()=>setGoalManagerOpen(true)}
+            onMarkGoalPicked={onMarkGoalPicked} onBumpGoalDoneCount={onBumpGoalDoneCount} onBumpGoalSkipCount={onBumpGoalSkipCount}/>
+        )}
+        {false && (
+          <DailyPicksCard td={td} data={data} taskPool={taskPool} onToggle={onTogglePoolTask} onSwap={onSwapDailyTask} onOpenManager={()=>setPoolManagerOpen(true)}/>
+        )}
 
         {/* Lịch trình thông minh theo giờ — đọc từ kế hoạch AI hôm nay, tự ẩn nếu chưa có kế hoạch */}
         <SmartSchedule td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} taskPool={taskPool}
