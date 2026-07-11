@@ -10262,33 +10262,34 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
 function AddManualTaskRow({ theme, accent, onAdd }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
-  const [start, setStart] = useState("");
-  const [dur, setDur] = useState(30);
 
   if (!open) {
     return (
       <button onClick={() => setOpen(true)}
         style={{ width: "100%", marginTop: 4, padding: 8, borderRadius: 8, border: `1px dashed ${theme.border}`,
           background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
-        + Thêm task
+        + Thêm việc
       </button>
     );
   }
+  // [PATCH] Yêu cầu: danh sách chỉ hiển thị theo thứ tự công việc, không
+  // hỏi giờ/phút nữa. Vẫn cần start/dur nội bộ cho engine xếp lịch phía
+  // dưới (routeItems) nên gán mặc định "ngay bây giờ, 30 phút" — người
+  // dùng không thấy và không nhập các giá trị này, chỉ nhập tên việc rồi
+  // sắp xếp lại bằng kéo-thả nếu muốn đổi thứ tự ưu tiên.
   const submit = () => {
-    if (!name.trim() || !start) return;
-    onAdd(name, start, Number(dur) || 30);
-    setName(""); setStart(""); setDur(30); setOpen(false);
+    if (!name.trim()) return;
+    const now = new Date();
+    const nowHM = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    onAdd(name, nowHM, 30);
+    setName(""); setOpen(false);
   };
   return (
     <div style={{ borderRadius: 8, border: `1px solid ${theme.border}`, padding: 8, marginTop: 4 }}>
-      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Tên task"
+      <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Tên việc"
+        autoFocus
+        onKeyDown={e => { if (e.key === "Enter") submit(); }}
         style={{ width: "100%", padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 6, boxSizing: "border-box" }}/>
-      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-        <input type="time" value={start} onChange={e => setStart(e.target.value)}
-          style={{ flex: 1, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
-        <input type="number" min="5" step="5" value={dur} onChange={e => setDur(e.target.value)} placeholder="Phút"
-          style={{ width: 70, padding: 6, borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
-      </div>
       <div style={{ display: "flex", gap: 6 }}>
         <button onClick={submit} style={{ flex: 1, padding: 6, borderRadius: 6, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
           Thêm
@@ -10743,7 +10744,7 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         <span style={{ fontSize: 10, color: theme.textDim }}>{doneCount}/{checkableItems.length}</span>
       </div>
       <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 10 }}>
-        Tick từng việc kèm giờ cụ thể để nhận XP — bỏ qua sẽ được AI ghi nhận để điều chỉnh lần sau.
+        Tick từng việc theo thứ tự để nhận XP — bỏ qua sẽ được AI ghi nhận để điều chỉnh lần sau.
       </div>
 
       <div style={{ height: 6, borderRadius: 999, background: theme.bg, overflow: "hidden", marginBottom: 10 }}>
@@ -10791,23 +10792,14 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
           if (isDraggable(it)) { nodes.push(dropZone(dropIdx)); dropIdx++; }
 
           if (it.isFixed) {
-            nodes.push(
-              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
-                <span style={{ width: 6, height: 6, borderRadius: "50%", background: it.color || "#EF4444", flexShrink: 0 }}/>
-                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
-                  🕐 {it.start} 🏫 {it.name} (cố định, {minutesBetweenHHMM(it.start, it.end)}')
-                </span>
-              </div>
-            );
+            // [PATCH] Yêu cầu: không hiển thị mục cố định trong danh sách
+            // nhiệm vụ hôm nay — vẫn giữ trong tính toán cursor/thứ tự bên
+            // trên (routeItems) để né giờ, chỉ ẩn khỏi UI ở đây.
             return;
           }
           if (it.isBuffer) {
-            nodes.push(
-              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "3px 10px", marginBottom: 6 }}>
-                <span style={{ fontSize: 10, color: theme.textDim, minWidth: 88, flexShrink: 0 }}>{it.start}–{it.end}</span>
-                <span style={{ fontSize: 11, color: theme.textDim }}>☕ nghỉ</span>
-              </div>
-            );
+            // [PATCH] Ẩn buffer khỏi danh sách hiển thị dạng công việc —
+            // buffer không phải là một công việc.
             return;
           }
 
@@ -10851,8 +10843,9 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
                   <span style={{ fontSize: 13, fontWeight: 600, color: skippedToday ? theme.textDim : theme.text,
                     textDecoration: checked ? "line-through" : "none" }}>
                     {skippedToday ? "⏭ " : checked ? "✅ " : ""}{it.isBigWin ? "⭐ " : it.isDeadlineTask ? "⏰ " : ""}
-                    {/* [PATCH v38] MỤC 4: format giờ cụ thể "🕐 HH:MM - HH:MM Tên (dur')" */}
-                    {it.start ? `🕐 ${it.start}${it.end ? " - " + it.end : ""} ` : ""}{it.name}{it.dur > 0 ? ` (${it.dur}')` : ""}
+                    {/* [PATCH] Yêu cầu: bỏ khung giờ/thời lượng khỏi hiển
+                        thị — chỉ còn tên công việc theo thứ tự ưu tiên. */}
+                    {it.name}
                   </span>
                 </div>
                 {!skippedToday && shortWhy && <div style={{ fontSize: 11, color: theme.textDim, marginTop: 3 }}>💡 {shortWhy}</div>}
