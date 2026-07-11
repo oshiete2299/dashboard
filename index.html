@@ -10629,6 +10629,22 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // reduce/increase ưu tiên (MỤC 3). Chạy lại mỗi khi danh sách item đổi.
   // [PATCH v30] cũng lưu lại toàn bộ skipList vào skipListAll để phần
   // "📊 Phân tích 30 ngày qua" phía dưới dùng chung, không tải 2 lần.
+  //
+  // [FIX FREEZE] BUG NGHIÊM TRỌNG đã sửa: effect này trước đây phụ thuộc
+  // trực tiếp vào `routeItems` — nhưng routeItems là kết quả useMemo tạo
+  // MẢNG MỚI mỗi lần render (đặc biệt khi chưa có plan: routeItemsBase trả
+  // về `[]` mới toanh mỗi lần, vì `[] !== []` trong JS dù nội dung giống
+  // hệt nhau). Hậu quả: MỌI lần re-render của SmartSchedule (tức là MỌI
+  // lần bấm bất kỳ nút nào trong toàn app, vì Today re-render kéo theo)
+  // đều khiến effect này chạy lại → gọi loadSkipHistory() (đọc storage,
+  // bất đồng bộ) → setSkipAnalysis/setSkipListAll → gây re-render → lại
+  // tạo routeItems mới → effect chạy lại → ... → vòng lặp vô hạn, mỗi
+  // vòng đều gọi storage, khiến trang bị đơ hoàn toàn chỉ sau 1 lần chạm.
+  // Sửa: đổi dependency sang latestEntryId (chỉ đổi khi THỰC SỰ có kế
+  // hoạch AI mới) kèm số lượng item (đề phòng kéo-thả/thêm task thủ công
+  // đổi thứ tự/số lượng mà không đổi latestEntryId) — cả hai đều là giá
+  // trị nguyên thuỷ ổn định, không tạo reference mới mỗi render.
+  const routeItemsSignature = routeItems.length + ":" + routeItems.map(it => it.key).join(",");
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -10643,7 +10659,8 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       setSkipListAll(list);
     })();
     return () => { cancelled = true; };
-  }, [routeItems]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestEntryId, routeItemsSignature]);
 
   // ── "Làm lại" — tính lại toàn bộ lịch từ giờ hiện tại. Gọi thẳng cùng
   // pipeline MorningWidget dùng (runAiPlannerPipeline → aiPlannerCore.js),
