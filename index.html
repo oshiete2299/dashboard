@@ -1088,7 +1088,13 @@ function runPlannerEngine(ctx, rawResult, dayLog){
 
   let oneBigWin = null;
   if(tasks.length){
-    const sorted = [...tasks].sort((a,b)=> (b.priority==="high")-(a.priority==="high"));
+    // Loại task Routine cố định (isFixedRoutine) khỏi ứng viên One Big
+    // Win — Routine không phải việc AI đề xuất, không nên trở thành "việc
+    // lớn nhất trong ngày". Nếu sau khi loại không còn task nào, giữ
+    // nguyên hành vi fallback hiện tại (dùng lại toàn bộ tasks).
+    const bigWinCandidates = tasks.filter(t => !t.isFixedRoutine);
+    const poolForBigWin = bigWinCandidates.length ? bigWinCandidates : tasks;
+    const sorted = [...poolForBigWin].sort((a,b)=> (b.priority==="high")-(a.priority==="high"));
     const bigWinReasonNode = rawResult.tasks.length ? rawResult.bigWin : null;
     oneBigWin = {
       label: sorted[0].name,
@@ -2458,7 +2464,7 @@ async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts
 
   // [PATCH v39] previewMode: KHÔNG ghi storage (không appendEntry) — trả
   // về 1 bucket "today" giả cùng shape (entries: [entry]) để UI xem thử có
-  // thể tái dùng nguyên component hiển thị cũ (AIPlannerEntryCard/schedule)
+  // thể tái dùng nguyên component hiển thị cũ (PlannerRunLogCard/schedule)
   // mà không cần nhánh hiển thị riêng.
   const previewEntry = { id: "preview_" + Date.now(), createdAt: new Date().toISOString(), ctx, result, trace, regenReason, plannerOutput, isPreview: true };
   if (previewMode) {
@@ -4175,7 +4181,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
   // [PATCH v39] MỤC 1: chạy pipeline ở previewMode với draft rules chưa
   // lưu — không đụng storage, không đổi `today`/streak thật. Trả về
   // bucket "today" giả (entries: [1 entry preview]) để PreviewModal hiển
-  // thị bằng đúng component AIPlannerEntryCard/schedule đã có sẵn.
+  // thị bằng đúng component PlannerRunLogCard/schedule đã có sẵn.
   const runPreview = async (draftOverrides) => {
     if (!form) return null;
     const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
@@ -4213,9 +4219,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
       } catch {}
     } catch (e) {
       console.error("[AI Planner Beta] run failed:", e);
-      // [TEMP DEBUG] hiện chi tiết lỗi thật ra UI để chẩn đoán — xoá dòng
-      // message/stack sau khi debug xong, khôi phục lại thông báo gốc.
-      setErrorMsg("Có lỗi khi chạy AI Planner. Dữ liệu chưa được lưu — thử lại được. [DEBUG: " + (e?.message || String(e)) + "] STACK: " + (e?.stack || "N/A"));
+      setErrorMsg("Có lỗi khi chạy AI Planner. Dữ liệu chưa được lưu — thử lại được.");
     } finally {
       setRunning(false);
     }
@@ -4473,7 +4477,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
       )}
 
       {today && [...today.entries].reverse().map((entry, idx) => (
-        <AIPlannerEntryCard key={entry.id} entry={entry} isLatest={idx === 0} theme={theme} accent={accent} />
+        <PlannerRunLogCard key={entry.id} entry={entry} isLatest={idx === 0} theme={theme} accent={accent} />
       ))}
 
       {/* [PATCH v36] MỤC 2: form thêm/sửa/xoá task cố định. */}
@@ -4571,7 +4575,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
 // ════════════════════════════════════════════════════════════════════════
 // [PATCH v39] MỤC 1 — PreviewModal: chạy runAiPlannerPipeline({previewMode:
 // true, draftOverrides}) khi mở, hiển thị kết quả ngay bằng chính
-// AIPlannerEntryCard đã có sẵn (isPreview không đổi cách render, chỉ đổi
+// PlannerRunLogCard đã có sẵn (isPreview không đổi cách render, chỉ đổi
 // nhãn tiêu đề modal + không cho lưu). Nhận thêm `conflictWarnings` (từ
 // detectRuleConflicts trên draftOverrides.conditionRules, tính bởi cha) để
 // hiển thị NGAY TRÊN modal — không tính lại conflict ở đây (giữ component
@@ -4626,7 +4630,7 @@ function PreviewModal({ onClose, runPreview, draftOverrides, conflictWarnings, t
         {loading && <div style={{ fontSize: 12, color: theme.textDim, textAlign: "center", padding: 20 }}>Đang tính thử lịch…</div>}
         {error && <div style={{ fontSize: 12, color: theme.danger, textAlign: "center", padding: 20 }}>{error}</div>}
         {!loading && !error && previewToday && previewToday.entries.map(entry => (
-          <AIPlannerEntryCard key={entry.id} entry={entry} isLatest theme={theme} accent={accent} />
+          <PlannerRunLogCard key={entry.id} entry={entry} isLatest theme={theme} accent={accent} />
         ))}
 
         <button onClick={onClose}
@@ -4639,7 +4643,7 @@ function PreviewModal({ onClose, runPreview, draftOverrides, conflictWarnings, t
   );
 }
 
-function AIPlannerEntryCard({ entry, isLatest, theme, accent }) {
+function PlannerRunLogCard({ entry, isLatest, theme, accent }) {
   const [traceOpen, setTraceOpen] = useState(false);
   const { result, plannerOutput, regenReason } = entry;
 
@@ -4660,44 +4664,6 @@ function AIPlannerEntryCard({ entry, isLatest, theme, accent }) {
 
       <div style={{ fontWeight: 700, fontSize: 14, color: theme.text, marginBottom: 6 }}>{result.verdict}</div>
       <div style={{ fontSize: 13, color: theme.text, marginBottom: 10, lineHeight: 1.5 }}>{result.message}</div>
-
-      {plannerOutput.oneBigWin && (
-        <div style={{ background: theme.bg, borderRadius: 10, padding: 10, marginBottom: 8 }}>
-          <div style={{ fontSize: 11, color: accent, fontWeight: 700, marginBottom: 3 }}>⭐ One Big Win</div>
-          <div style={{ fontSize: 13, color: theme.text }}>{plannerOutput.oneBigWin.label}</div>
-          <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>{plannerOutput.oneBigWin.why}</div>
-        </div>
-      )}
-
-      {plannerOutput.tasks && plannerOutput.tasks.length > 0 && (
-        <div style={{ marginBottom: 8 }}>
-          {plannerOutput.tasks.map((t, i) => (
-            <div key={i} style={{ borderLeft: `3px solid ${aiPlannerPriorityClass(t.priority)}`, paddingLeft: 8, marginBottom: 8 }}>
-              <div style={{ fontSize: 13, color: theme.text, fontWeight: 600 }}>{t.name} <span style={{ color: theme.textDim, fontWeight: 400 }}>({t.dur}')</span></div>
-              <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>{t.why}</div>
-              <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>✓ {t.doneWhen}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {plannerOutput.backupPlan && (
-        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 8 }}>
-          🛟 Backup: {plannerOutput.backupPlan.label} — {plannerOutput.backupPlan.why}
-        </div>
-      )}
-
-      {plannerOutput.schedule && plannerOutput.schedule.length > 0 && (
-        <div style={{ marginBottom: 8 }}>
-          <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 4 }}>📅 Lịch trình</div>
-          {plannerOutput.schedule.map((b, i) => (
-            <div key={i} style={{ fontSize: 11, color: b.type === "fixed" ? theme.textDim : theme.text, display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
-              <span>{b.start}–{b.end}</span>
-              <span>{b.name}{b.type === "buffer" ? " (nghỉ)" : ""}</span>
-            </div>
-          ))}
-        </div>
-      )}
 
       {plannerOutput.warnings && plannerOutput.warnings.length > 0 && (
         <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 8, lineHeight: 1.5 }}>
@@ -8644,50 +8610,12 @@ function AISuggestionsCard({ td, data, taskPool, db, plannerStorage, plannerToda
   const accent = useContext(AccentContext);
   const [collapsed, setCollapsed] = useState(false);
   const [toast, setToast] = useState(null);
-  // [TEMP DEBUG] load thêm history phòng trường hợp entry 11:34 đã bị
-  // rotateDay() archive sang ngày hôm trước — chỉ đọc, không ghi gì.
-  const [__debugHistory, __setDebugHistory] = useState(null);
-  useEffect(() => {
-    let alive = true;
-    if (plannerStorage?.loadHistory) {
-      plannerStorage.loadHistory().then(h => { if (alive) __setDebugHistory(h); }).catch(() => {});
-    }
-    return () => { alive = false; };
-  }, [plannerStorage]);
 
   const entryCount = plannerToday?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? plannerToday.entries[entryCount - 1] : null;
   const plannerOutput = latestEntry?.plannerOutput || null;
   const oneBigWin = plannerOutput?.oneBigWin || null;
   const allTasks = plannerOutput?.tasks || [];
-
-  // ════════════════════════════════════════════════════════════════════
-  // [TEMP DEBUG — theo yêu cầu Gia Bảo, KHÔNG đổi logic, chỉ log/hiển thị]
-  // In toàn bộ plannerOutput.tasks với đúng các field cần audit. Xoá khối
-  // này (và <DebugTasksPanel> bên dưới JSX) sau khi debug xong.
-  // ════════════════════════════════════════════════════════════════════
-  const __debugTaskRows = allTasks.map((t, i) => ({
-    idx: i,
-    name: t.name,
-    why: t.why,
-    isFixedRoutine: t.isFixedRoutine, // sẽ in "undefined" thật nếu field không tồn tại
-    source: t.source,
-    category: t.category,
-    type: t.type,
-    origin: t.origin,
-    dur: t.dur,
-    icon: t.icon,
-    color: t.color,
-  }));
-  console.log("[DEBUG plannerOutput.tasks] entryCount=", entryCount, "latestEntry.id=", latestEntry?.id, "latestEntry.createdAt=", latestEntry?.createdAt);
-  console.log("[DEBUG plannerOutput.tasks] full JSON:\n" + JSON.stringify(__debugTaskRows, null, 2));
-  // [TEMP DEBUG] thêm — tại sao tasks rỗng: skippedTasks/warnings/caps/trace
-  console.log("[DEBUG plannerOutput EXTRA] skippedTasks=", JSON.stringify(plannerOutput?.skippedTasks, null, 2));
-  console.log("[DEBUG plannerOutput EXTRA] warnings=", JSON.stringify(plannerOutput?.warnings, null, 2));
-  console.log("[DEBUG plannerOutput EXTRA] oneBigWin=", JSON.stringify(plannerOutput?.oneBigWin, null, 2));
-  console.log("[DEBUG plannerOutput EXTRA] planningTrace=", JSON.stringify(plannerOutput?.planningTrace, null, 2));
-  console.log("[DEBUG plannerOutput EXTRA] latestEntry.ctx=", JSON.stringify(latestEntry?.ctx, null, 2));
-  console.log("[DEBUG plannerOutput EXTRA] latestEntry.result.caps=", JSON.stringify(latestEntry?.result?.caps, null, 2));
 
   // Chỉ AI task thật — bỏ Routine (isFixedRoutine) và bỏ chính oneBigWin
   // (oneBigWin có nút Áp dụng riêng, không lặp lại trong danh sách dưới).
@@ -8736,87 +8664,13 @@ function AISuggestionsCard({ td, data, taskPool, db, plannerStorage, plannerToda
     save(td, { bigGoalsToday: [...todayBigGoals, { id: "bg_"+Date.now(), text: oneBigWin.label, done: false }] });
   };
 
-  // ════════════════════════════════════════════════════════════════════
-  // [TEMP DEBUG UI — theo yêu cầu Gia Bảo] Panel hiển thị TOÀN BỘ entries
-  // trong plannerToday.entries (không chỉ entry cuối), mỗi entry kèm giờ
-  // tạo thật + toàn bộ task bên trong, để tìm đúng entry tương ứng lúc
-  // 11:34. Render TRƯỚC early-return bên dưới để không bị ẩn khi
-  // suggestions rỗng. Chỉ đọc, không đổi state/logic. Xoá khối
-  // <div id="__debug-tasks-panel"> này sau khi debug xong.
-  // ════════════════════════════════════════════════════════════════════
-  const allEntries = plannerToday?.entries || [];
-  const debugPanel = (
-    <div id="__debug-tasks-panel" style={{ background: "#1a1a1a", color: "#0f0", fontFamily: "monospace", fontSize: 11, padding: 10, borderRadius: 8, marginBottom: 14, border: "2px solid #f00", overflowX: "auto" }}>
-      <div style={{ color: "#ff0", fontWeight: 700, marginBottom: 6 }}>
-        🐞 DEBUG — tổng số entries hôm nay: {allEntries.length}
-      </div>
-      {allEntries.length === 0 && <div style={{ color: "#f66" }}>plannerToday.entries = [] (chưa có entry nào hôm nay)</div>}
-      {allEntries.map((entry, ei) => {
-        const eOutput = entry?.plannerOutput || null;
-        const eTasks = eOutput?.tasks || [];
-        const dinnerTasks = eTasks.filter(t => (t.name || "").includes("Ăn tối"));
-        return (
-          <div key={entry.id || ei} style={{ border: "1px solid #555", borderRadius: 6, padding: 8, marginBottom: 10 }}>
-            <div style={{ color: "#0ff", fontWeight: 700 }}>
-              ── Entry #{ei} — id={String(entry?.id)} — tạo lúc: {entry?.createdAt ? new Date(entry.createdAt).toLocaleString() : "N/A"} ──
-            </div>
-            <div style={{ color: "#aaa" }}>tổng số task trong entry này: {eTasks.length}</div>
-            {dinnerTasks.length > 0 ? (
-              dinnerTasks.map((t, ti) => (
-                <pre key={ti} style={{ whiteSpace: "pre-wrap", color: "#0f0", marginTop: 4 }}>
-{`  >>> TÌM THẤY "Ăn tối" #${ti} <<<
-  name: ${JSON.stringify(t.name)}
-  why: ${JSON.stringify(t.why)}
-  isFixedRoutine: ${t.isFixedRoutine === undefined ? "undefined" : JSON.stringify(t.isFixedRoutine)}
-  source: ${t.source === undefined ? "undefined" : JSON.stringify(t.source)}
-  category: ${t.category === undefined ? "undefined" : JSON.stringify(t.category)}
-  type: ${t.type === undefined ? "undefined" : JSON.stringify(t.type)}
-  origin: ${t.origin === undefined ? "undefined" : JSON.stringify(t.origin)}
-  dur: ${JSON.stringify(t.dur)}  icon: ${JSON.stringify(t.icon)}  color: ${JSON.stringify(t.color)}
-  [tất cả keys thật]: ${JSON.stringify(Object.keys(t))}`}
-                </pre>
-              ))
-            ) : (
-              <div style={{ color: "#666" }}>(entry này không có task "Ăn tối")</div>
-            )}
-          </div>
-        );
-      })}
-      {__debugHistory && __debugHistory.days && __debugHistory.days.length > 0 && (
-        <div style={{ marginTop: 12, borderTop: "2px solid #f00", paddingTop: 8 }}>
-          <div style={{ color: "#ff0", fontWeight: 700 }}>📦 HISTORY (các ngày đã archive) — {__debugHistory.days.length} ngày</div>
-          {__debugHistory.days.map((day, di) => (
-            <div key={di} style={{ marginTop: 6 }}>
-              <div style={{ color: "#0ff" }}>Ngày: {day.date} — số entries: {(day.entries||[]).length}</div>
-              {(day.entries||[]).map((entry, ei) => {
-                const eTasks = entry?.plannerOutput?.tasks || [];
-                const dinnerTasks = eTasks.filter(t => (t.name || "").includes("Ăn tối"));
-                if (!dinnerTasks.length) return null;
-                return dinnerTasks.map((t, ti) => (
-                  <pre key={ei+"_"+ti} style={{ whiteSpace: "pre-wrap", color: "#0f0", marginTop: 4 }}>
-{`  >>> [History ${day.date}] Entry lúc ${entry?.createdAt ? new Date(entry.createdAt).toLocaleString() : "N/A"} — TÌM THẤY "Ăn tối" <<<
-  name: ${JSON.stringify(t.name)}
-  why: ${JSON.stringify(t.why)}
-  isFixedRoutine: ${t.isFixedRoutine === undefined ? "undefined" : JSON.stringify(t.isFixedRoutine)}
-  [tất cả keys thật]: ${JSON.stringify(Object.keys(t))}`}
-                  </pre>
-                ));
-              })}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
-  if (!plannerOutput || (!suggestions.length && !oneBigWin)) return debugPanel || null; // [TEMP DEBUG] trả debugPanel thay vì null để vẫn thấy log khi card gốc ẩn
+  if (!plannerOutput || (!suggestions.length && !oneBigWin)) return null;
 
   const isApplied = (t) => existingNames.has(normalizeTaskName(t.name));
   const bigWinApplied = oneBigWin && bigGoalNames.has(normalizeTaskName(oneBigWin.label));
 
   return (
     <>
-    {debugPanel}
     <div style={{ background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14, border: `1px solid ${theme.border}`, position: "relative" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: collapsed?0:10 }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>🤖 AI đề xuất</span>
@@ -9938,7 +9792,6 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
         extraEvents: [],
       });
 
-      setCheckedTasks({});
       setAppliedAt(null);
       setLastUpdatedAt(null);
       // [PATCH] reset form chọn (slider/nút/chip) khi sang ngày mới, thay
@@ -10028,7 +9881,6 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
         }
       }
       setToday(updatedToday);
-      setCheckedTasks({});
       setAppliedAt(null);
       setCheckinOpen(false);
       if (isUpdate) setLastUpdatedAt(new Date());
