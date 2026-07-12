@@ -86,6 +86,52 @@ const TAB_COLORS = {
 const AccentContext = createContext(null);
 const MediaContext = createContext(null);
 
+// ── PLANNER RUNTIME CONTEXT (PR0.1 tạo khung, PR0.2 gắn dữ liệu thật) ──────
+// Khung sườn cho việc hợp nhất plannerStorage/plannerToday giữa Today (tab 0)
+// và AIPlannerBeta (tab 11) — xem V42_Master_Roadmap.md, finding A1.
+// PR0.2: Provider giờ SỞ HỮU plannerStorage + plannerToday thật, chuyển
+// nguyên logic rotateDay vốn nằm trong Today sang đây (không đổi hành vi).
+// AIPlannerBeta CHƯA đọc Context này (đó là phạm vi PR0.3) — vẫn tự tạo
+// storage riêng như cũ.
+const PlannerRuntimeContext = createContext(null);
+
+function PlannerRuntimeProvider({ children }) {
+  // plannerStorage: 1 instance duy nhất cho vòng đời Provider — y hệt
+  // useMemo(() => createPlannerStorage(S), []) trước đây nằm trong Today.
+  const plannerStorage = useMemo(() => createPlannerStorage(S), []);
+  const [plannerToday, setPlannerToday] = useState(null);
+
+  // td tính bằng toISO() ngay tại Provider — cùng hàm thuần App dùng để tính
+  // td cho toàn app, nên cho cùng giá trị trong cùng 1 lượt render/ngày.
+  // Provider nằm phía trên Today trong cây nên không thể nhận td qua prop;
+  // tự tính tại đây giữ Provider độc lập đúng như roadmap yêu cầu.
+  const td = toISO();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const rotated = await plannerStorage.rotateDay(td);
+      if (!cancelled) setPlannerToday(rotated);
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [td]);
+
+  // value memo hoá để tránh re-render thừa ở mọi consumer khi Provider
+  // re-render vì lý do khác plannerStorage/plannerToday (plannerStorage
+  // không đổi sau lần đầu nên chỉ phụ thuộc thực sự là plannerToday).
+  const value = useMemo(
+    () => ({ plannerStorage, plannerToday, setPlannerToday }),
+    [plannerStorage, plannerToday]
+  );
+
+  return (
+    <PlannerRuntimeContext.Provider value={value}>
+      {children}
+    </PlannerRuntimeContext.Provider>
+  );
+}
+
 // ── THEMES ─────────────────────────────────────────────────────────────────
 // Mỗi theme có 5 token màu chính dùng xuyên suốt UI:
 //   primary   - nút chính, tiêu đề lớn, số liệu XP/Level/Streak, điểm nhấn mạnh nhất
@@ -1641,6 +1687,832 @@ function buildScheduleV33(tasks, ctx) {
   return schedule;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   [V42 PR1.1] TIMELINE OVERRIDE LAYER — nền tảng, HÀM THUẦN, CHƯA GẮN UI
+   ══════════════════════════════════════════════════════════════════════
+   Phạm vi PR1.1 (đúng V42_Master_Roadmap.md, Phase 1):
+     - CHỈ định nghĩa data model + applyTimelineOverrides() (pure function).
+     - KHÔNG render UI, KHÔNG drag/drop, KHÔNG resize, KHÔNG reflow thật
+       (delta luôn 0 ở PR này vì chưa ai ghi doneAt lệch giờ dự kiến).
+     - KHÔNG đổi buildScheduleV33/enrichTasksWithContext/aiPlannerCore.js.
+     - KHÔNG đổi PlannerRuntimeContext/PlannerStorage/buildPlannerForm.
+     - CHƯA có component nào import/gọi các hàm dưới đây — cô lập hoàn
+       toàn, đúng nguyên tắc "code đứng riêng, test bằng dữ liệu giả".
+
+   3.2 Timeline Override Layer (thiết kế §10.3.2 trong roadmap):
+   Một cấu trúc MỚI, lưu theo ngày, TÁCH BIỆT hoàn toàn khỏi AI Planner
+   storage (v25:/v33:/v37:/v38:) và khỏi schema db[date] cũ (dailyPicks/
+   poolDone/bigGoalsToday/timelineDone không đổi field, không đổi shape).
+   PR1.1 chỉ định nghĩa SHAPE của layer này + hàm merge thuần; việc thật
+   sự đọc/ghi state (useTimelineOverrides hook) thuộc PR1.3, không phải
+   PR này.
+
+   Shape của Timeline Override Layer (dữ liệu 1 ngày):
+   {
+     blocks: {
+       // key = doneKey kiểu "start|tên" (đúng tiền lệ doneKey đã dùng ở
+       // timelineDone hiện có — KHÔNG phát minh key mới, để về sau map
+       // 1-1 với timelineDone nếu cần đối chiếu).
+       [doneKey]: {
+         durOverride: number | null,  // phút, ghi đè dur gốc nếu đã resize (PR2.x)
+         pinned: boolean,             // ghim — Reflow không đẩy giờ (PR2.3)
+         doneAt: string | null,       // "HH:MM" thời điểm tick thực tế (PR3.x)
+       }
+     },
+     goals: {
+       // key = goalId (id sẵn có trong dailyPicks) — DUY NHẤT nơi goal có
+       // khái niệm thời gian; bản thân dailyPicks/poolDone KHÔNG đổi.
+       [goalId]: { start: string, dur: number }  // (PR4.x)
+     }
+   }
+   Ở PR1.1, layer luôn ở dạng rỗng: { blocks: {}, goals: {} } — chưa ai
+   sinh ra override thật (chưa có gesture nào tồn tại), nên mọi field
+   phía trên chỉ là ĐỊNH NGHĨA SHAPE, chưa có luồng ghi.
+
+   Vì sao dùng object-keyed-by-doneKey thay vì mảng:
+     - doneKey ("start|tên") đã là tiền lệ ổn định trong timelineDone —
+       tái dùng để không tạo thêm một sơ đồ khoá song song.
+     - Lookup O(1) khi applyTimelineOverrides merge từng block của
+       schedule[] (tránh .find() trong vòng lặp — schedule có thể vài
+       chục block/ngày, không đáng kể về hiệu năng nhưng object-key vẫn
+       là lựa chọn rẻ và rõ ràng hơn mảng khi merge 1-1 theo khoá).
+     - goals tách khỏi blocks vì goal không có mặt trong schedule[] gốc
+       (schedule[] chỉ do buildScheduleV33 sinh từ tasks/fixedEvents) —
+       gộp chung sẽ làm applyTimelineOverrides phải đoán loại record.
+   ────────────────────────────────────────────────────────────────────── */
+
+// [V42 PR1.1] Override rỗng chuẩn cho 1 ngày chưa có tương tác gì — dùng
+// làm giá trị khởi tạo cho useTimelineOverrides (PR1.3) và làm input mặc
+// định khi gọi applyTimelineOverrides mà chưa có Override Layer thật.
+function createEmptyTimelineOverrideLayer() {
+  return { blocks: {}, goals: {} };
+}
+
+// [V42 PR1.1] doneKey ổn định "start|tên" — tái dùng đúng công thức đã có
+// tiền lệ ở timelineDone (xem SmartSchedule, dòng ~10506) để Override
+// Layer và timelineDone luôn nói cùng một "ngôn ngữ khoá" cho cùng 1 block.
+function timelineBlockKey(block) {
+  return `${block.start}|${block.name}`;
+}
+
+// [V42 PR1.1] applyTimelineOverrides(schedule, overrideLayer) — HÀM THUẦN.
+// Nhận schedule[] gốc (output buildScheduleV33, KHÔNG đổi) + Override
+// Layer (có thể rỗng/undefined), trả về finalRenderBlocks[] — danh sách
+// block cuối cùng để vẽ lên UI (ở các PR sau; PR1.1 CHƯA có UI nào gọi
+// hàm này).
+//
+// Điều kiện hoàn thành PR1.1 (đúng roadmap): với overrideLayer rỗng,
+// applyTimelineOverrides(schedule, {}) phải cho ra kết quả TƯƠNG ĐƯƠNG cấu
+// trúc mà SmartSchedule hiện đang tự tính tay (timelineItems, xem dòng
+// ~10501-10512) — tức cùng lọc "fixed | buffer | (task && isFixedRoutine)"
+// và cùng field name/start/end/isBuffer/isFixed/doneKey. Hàm này KHÔNG
+// tự áp field `color` phụ thuộc theme (vì đó là chi tiết trình bày của
+// component, không phải của layer dữ liệu) — SmartSchedule ở PR1.3 sẽ tự
+// map thêm color khi tiêu thụ finalRenderBlocks[], y hệt cách nó đang
+// làm với timelineItems hiện tại.
+//
+// [V42 PR3.2] CẬP NHẬT: giờ ĐÃ tính Reflow thật (trước đó ở PR1.1/PR1.3/
+// PR2.x delta luôn 0 vì chưa ai ghi doneAt). Xem reflowTimelineBlocks()
+// ngay dưới hàm này để biết chi tiết thuật toán — applyTimelineOverrides
+// chỉ gọi nó như bước cuối cùng, không tự chứa logic dịch chuyển.
+//
+// PR3.2 CHƯA merge goal vào timeline (goals luôn để nguyên trong dải
+// "chưa xếp giờ" — đó là việc của PR4.x).
+// [V42 PR4.2] taskPool (tham số THỨ 3, TÙY CHỌN — mặc định undefined→[])
+// được thêm để applyTimelineOverrides có thể tra tên/icon của goal (layer.
+// goals chỉ lưu {start,dur} theo đúng schema PR1.1, KHÔNG có tên — tên goal
+// sống trong taskPool, nguồn chân lý cũ, không đổi). Mọi call site CŨ gọi
+// applyTimelineOverrides(schedule, overrideLayer) — 2 tham số — vẫn hoạt
+// động y hệt trước: tham số thứ 3 optional, khi thiếu thì
+// scheduledGoalBlocks rỗng, hàm trả về đúng kết quả cũ (không đổi hành vi
+// khi không truyền taskPool).
+// [BUGFIX / Edge case #7] dailyPicks (tham số THỨ 4, TÙY CHỌN — mặc định
+// undefined→bỏ qua check). Trước bugfix này, goalBlocks chỉ lọc theo
+// taskPool[goalId] tồn tại hay không. Khi người dùng xoá 1 goal khỏi
+// TodaysGoalsCard bằng nút × (removeTodayGoal → data.dailyPicks mất id đó),
+// goal đó KHÔNG bị xoá khỏi taskPool (taskPool là kho chung, dailyPicks mới
+// là "hôm nay có việc này không") — nên goalOverrides[goalId] vẫn còn (vì
+// removeTodayGoal không dọn overrideLayer.goals), và t = poolById[goalId]
+// vẫn tồn tại → block ma vẫn hiển thị trên Timeline kèm checkbox hoạt động
+// dù đã bị xoá khỏi "Nhiệm vụ hôm nay". Khi dailyPicks được truyền vào, chỉ
+// giữ goalId nào vẫn còn trong dailyPicks hôm nay — đúng ý nghĩa "goal đã bị
+// xoá khỏi TodaysGoalsCard thì block tương ứng trên timeline phải tự biến
+// mất" (roadmap Edge case #7). Khi KHÔNG truyền dailyPicks (call site cũ),
+// hành vi giữ nguyên y hệt trước bugfix — không đổi gì cho call site chưa
+// cập nhật.
+function applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks) {
+  const layer = overrideLayer || createEmptyTimelineOverrideLayer();
+  const blockOverrides = layer.blocks || {};
+
+  const localBlocks = (schedule || [])
+    .filter(b => b.type === "fixed" || b.type === "buffer" || (b.type === "task" && b.isFixedRoutine))
+    .map((b, i) => {
+      const doneKey = timelineBlockKey(b);
+      const override = blockOverrides[doneKey] || null;
+
+      // [PR1.1] durOverride/pinned/doneAt được ĐỌC ở đây để hàm đã sẵn
+      // sàng nhận override thật từ PR2.x/PR3.x trở đi.
+      // [V42 PR2.1] durOverride giờ được ÁP DỤNG THẬT (từ PR2.1 trở đi)
+      // khi người dùng resize — end được tính lại từ start gốc + dur mới.
+      const dur = override && typeof override.durOverride === "number"
+        ? override.durOverride
+        : (typeof b.dur === "number" ? b.dur : minutesBetweenHHMM(b.start, b.end));
+      const end = override && typeof override.durOverride === "number"
+        ? minutesToHHMMV33(parseTimeToMinutesV33(b.start) + dur)
+        : b.end;
+
+      return {
+        key: (b.type === "fixed" ? "fx" : b.type === "buffer" ? "buf" : "rt") + i,
+        doneKey,
+        name: b.name,
+        start: b.start,
+        end,
+        dur,
+        isBuffer: b.type === "buffer",
+        isFixed: b.type === "fixed",
+        pinned: !!(override && override.pinned),
+        doneAt: (override && override.doneAt) || null,
+        // sourceColor: màu gốc do buildScheduleV33/enrichTasksWithContext
+        // gán (nếu có) — đổi tên khỏi `color` có chủ đích, để không đụng
+        // độ ưu tiên "theme.textDim cho buffer" mà SmartSchedule tự quyết
+        // định ở lớp trình bày (xem ghi chú điều kiện hoàn thành ở trên).
+        sourceColor: b.color || null,
+      };
+    });
+
+  // [V42 PR3.2] Bước Reflow — xem reflowTimelineBlocks() để biết thuật
+  // toán chi tiết. Đây là bước CUỐI CÙNG của applyTimelineOverrides, chạy
+  // sau khi durOverride (PR2.1/resize) đã được áp — Reflow dịch cả
+  // start/end dựa trên delta đọc từ doneAt, KHÔNG đổi lại dur của bất kỳ
+  // block nào (dur giữ nguyên, chỉ start/end trượt theo thời gian).
+  // [V42 PR4.2] QUAN TRỌNG: reflowTimelineBlocks() CHỈ nhận localBlocks
+  // (Routine/Fixed/Buffer) — goal KHÔNG được đưa vào input của Reflow, để
+  // không sửa/không ảnh hưởng hành vi Reflow đã chốt ở PR3.2/3.3/3.4 theo
+  // đúng yêu cầu phạm vi PR4.2 ("Không sửa Reflow"). Goal được merge vào
+  // SAU khi Reflow đã chạy xong trên block thường.
+  const reflowedBlocks = reflowTimelineBlocks(localBlocks);
+
+  // [V42 PR4.2] Merge Goal đã gán giờ (overrideLayer.goals, schema PR1.1,
+  // KHÔNG đổi) thành block hiển thị trên timeline — hoàn toàn TÁCH biệt
+  // khỏi pipeline Routine/Fixed/Buffer/Reflow phía trên:
+  //   - Không đi qua filter dòng ~1786 (goal không có mặt trong schedule[]
+  //     gốc — đúng đúng comment PR1.1 "goal không có mặt trong schedule[]
+  //     gốc").
+  //   - Không đi qua reflowTimelineBlocks — goal không pin, không doneAt,
+  //     không bị dịch chuyển bởi delta tick sớm/trễ của Routine (đúng yêu
+  //     cầu "Không sửa Reflow" — Reflow hoàn toàn không biết goal tồn tại).
+  //   - Không có resize/pin handle (PR2.x không áp dụng cho goal — đúng
+  //     "Không sửa Resize/Pin", "Chưa làm: resize goal, pin goal" của
+  //     PR4.2).
+  // taskPool dùng để tra tên/icon hiển thị (layer.goals chỉ lưu {start,dur}
+  // theo schema PR1.1) — nếu thiếu taskPool hoặc goalId không còn tồn tại
+  // trong taskPool (đã bị xoá khỏi Kho việc nhỏ), bỏ qua an toàn, không
+  // tạo block "tên rỗng" (tương tự cách TodaysGoalsCard/UnscheduledGoalsLane
+  // đã tự bỏ qua goal đã xoá khỏi taskPool).
+  const goalOverrides = layer.goals || {};
+  const poolById = Object.fromEntries((taskPool || []).map(t => [t.id, t]));
+  // [BUGFIX / Edge case #7] Chỉ dùng để LOẠI bớt (không mở rộng tập hợp) —
+  // nếu dailyPicks không được truyền (undefined), dailyPicksSet là null và
+  // điều kiện bên dưới bỏ qua check này hoàn toàn (giữ đúng hành vi cũ).
+  const dailyPicksSet = Array.isArray(dailyPicks) ? new Set(dailyPicks) : null;
+  const goalBlocks = Object.keys(goalOverrides)
+    .map(goalId => {
+      const g = goalOverrides[goalId];
+      const t = poolById[goalId];
+      if (!g || !t || typeof g.start !== "string" || typeof g.dur !== "number") return null;
+      if (dailyPicksSet && !dailyPicksSet.has(goalId)) return null;
+      const end = minutesToHHMMV33(parseTimeToMinutesV33(g.start) + g.dur);
+      return {
+        key: "goal_" + goalId,
+        doneKey: null, // goal không dùng doneKey (không đi qua timelineDone/toggleTimelineItem cũ — tick goal vẫn qua poolDone, xem SmartSchedule)
+        goalId,
+        name: t.l,
+        start: g.start,
+        end,
+        dur: g.dur,
+        isBuffer: false,
+        isFixed: false,
+        isGoal: true,
+        pinned: false,
+        doneAt: null,
+        overflow: false, // goal chưa qua Reflow → không có khái niệm overflow ở PR4.2
+        sourceColor: null,
+      };
+    })
+    .filter(Boolean);
+
+  if (goalBlocks.length === 0) return reflowedBlocks;
+
+  // Gộp rồi sắp theo `start` để hiển thị đúng thứ tự thời gian trên
+  // Timeline (reflowedBlocks vốn đã theo thứ tự thời gian của schedule[]
+  // gốc; chèn thêm goalBlocks rồi sort lại theo start là cách đơn giản
+  // nhất để giữ đúng thứ tự hiển thị mà không cần thuật toán chèn xen kẽ).
+  return [...reflowedBlocks, ...goalBlocks].sort(
+    (a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start)
+  );
+}
+
+
+
+// [V42 PR3.2] REFLOW ENGINE — hàm thuần, tách riêng khỏi applyTimelineOverrides
+// để dễ đọc/test độc lập. Nhận vào mảng block ĐÃ merge override (durOverride/
+// pinned/doneAt đã gắn sẵn trên từng phần tử, đúng shape do applyTimelineOverrides
+// tạo ra ở bước trên) — trả về mảng block MỚI với start/end đã dịch chuyển
+// theo delta tick sớm/trễ.
+//
+// Phạm vi PR3.2 (lịch sử — xem PR3.3/PR3.4 bên dưới để biết hành vi thật
+// hiện tại, phần này giữ lại làm nhật ký thiết kế):
+//   - Đọc doneAt từ từng block, tính delta = doneAt − end dự kiến của
+//     CHÍNH block đó (phút). Sớm hơn dự kiến → delta âm → các block sau
+//     dịch sớm lên. Trễ hơn dự kiến → delta dương → dịch trễ xuống.
+//   - dur của mỗi block GIỮ NGUYÊN khi bị đẩy — chỉ start/end trượt theo
+//     delta, không co giãn. Trả về mảng MỚI, KHÔNG mutate đầu vào.
+//   - Tại PR3.2, cờ `pinned` CHƯA được tôn trọng (mọi block phía sau đều
+//     dịch, kể cả block đã pin) — hành vi này đã được PR3.3 thay thế.
+//
+// [V42 PR3.3] Tôn trọng cờ `pinned`. Thuật toán: chia mảng block (đã sắp
+// theo thời gian, do applyTimelineOverrides truyền vào) thành các "phân
+// đoạn" ngăn cách bởi từng block pinned:
+//   - Block pinned: start/end giữ NGUYÊN 100% — không cộng phần dịch tích
+//     luỹ (cumulativeDeltaMin) từ các block TRƯỚC nó. Đây là điều kiện
+//     cốt lõi "block pinned không được dịch".
+//   - Block TRƯỚC 1 pin: vẫn dịch bình thường theo delta cộng dồn của các
+//     block chưa-pin trước đó — không bị pin phía sau ảnh hưởng gì (đúng
+//     yêu cầu "block trước pinned vẫn có thể dịch").
+//   - Block SAU 1 pin: dịch tiếp theo delta MỚI, bắt đầu lại từ 0 tại mốc
+//     pin đó (nếu pin có doneAt, delta phát sinh từ chính pin được cộng
+//     dồn cho các block sau nó — vì bản thân task đã pin xong sớm/trễ vẫn
+//     là một sự kiện thực tế cần phản ánh cho phần lịch phía sau nó; nếu
+//     pin không có doneAt, delta bắt đầu lại đúng bằng 0). Đây là ý nghĩa
+//     "block sau pinned tiếp tục dịch theo timeline mới".
+//   - reflowTimelineBlocks() vẫn là hàm thuần: không mutate mảng/object
+//     đầu vào, không đọc storage, không side-effect.
+//
+// [V42 PR3.4] Xử lý edge cases (không đổi cách tính delta/pin ở trên,
+// chỉ thêm bước clamp + đánh dấu `overflow` ở cuối mỗi block):
+//   - #1 Vượt giờ ngủ: nếu 1 block (không pinned) bị dịch tới mức đè lên
+//     giờ ngủ (23:30, hằng số cục bộ SLEEP_BOUNDARY_MIN — KHÔNG đọc
+//     ctx/setts, giữ hàm thuần) hoặc lên chính mốc pin kế tiếp — clamp vị
+//     trí hiển thị sát mốc chặn (giữ nguyên dur, không co giãn) và đánh
+//     dấu overflow:true, KHÔNG để minutesToHHMMV33 (dùng % 24) "quay
+//     vòng" hiển thị nhầm sang đầu ngày hôm sau.
+//   - Delta âm lớn: nếu start bị đẩy về trước 00:00, clamp về 0 và đánh
+//     dấu overflow:true (đối xứng với trường hợp vượt giờ ngủ ở đầu kia
+//     của trục thời gian).
+//   - Delta dương lớn / nhiều doneAt liên tiếp: đã được cumulativeDeltaMin
+//     cộng dồn đúng qua nhiều block trong cùng 1 lượt gọi (không cần xử
+//     lý thêm) — chỉ khác ở chỗ nếu tổng dịch vượt mốc chặn thì rơi vào
+//     đúng nhánh overflow ở trên.
+//   - resize + doneAt / resize + pin / doneAt + pin: không cần nhánh
+//     riêng — durOverride (resize) đã được applyTimelineOverrides áp vào
+//     `dur`/`end` TRƯỚC khi gọi hàm này (xem dòng gọi reflowTimelineBlocks
+//     ở applyTimelineOverrides), nên reflow luôn thấy đúng dur/end đã
+//     resize; pinned + doneAt cùng lúc đã xử lý ở nhánh "Pin có doneAt"
+//     bên trên.
+//   - Overlap: được ngăn bằng chính cơ chế clamp-tại-mốc-chặn (không có
+//     block nào được phép start sau mốc chặn của chính nó → không thể
+//     chồng lên block/pin phía sau nó).
+//   - End of day: mốc chặn mặc định (khi không còn pin nào phía sau) là
+//     SLEEP_BOUNDARY_MIN — block cuối ngày cũng bị clamp tại đây.
+//   - Khoảng thời gian không đủ: khi mốc chặn trừ dur của block cho ra vị
+//     trí start còn nhỏ hơn cả điểm bắt đầu đã dịch của chính nó, block
+//     đó chắc chắn overflow — hiển thị dur gốc đúng (không bị ép về 0)
+//     tại khu "Chưa xếp được" (UI đọc cờ overflow, phần render riêng).
+//   - reflowTimelineBlocks() KHÔNG throw, KHÔNG lọc bớt phần tử — mọi
+//     block đầu vào luôn có mặt ở đầu ra (đủ số lượng), overflow chỉ là 1
+//     cờ đọc thêm, không làm block "biến mất âm thầm".
+function reflowTimelineBlocks(blocks) {
+  if (!Array.isArray(blocks) || blocks.length === 0) return blocks || [];
+
+  // [PR3.4] Ranh giới giờ ngủ dùng làm mốc "hết ngày hợp lệ" cho Reflow —
+  // giữ đúng giá trị "23:30" đã dùng làm sleepAt trong phần build lịch AI
+  // gốc (dòng ~1067). Reflow là lớp override SAU khi lịch đã sinh, không
+  // đọc lại ctx/setts, nên dùng hằng số cố định tương đương thay vì mở
+  // rộng chữ ký hàm (đúng nguyên tắc "không đổi chữ ký hàm thuần").
+  const SLEEP_BOUNDARY_MIN = parseTimeToMinutesV33("23:30");
+
+  // [PR3.4] Với mỗi index i, tính trước mốc chặn kế tiếp: start GỐC (chưa
+  // dịch) của block pinned gần nhất phía sau i (hoặc SLEEP_BOUNDARY_MIN
+  // nếu không còn pin nào phía sau). Dùng start GỐC làm giới hạn vì đó
+  // chính là toạ độ neo cứng của Reflow (block pinned không dịch nên
+  // start gốc = start hiển thị của nó).
+  const nextBoundaryMinByIndex = (() => {
+    const res = new Array(blocks.length).fill(SLEEP_BOUNDARY_MIN);
+    let nextBoundary = SLEEP_BOUNDARY_MIN;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      res[i] = nextBoundary;
+      if (blocks[i] && blocks[i].pinned) {
+        nextBoundary = parseTimeToMinutesV33(blocks[i].start);
+      }
+    }
+    return res;
+  })();
+
+  let cumulativeDeltaMin = 0;
+
+  return blocks.map((b, i) => {
+    const isPinned = !!b.pinned;
+
+    // [PR3.3] Block pinned giữ nguyên start/end gốc (không cộng phần dịch
+    // tích luỹ từ các block trước nó).
+    const baseStartMin = isPinned
+      ? parseTimeToMinutesV33(b.start)
+      : parseTimeToMinutesV33(b.start) + cumulativeDeltaMin;
+    const baseEndMin = isPinned
+      ? parseTimeToMinutesV33(b.end)
+      : parseTimeToMinutesV33(b.end) + cumulativeDeltaMin;
+
+    // [PR3.4] Clamp + đánh dấu overflow — chỉ áp dụng cho block KHÔNG
+    // pinned (block pinned tự nó luôn là mốc neo hợp lệ, không bị chặn
+    // bởi chính nó).
+    let overflow = false;
+    let clampedStartMin = baseStartMin;
+    let clampedEndMin = baseEndMin;
+
+    if (!isPinned) {
+      const dur = baseEndMin - baseStartMin;
+
+      // Delta âm lớn đẩy start về trước 00:00.
+      if (clampedStartMin < 0) {
+        overflow = true;
+        clampedStartMin = 0;
+        clampedEndMin = clampedStartMin + dur;
+      }
+
+      // Vượt giờ ngủ / không đủ chỗ trước mốc pin kế tiếp (edge case #1,
+      // #3, #9, overlap, end-of-day, khoảng thời gian không đủ).
+      const boundaryMin = nextBoundaryMinByIndex[i];
+      if (clampedEndMin > boundaryMin || clampedStartMin >= boundaryMin) {
+        overflow = true;
+        // Kéo LÙI start về sát mốc chặn (boundaryMin - dur) — dùng Math.min
+        // vì clampedStartMin hiện tại đang LỚN HƠN mốc cho phép, nên giá
+        // trị hợp lệ luôn là số NHỎ HƠN trong 2 lựa chọn.
+        clampedStartMin = Math.min(clampedStartMin, boundaryMin - dur);
+        clampedEndMin = clampedStartMin + dur;
+      }
+    }
+
+    const shifted = {
+      ...b,
+      start: minutesToHHMMV33(clampedStartMin),
+      end: minutesToHHMMV33(clampedEndMin),
+      // [PR3.4] UI (phần render) đọc cờ này để hiển thị khu "Chưa xếp
+      // được" thay vì âm thầm chồng đè/biến mất. Block KHÔNG bị xoá khỏi
+      // mảng — chỉ đánh dấu.
+      overflow,
+    };
+
+    // Delta của CHÍNH block này (nếu có doneAt) được cộng dồn cho các
+    // block PHÍA SAU nó — dùng baseEndMin (end SAU khi áp phần dịch tích
+    // luỹ hiện tại, TRƯỚC khi bị clamp overflow — delta phải phản ánh
+    // đúng thời điểm done thực tế bất kể có overflow hiển thị hay không),
+    // để cộng dồn đúng khi có nhiều block done sớm/trễ liên tiếp trong
+    // cùng 1 lượt gọi.
+    if (typeof b.doneAt === "string" && b.doneAt.length > 0) {
+      const doneAtMin = parseTimeToMinutesV33(b.doneAt);
+      const blockDelta = doneAtMin - baseEndMin;
+      if (isPinned) {
+        // [PR3.3] Pin là mốc neo mới: delta của các block TRƯỚC nó không
+        // còn cộng dồn tiếp (baseStartMin/baseEndMin của pin không cộng
+        // cumulativeDeltaMin cũ) — cumulativeDeltaMin bắt đầu lại TỪ
+        // CHÍNH delta của pin này, áp dụng cho các block phía sau.
+        cumulativeDeltaMin = blockDelta;
+      } else {
+        cumulativeDeltaMin += blockDelta;
+      }
+    } else if (isPinned) {
+      // [PR3.3] Pin không có doneAt: mốc neo mới nhưng không phát sinh
+      // delta riêng → các block sau tính lại từ 0.
+      cumulativeDeltaMin = 0;
+    }
+
+    return shifted;
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   [V42 PR1.2] TIMELINE OVERRIDE LAYER — STORAGE/RUNTIME, CHƯA GẮN UI
+   ══════════════════════════════════════════════════════════════════════
+   Phạm vi PR1.2 (theo chỉ dẫn trực tiếp — mở rộng roadmap gốc):
+     - CHỈ thêm cơ chế đọc/ghi Timeline Override Layer xuống storage (S).
+     - Dùng đúng shape đã định nghĩa ở PR1.1 (createEmptyTimelineOverrideLayer).
+     - KHÔNG sửa applyTimelineOverrides()/timelineBlockKey() (PR1.1 giữ nguyên).
+     - KHÔNG render UI, KHÔNG hook (useTimelineOverrides thuộc PR1.3).
+     - KHÔNG resize/drag/pin/reflow — các hàm dưới đây chỉ đọc/ghi RAW layer,
+       không tính toán gì lên dữ liệu (đúng nguyên tắc "storage thuần").
+     - KHÔNG đổi PlannerRuntimeContext — Override Layer KHÔNG đi qua
+       PlannerStorage/PlannerRuntimeContext, đúng thiết kế §10.3.2: "Layer
+       này đọc và ghi độc lập... Không tác động tới 11 storage key AI
+       Planner đã có." Nên PR này không chạm Context.
+
+   Nơi lưu: key riêng theo ngày, namespace mới "v42:" (theo nhóm B1 của
+   roadmap — namespace mới chỉ áp dụng cho key mới, không migrate ngược).
+   KHÔNG lưu trong db[date] (key "d:"+date) vì đó là schema cũ
+   (dailyPicks/poolDone/bigGoalsToday/timelineDone...) — chèn field mới
+   vào đó sẽ vi phạm "không đổi schema dữ liệu cũ". Dùng key vật lý tách
+   biệt hoàn toàn: "v42:timelineOverride:<date>".
+   ────────────────────────────────────────────────────────────────────── */
+
+// [V42 PR1.2] Tiền tố key storage cho Timeline Override Layer, 1 key/ngày —
+// cùng cách timelineDone/dailyPicks được key theo ngày (qua db[date]),
+// nhưng ở đây là key S riêng, không lồng trong db[date].
+const TIMELINE_OVERRIDE_KEY_PREFIX_V42 = "v42:timelineOverride:";
+function timelineOverrideStorageKey(date) {
+  return TIMELINE_OVERRIDE_KEY_PREFIX_V42 + date;
+}
+
+// [V42 PR1.2] Kiểm tra tối thiểu shape của layer đọc từ storage — phòng
+// trường hợp dữ liệu hỏng/ghi dở (ví dụ tương lai đổi shape mà quên
+// migration). KHÔNG phải validate sâu từng override record — PR1.2 chỉ
+// đảm bảo layer có đúng 2 field gốc {blocks, goals} dạng object, để
+// applyTimelineOverrides (PR1.1, không sửa ở đây) luôn nhận input hợp lệ.
+function isValidTimelineOverrideLayerShape(layer) {
+  return !!layer
+    && typeof layer === "object"
+    && typeof layer.blocks === "object" && layer.blocks !== null && !Array.isArray(layer.blocks)
+    && typeof layer.goals === "object" && layer.goals !== null && !Array.isArray(layer.goals);
+}
+
+// [V42 PR1.2] Đọc Timeline Override Layer của 1 ngày từ storage.
+// - Chưa từng ghi (lần đầu mở ngày đó) → trả về layer rỗng qua
+//   createEmptyTimelineOverrideLayer() (PR1.1), KHÔNG tự ghi xuống storage
+//   ở bước đọc (khác với loadFixedTasksV33 — ở đây không cần "seed" vì
+//   rỗng chính là trạng thái hợp lệ mặc định, ghi thêm 1 lượt I/O không
+//   cần thiết mỗi lần đọc ngày mới).
+// - Dữ liệu hỏng/parse lỗi/shape sai → fallback về layer rỗng, KHÔNG throw,
+//   để một bản ghi hỏng không làm vỡ toàn bộ luồng đọc Today.
+async function loadTimelineOverrideLayer(date) {
+  if (!date) return createEmptyTimelineOverrideLayer();
+  try {
+    const raw = await S.get(timelineOverrideStorageKey(date));
+    if (raw && raw !== "null") {
+      const parsed = JSON.parse(raw);
+      if (isValidTimelineOverrideLayerShape(parsed)) {
+        return { blocks: parsed.blocks, goals: parsed.goals };
+      }
+    }
+  } catch {}
+  return createEmptyTimelineOverrideLayer();
+}
+
+// [V42 PR1.2] Ghi Timeline Override Layer của 1 ngày xuống storage.
+// Ghi đè toàn bộ layer (không patch từng phần) — đúng nguyên tắc "hàm
+// storage thuần", việc patch từng block/goal cụ thể (resizeBlock/pinBlock/
+// assignGoalToSlot...) là trách nhiệm của useTimelineOverrides ở PR1.3+,
+// hàm này chỉ là lớp I/O đáy cùng. Luôn ghi đúng shape {blocks, goals} dù
+// caller lỡ truyền thiếu field, để dữ liệu trong storage không bao giờ
+// lệch shape đã định nghĩa ở PR1.1.
+async function saveTimelineOverrideLayer(date, layer) {
+  if (!date) return;
+  const safe = isValidTimelineOverrideLayerShape(layer)
+    ? layer
+    : createEmptyTimelineOverrideLayer();
+  await S.set(timelineOverrideStorageKey(date), JSON.stringify(safe));
+}
+
+// [V42 PR5.2] deleteTimelineOverrideLayer từng được định nghĩa sẵn ở đây
+// (PR1.2) làm hạ tầng dự phòng cho PR1.4/PR5.1, nhưng cả PR1.4 lẫn PR5.1
+// hoàn thiện thực tế đều đi theo hướng "ghi layer rỗng" (setOverrideLayer +
+// clearAllTimelineOverrides, qua saveTimelineOverrideLayer) thay vì xoá hẳn
+// key storage — nên hàm này không có call site nào. Đã xoá ở PR5.2 (dọn
+// dead code) vì roadmap không có nhu cầu thật sự nào cho việc xoá key
+// storage của Override Layer; nếu cần lại trong tương lai, có thể khôi phục
+// bằng đúng chữ ký cũ (date) => S.delete(timelineOverrideStorageKey(date)).
+
+/* ══════════════════════════════════════════════════════════════════════
+   [V42 PR1.3] TIMELINE OVERRIDE LAYER — HOOK STATE, GẮN VÀO Today/SmartSchedule
+   ══════════════════════════════════════════════════════════════════════
+   Phạm vi PR1.3 (đúng V42_Master_Roadmap.md, Phase 1):
+     - CHỈ giữ state overrideLayer của 1 ngày (date) trong React, đồng bộ
+       hai chiều với storage qua loadTimelineOverrideLayer/
+       saveTimelineOverrideLayer (PR1.2, KHÔNG sửa hai hàm đó ở đây).
+     - KHÔNG chứa business logic (resize/pin/reflow) — hook này KHÔNG gọi
+       resizeTimelineBlock/pinTimelineBlock/unpinTimelineBlock (PR2.1);
+       nơi gọi những hàm đó (PR2.2+) sẽ tự tính layer mới rồi truyền vào
+       setter mà hook này expose ra, hook không tự quyết định NỘI DUNG
+       thay đổi là gì.
+     - Đổi `date` (rotate ngày) → tự load lại layer của ngày mới, đúng
+       tinh thần PR1.4 (Override Layer tách theo ngày qua storage key)
+       dù PR1.4 (reset chủ động khi rotate) chưa làm ở đây — vì layer đã
+       tự nhiên đọc ra đúng của ngày mới nhờ key khác nhau, không cần một
+       bước "xoá" riêng để hook này hoạt động đúng.
+   ────────────────────────────────────────────────────────────────────── */
+
+// [V42 PR1.3] useTimelineOverrides(date)
+// Trả về { overrideLayer, setOverrideLayer, reload }.
+// - overrideLayer: layer hiện tại của `date` (bắt đầu là layer rỗng cho
+//   tới khi load xong từ storage, để applyTimelineOverrides luôn có input
+//   hợp lệ ngay từ render đầu tiên, không cần chờ Promise).
+// - setOverrideLayer(nextLayer): ghi đè cả state React lẫn storage (qua
+//   saveTimelineOverrideLayer) — nhận layer ĐÃ TÍNH SẴN (ví dụ do PR2.2
+//   gọi resizeTimelineBlock(overrideLayer, doneKey, newDur) rồi truyền
+//   kết quả vào đây), hook không tự tính toán nội dung.
+// - reload(): đọc lại từ storage (dùng cho trường hợp cần đồng bộ ngoài
+//   ý muốn, không có call site nào bắt buộc ở PR1.3).
+function useTimelineOverrides(date) {
+  const [overrideLayer, setOverrideLayerState] = useState(() => createEmptyTimelineOverrideLayer());
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const loaded = await loadTimelineOverrideLayer(date);
+      if (!cancelled) setOverrideLayerState(loaded);
+    })();
+    return () => { cancelled = true; };
+  }, [date]);
+
+  const setOverrideLayer = useCallback((nextLayer) => {
+    setOverrideLayerState(nextLayer);
+    saveTimelineOverrideLayer(date, nextLayer);
+  }, [date]);
+
+  const reload = useCallback(async () => {
+    const loaded = await loadTimelineOverrideLayer(date);
+    setOverrideLayerState(loaded);
+  }, [date]);
+
+  return { overrideLayer, setOverrideLayer, reload };
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   [V42 PR2.1] TIMELINE OVERRIDE LAYER — API THAO TÁC, HÀM THUẦN, CHƯA GẮN UI
+   ══════════════════════════════════════════════════════════════════════
+   Phạm vi PR2.1 (theo chỉ dẫn trực tiếp — nền tảng cho Resize/Pin sau này):
+     - CHỈ định nghĩa các hàm THUẦN thao tác trên Timeline Override Layer
+       (shape đã chốt ở PR1.1: { blocks: {[doneKey]: {durOverride, pinned,
+       doneAt}}, goals: {[goalId]: {start, dur}} }).
+     - Mỗi hàm nhận layer hiện tại + tham số thao tác, trả về layer MỚI —
+       KHÔNG mutate input, KHÔNG đọc/ghi storage (S.get/S.set), KHÔNG
+       React state (useState/useReducer), KHÔNG side effect nào khác.
+     - KHÔNG sửa applyTimelineOverrides()/timelineBlockKey() (PR1.1 giữ
+       nguyên) — các hàm dưới đây chỉ tạo ra layer mới; việc render vẫn
+       đi qua applyTimelineOverrides() y hệt trước, không đổi.
+     - KHÔNG render UI, KHÔNG gesture (drag/resize/pin UI), KHÔNG Reflow
+       tự động (Reflow thật thuộc PR3.x) — resizeTimelineBlock ở đây chỉ
+       ghi đè durOverride của ĐÚNG 1 block được chỉ định, không tự đẩy các
+       block khác (việc "đẩy block sau" theo Reflow — nếu roadmap PR2.1
+       gốc yêu cầu — vẫn phải đi qua applyTimelineOverrides ở lớp trình
+       bày hoặc hook PR1.3/PR3.x, không phải trách nhiệm của lớp API thuần
+       này; xem ghi chú "Deferred" cuối phần giải thích khi trả lời).
+     - KHÔNG đổi PlannerRuntimeContext/PlannerStorage/buildPlannerForm.
+     - KHÔNG đổi storage schema — vẫn đúng shape {blocks, goals} đã định
+       nghĩa ở PR1.1; hàm loadTimelineOverrideLayer/saveTimelineOverrideLayer
+       (PR1.2) không đổi.
+     - CHƯA có component/hook nào import/gọi các hàm dưới đây — cô lập
+       hoàn toàn, đúng nguyên tắc "code đứng riêng, test bằng dữ liệu giả"
+       đã áp dụng từ PR1.1.
+   ────────────────────────────────────────────────────────────────────── */
+
+// [V42 PR2.1] Helper nội bộ — tạo bản sao nông (shallow clone) của layer,
+// dùng chung cho mọi hàm thao tác dưới đây để đảm bảo KHÔNG mutate input.
+// Không export ra ngoài (chỉ dùng nội bộ file này).
+function cloneTimelineOverrideLayer(layer) {
+  const safe = isValidTimelineOverrideLayerShape(layer)
+    ? layer
+    : createEmptyTimelineOverrideLayer();
+  return {
+    blocks: { ...safe.blocks },
+    goals: { ...safe.goals },
+  };
+}
+
+// [V42 PR2.1] resizeTimelineBlock(layer, doneKey, newDur)
+// Ghi đè durOverride cho ĐÚNG 1 block (nhận diện qua doneKey — công thức
+// "start|tên" từ timelineBlockKey(), PR1.1). Dùng cho Resize (PR2.x).
+//
+// - newDur phải là số dương hữu hạn; nếu không hợp lệ, trả về layer
+//   KHÔNG đổi (bản sao, không mutate) — hàm không tự làm tròn/áp ngưỡng
+//   tối thiểu 5 phút (đó là business rule của UI/hook gọi hàm này, PR2.x
+//   sau này quyết định; hàm thuần ở đây chỉ lưu số được truyền vào).
+// - Không tự tính lại/đẩy block phía sau — đó là việc của
+//   applyTimelineOverrides (đọc dur mới) hoặc Reflow (PR3.x), không phải
+//   của lớp ghi override này.
+// - Giữ nguyên pinned/doneAt hiện có của block đó nếu có; chỉ patch
+//   durOverride.
+function resizeTimelineBlock(layer, doneKey, newDur) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!doneKey || typeof newDur !== "number" || !isFinite(newDur) || newDur <= 0) {
+    return next;
+  }
+  const existing = next.blocks[doneKey] || {};
+  next.blocks = {
+    ...next.blocks,
+    [doneKey]: {
+      durOverride: newDur,
+      pinned: !!existing.pinned,
+      doneAt: existing.doneAt || null,
+    },
+  };
+  return next;
+}
+
+// [V42 PR2.1] pinTimelineBlock(layer, doneKey)
+// Đặt pinned = true cho 1 block. Giữ nguyên durOverride/doneAt hiện có.
+// Dùng cho Pin (PR2.3) — hàm thuần chỉ ghi cờ, KHÔNG tự chặn Reflow (việc
+// "Reflow không đẩy giờ block đã pin" là logic đọc cờ này ở PR3.x/hook,
+// không phải việc của hàm ghi cờ).
+function pinTimelineBlock(layer, doneKey) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!doneKey) return next;
+  const existing = next.blocks[doneKey] || {};
+  next.blocks = {
+    ...next.blocks,
+    [doneKey]: {
+      durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      pinned: true,
+      doneAt: existing.doneAt || null,
+    },
+  };
+  return next;
+}
+
+// [V42 PR2.1] unpinTimelineBlock(layer, doneKey)
+// Đặt pinned = false cho 1 block. Giữ nguyên durOverride/doneAt hiện có.
+// Nếu block chưa từng có override nào (chưa resize, chưa doneAt), việc
+// "unpin" một block chưa từng pin vẫn hợp lệ và vô hại — trả về layer với
+// record { durOverride: null, pinned: false, doneAt: null } (tương đương
+// không có override), không throw.
+function unpinTimelineBlock(layer, doneKey) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!doneKey) return next;
+  const existing = next.blocks[doneKey] || {};
+  next.blocks = {
+    ...next.blocks,
+    [doneKey]: {
+      durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      pinned: false,
+      doneAt: existing.doneAt || null,
+    },
+  };
+  return next;
+}
+
+// [V42 PR4.2] assignGoalToSlot(layer, goalId, start, dur)
+// Ghi mapping goalId → {start, dur} vào overrideLayer.goals — ĐÚNG schema
+// đã chốt sẵn từ PR1.1 ({goals: {[goalId]: {start, dur}}}, xem comment
+// dòng ~1722), KHÔNG mở rộng/đổi shape. Cùng pattern với resizeTimelineBlock/
+// pinTimelineBlock/unpinTimelineBlock (PR2.1): hàm THUẦN, nhận layer hiện
+// tại + tham số thao tác, trả về layer MỚI, KHÔNG mutate input, KHÔNG đọc/
+// ghi storage, KHÔNG side effect, KHÔNG gọi React.
+// - Không tự validate chồng giờ với block/goal khác — đó là việc của caller
+//   (SmartSchedule, PR4.2 phần UI) trước khi gọi hàm này, giữ đúng nguyên
+//   tắc "hàm ghi override chỉ ghi, không tự quyết định business rule" đã áp
+//   dụng nhất quán cho toàn bộ nhóm hàm PR2.1.
+// - Không đụng layer.blocks — assign goal hoàn toàn tách biệt khỏi Routine/
+//   Fixed/Buffer override.
+function assignGoalToSlot(layer, goalId, start, dur) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!goalId || typeof start !== "string" || start.length === 0
+      || typeof dur !== "number" || !isFinite(dur) || dur <= 0) {
+    return next;
+  }
+  next.goals = {
+    ...next.goals,
+    [goalId]: { start, dur },
+  };
+  return next;
+}
+
+// [V42 PR4.3] unassignGoal(layer, goalId)
+// Nghịch đảo của assignGoalToSlot — xoá HẲN mapping goalId → {start,dur}
+// khỏi overrideLayer.goals, để applyTimelineOverrides không còn sinh ra
+// block goal đó nữa (goal quay lại UnscheduledGoalsLane, vì
+// UnscheduledGoalsLane lọc "chưa xếp giờ" bằng chính điều kiện
+// !overrideLayer.goals[id] — xem UnscheduledGoalsLane). Cùng pattern THUẦN
+// với các hàm PR2.1/PR4.2: nhận layer + goalId, trả về layer MỚI, KHÔNG
+// mutate input, KHÔNG đọc/ghi storage, KHÔNG side effect, KHÔNG React.
+// - KHÔNG đụng layer.blocks — gỡ goal hoàn toàn tách biệt khỏi Routine/
+//   Fixed/Buffer override (đối xứng với assignGoalToSlot).
+// - KHÔNG đụng data.dailyPicks/poolDone — goal vẫn còn trong "Nhiệm vụ hôm
+//   nay", chỉ mất phần "đã gán giờ hay chưa" (đúng thiết kế §9 mục 2.4:
+//   "dữ liệu goal trong dailyPicks không đổi, chỉ có phần đã gán giờ hay
+//   chưa mất đi").
+// - Nếu goalId chưa từng được gán giờ (không có trong layer.goals), trả về
+//   layer tương đương (bản sao, không đổi nội dung goals) — vô hại, không
+//   throw, giữ đúng tính idempotent cho round-trip gán/gỡ nhiều lần.
+function unassignGoal(layer, goalId) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!goalId) return next;
+  if (goalId in next.goals) {
+    const { [goalId]: _removed, ...rest } = next.goals;
+    next.goals = rest;
+  }
+  return next;
+}
+
+
+// [V42 PR5.2] clearTimelineOverride (xoá override của ĐÚNG 1 block, khác
+// clearAllTimelineOverrides xoá toàn bộ) từng được định nghĩa sẵn ở đây
+// (PR2.1) làm hạ tầng dự phòng, nhưng không có UI nào trong toàn bộ V42
+// cần "xoá hẳn override của 1 block riêng lẻ" — các gesture thật có đều đi
+// qua resizeTimelineBlock/pinTimelineBlock/unpinTimelineBlock (ghi đè giá
+// trị, không xoá entry) hoặc clearAllTimelineOverrides (xoá toàn bộ, dùng ở
+// PR1.4/PR5.1). Đã xoá ở PR5.2 (dọn dead code) vì không có call site nào;
+// nếu cần lại, có thể khôi phục bằng đúng chữ ký cũ (layer, doneKey).
+
+// [V42 PR2.1] clearAllTimelineOverrides(layer)
+// Reset toàn bộ blocks override về rỗng — dùng cho các tình huống như
+// PR5.1 (reset khi AI chạy lại thật) hoặc PR1.4 (reset khi đổi ngày), khi
+// nơi gọi đã CÓ SẴN layer trong tay (ví dụ đọc ra từ storage) và chỉ cần
+// một hàm thuần để tính ra layer-đã-reset, thay vì luôn phải gọi thẳng
+// createEmptyTimelineOverrideLayer(). Mặc định XOÁ CẢ goals — vì goals
+// (goalId → {start,dur}) cũng là một dạng override gắn với schedule cũ
+// của ngày đó; khi lịch gốc thay đổi hoàn toàn, mapping giờ cũ của goal
+// không còn ý nghĩa (đúng tinh thần thiết kế §10.3.4: "Override Layer của
+// ngày đó reset về rỗng"). Nếu về sau (PR5.x) cần giữ lại goals khi reset
+// blocks, đó sẽ là một hàm/tham số riêng — KHÔNG mở rộng ở đây để giữ
+// đúng phạm vi PR2.1.
+function clearAllTimelineOverrides(layer) {
+  return createEmptyTimelineOverrideLayer();
+}
+
+// [V42 PR5.1] isTimelineOverrideLayerEmpty(layer)
+// Hàm thuần, trả về true nếu layer không có bất kỳ override nào (không có
+// block nào bị resize/pin/doneAt, không có goal nào đã gán giờ) — dùng để
+// quyết định có cần hỏi xác nhận trước khi reset (PR5.1, Edge case #5:
+// "cần một confirm dialog nhỏ nếu Override Layer không rỗng") hay không.
+// KHÔNG mutate input, KHÔNG side effect, cùng pattern các hàm PR2.1/PR4.x
+// khác trong nhóm này.
+function isTimelineOverrideLayerEmpty(layer) {
+  const safe = isValidTimelineOverrideLayerShape(layer)
+    ? layer
+    : createEmptyTimelineOverrideLayer();
+  return Object.keys(safe.blocks).length === 0 && Object.keys(safe.goals).length === 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   [V42 PR3.1] TIMELINE OVERRIDE LAYER — GHI doneAt, HÀM THUẦN
+   ══════════════════════════════════════════════════════════════════════
+   Phạm vi PR3.1 TẠI THỜI ĐIỂM PR3.1 (nhật ký lịch sử — xem ghi chú cập
+   nhật cuối khối này để biết trạng thái call site THẬT hiện tại):
+     - CHỈ thêm 1 hàm thuần ghi thời điểm "done thực tế" vào Override
+       Layer — KHÔNG đẩy block, KHÔNG reflow, KHÔNG tính lại schedule,
+       KHÔNG đổi start/end của bất kỳ block nào, KHÔNG đụng UI.
+     - Cùng pattern với resizeTimelineBlock/pinTimelineBlock/
+       unpinTimelineBlock (PR2.1): nhận layer + tham số thao tác, trả về
+       layer MỚI, KHÔNG mutate input, KHÔNG đọc Date.now(), KHÔNG đọc/ghi
+       storage (S.get/S.set), KHÔNG gọi React (không useState/hook).
+     - Tên hàm: markTimelineBlockDoneAt (không dùng đúng chữ "markDoneAt"
+       ghi trong roadmap gốc) — để khớp convention đặt tên đã có trong
+       codebase thật: mọi hàm thao tác Override Layer đều có dạng
+       "<verb>TimelineBlock(layer, doneKey, ...)". Hành vi/field/shape
+       giữ đúng 100% những gì roadmap PR3.1 yêu cầu (ghi blocks[doneKey].
+       doneAt, không đổi durOverride/pinned).
+     - KHÔNG sửa applyTimelineOverrides()/timelineBlockKey() (đã đọc
+       override.doneAt sẵn từ PR1.1, dòng ~1809 — không cần đổi gì thêm
+       để field mới ghi ở đây được phản ánh ra finalRenderBlocks[].doneAt).
+     - KHÔNG sửa resizeTimelineBlock/pinTimelineBlock/unpinTimelineBlock/
+       clearAllTimelineOverrides (PR2.1, giữ nguyên).
+
+   [V42 PR3.3] CẬP NHẬT TRẠNG THÁI CALL SITE (đã xác nhận với Bảo trước
+   khi làm — xem hội thoại PR3.3): tại PR3.1/PR3.2, comment gốc ghi
+   "CHƯA có component/hook nào gọi markTimelineBlockDoneAt — việc gọi
+   thật từ toggleTimelineItem là phạm vi PR3.2". Trên thực tế PR3.2 chỉ
+   hoàn thành phần thuật toán thuần (reflowTimelineBlocks), KHÔNG wire
+   gọi hàm này từ toggleTimelineItem — nghĩa là Reflow chưa từng kích
+   hoạt được trên UI thật cho tới PR3.3. PR3.3 đã nối dây việc này
+   (SmartSchedule.toggleTimelineItem, xem comment "[V42 PR3.3] wiring"
+   tại đó) — hàm markTimelineBlockDoneAt ở dưới đây HOÀN TOÀN KHÔNG bị
+   sửa (đúng yêu cầu "không sửa markTimelineBlockDoneAt" của PR3.3/3.4),
+   chỉ có call site mới xuất hiện ở lớp UI.
+   ────────────────────────────────────────────────────────────────────── */
+
+// [V42 PR3.1] markTimelineBlockDoneAt(layer, doneKey, doneAt)
+// Ghi thời điểm hoàn thành THỰC TẾ ("HH:MM", do caller tự tính — hàm này
+// KHÔNG đọc Date.now()/new Date() để giữ đúng tính thuần) cho ĐÚNG 1 block
+// (nhận diện qua doneKey — công thức "start|tên" từ timelineBlockKey(),
+// PR1.1). Dùng làm nền cho Reflow (PR3.2) — PR3.1 chỉ lưu dữ liệu, KHÔNG
+// tự tính delta hay đẩy block nào khác.
+//
+// - doneAt phải là string non-empty; nếu không hợp lệ, trả về layer
+//   KHÔNG đổi (bản sao, không mutate) — hàm không tự validate định dạng
+//   "HH:MM" sâu hơn (đó là việc của caller ở PR3.2, tương tự cách
+//   resizeTimelineBlock không tự áp ngưỡng 5 phút).
+// - Truyền doneAt = null để XOÁ thời điểm done thực tế của 1 block (ví dụ
+//   khi người dùng untick) — giữ nguyên durOverride/pinned hiện có, chỉ
+//   patch doneAt về null, KHÔNG xoá cả entry.
+// - Giữ nguyên durOverride/pinned hiện có của block đó nếu có; chỉ patch
+//   doneAt — không thay đổi 2 field còn lại dù giá trị hiện tại là gì.
+// - Không tự tính lại/đẩy block phía sau — đó là việc của Reflow (PR3.2),
+//   không phải của lớp ghi override này.
+function markTimelineBlockDoneAt(layer, doneKey, doneAt) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!doneKey) return next;
+  if (doneAt !== null && (typeof doneAt !== "string" || doneAt.length === 0)) {
+    return next;
+  }
+  const existing = next.blocks[doneKey] || {};
+  next.blocks = {
+    ...next.blocks,
+    [doneKey]: {
+      durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      pinned: !!existing.pinned,
+      doneAt: doneAt,
+    },
+  };
+  return next;
+}
+
 // (spec §1) Task cố định mỗi ngày — luôn xuất hiện, không cần phân tích.
 // "Không cầm điện thoại" dur được tính riêng ở resolvePhoneFreeDurationV33
 // (spec §2) nên không cứng 15' ở đây.
@@ -2473,6 +3345,102 @@ async function runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts
 
   const updatedToday = await storage.appendEntry(td, { ctx, result, trace, regenReason, plannerOutput });
   return updatedToday;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [PR0.4] buildPlannerForm(mode, options) — PR0.4 (V42 Master Roadmap,
+// Phase 0). Trước PR0.4, MorningWidget/SmartSchedule/AIPlannerBeta mỗi nơi
+// tự dựng phần "khung form cơ bản" (nowTime/day/tiktok/recent/
+// completionRate qua bridgeDashboardToRawState + computeBehaviorMetrics)
+// bằng code viết tay riêng lẻ — cùng một logic, 3 bản sao. Hàm này KHÔNG
+// đổi field nào, KHÔNG đổi giá trị mặc định nào (energy:3, homework:null,
+// event:"none", daysToExam:60, freeNote:"" giữ nguyên y hệt từng nơi) —
+// chỉ gộp phần dựng khung dùng chung vào 1 chỗ, mỗi call site truyền đúng
+// input nó có và nhận lại đúng shape nó từng tự dựng trước đây.
+//
+// mode:
+//   "morningWidgetInit"      — khung form khởi tạo quickForm lúc mount
+//                                (trước đây: setQuickForm({...}) dòng ~9839).
+//                                Trả về object có thêm goalMode/extraEvents
+//                                (MorningWidget luôn có 2 field này).
+//   "smartScheduleRegenerate" — form dựng lại mỗi lần bấm "Làm lại"
+//                                (trước đây: object `form` viết tay trong
+//                                regenerate() — KHÔNG có goalMode/extraEvents,
+//                                giữ đúng như cũ).
+//   "aiPlannerBetaInit"       — khung form khởi tạo lúc mount tab 11, TRƯỚC
+//                                khi merge thêm field check-in (a-e) —
+//                                (trước đây: phần đầu của setForm({...})
+//                                dòng ~4113, trước các field specialPlans/
+//                                freeStart/.../checkinNote).
+//
+// options: { todayData, td, now, db, dayExp, targetXP, setts }
+//   - targetXP: dùng thẳng nếu truyền (AIPlannerBeta truyền targetXP prop
+//     trực tiếp); nếu không có, rơi về setts?.targetXP||150 (SmartSchedule
+//     dùng setts, không có targetXP prop riêng) — đúng 2 cách gọi
+//     computeBehaviorMetrics khác nhau đã tồn tại trước PR0.4.
+function buildPlannerForm(mode, options) {
+  const { todayData, td, now, dayExp, targetXP, setts } = options;
+  const bridged = bridgeDashboardToRawState({ todayData: todayData || {}, td, now: now || new Date() });
+  let metrics = { recent: "mixed", completionRate: 70 };
+  try {
+    metrics = computeBehaviorMetrics({
+      td, db: options.db, dayExp,
+      targetXP: (targetXP != null ? targetXP : (setts?.targetXP || 150)),
+    });
+  } catch (e) {
+    console.error("[buildPlannerForm] behaviorMetrics failed:", e);
+  }
+
+  const base = {
+    nowTime: bridged.nowTime,
+    day: bridged.day,
+    energy: 3,
+    homework: null,
+    tiktok: bridged.tiktok,
+    recent: metrics.recent,
+    completionRate: metrics.completionRate,
+    event: "none",
+    daysToExam: 60,
+    freeNote: "",
+  };
+
+  if (mode === "morningWidgetInit") {
+    // Giữ đúng 2 field goalMode/extraEvents MorningWidget luôn có ở khung
+    // khởi tạo (trước đây hardcode "study"/[] tại chỗ setQuickForm).
+    return { ...base, goalMode: "study", extraEvents: [] };
+  }
+
+  // "smartScheduleRegenerate" và "aiPlannerBetaInit" đều trả về đúng khung
+  // cơ bản, không thêm field — SmartSchedule chưa từng có goalMode/
+  // extraEvents trong object `form` của nó; AIPlannerBeta tự thêm các field
+  // check-in (a-e) ở call site sau khi nhận base này, không đổi ở đây.
+  return base;
+}
+
+// [PR0.4] readDeadlinePlan / writeAssignedMinutesToday — 2 thao tác đọc/ghi
+// v25:deadlinePlan trước đây được viết tay lặp lại ở MorningWidget.handleRun,
+// SmartSchedule.regenerate, AIPlannerBeta.buildRunFormAndDeadline (chỉ đọc).
+// Logic bên trong giữ nguyên 100% (cùng try/catch, cùng JSON.parse/stringify,
+// cùng field assignedMinutesToday, cùng cách tìm dlTask qua tên bắt đầu
+// bằng "Làm sự kiện:") — chỉ gộp thành 2 hàm dùng chung.
+async function readDeadlinePlan() {
+  try {
+    const raw = await S.get(DEADLINE_PLAN_KEY);
+    return raw && raw !== "null" ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeAssignedMinutesToday(deadlinePlan, updatedToday) {
+  if (!deadlinePlan) return;
+  const latest = updatedToday.entries[updatedToday.entries.length - 1];
+  const dlTask = (latest?.result?.tasks || []).find(t => (t.name || "").startsWith("Làm sự kiện:"));
+  if (dlTask) {
+    try {
+      await S.set(DEADLINE_PLAN_KEY, JSON.stringify({ ...deadlinePlan, assignedMinutesToday: dlTask.dur || 0 }));
+    } catch {}
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -3926,12 +4894,19 @@ function ConditionRulesManager({ runPreview }) {
   );
 }
 
-function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
+function AIPlannerBeta({ db, setDb, td, dayExp, targetXP, taskPool }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
 
   const core = useMemo(() => createAIPlannerCore(), []);
-  const storage = useMemo(() => createPlannerStorage(S), []);
+  // PR0.3: dùng chung plannerStorage/plannerToday/setPlannerToday với Today
+  // (tab 0) qua PlannerRuntimeContext, thay vì tự tạo storage riêng bằng
+  // createPlannerStorage(S). Provider đã chạy rotateDay() cho ngày hiện tại
+  // (xem PlannerRuntimeProvider) nên tab này không cần tự rotateDay nữa —
+  // chỉ cần đọc plannerToday đã có sẵn. Biến vẫn giữ tên `storage`/`today`/
+  // `setToday` ở các chỗ dùng bên dưới để không phải sửa lại toàn bộ call
+  // site, chỉ đổi NGUỒN GỐC của chúng sang Context.
+  const { plannerStorage: storage, plannerToday: today, setPlannerToday: setToday } = useContext(PlannerRuntimeContext);
 
   // ── DEV TOOLS (luôn hiển thị, có nhãn rõ ràng) ──────────────────────────
   // Công cụ để tạo nhanh dữ liệu giả cho bất kỳ tab nào, phục vụ kiểm tra
@@ -4008,7 +4983,9 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
   }, [setDb]);
 
   const [loading, setLoading] = useState(true);
-  const [today, setToday] = useState(null);
+  // PR0.3: `today`/`setToday` không còn là useState cục bộ ở đây — đến từ
+  // PlannerRuntimeContext (xem khai báo `storage`/`today`/`setToday` phía
+  // trên). Giữ nguyên mọi chỗ dùng today/setToday bên dưới không đổi.
   const [running, setRunning] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [form, setForm] = useState(null);
@@ -4022,20 +4999,20 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
     let cancelled = false;
     (async () => {
       setLoading(true);
-      const rotated = await storage.rotateDay(td);
-      if (cancelled) return;
-      setToday(rotated);
+      // PR0.3: KHÔNG tự gọi storage.rotateDay(td) nữa — PlannerRuntimeProvider
+      // đã rotateDay() một lần duy nhất cho cả Today lẫn tab này (cùng 1
+      // storage instance). `today` ở đây giờ là plannerToday từ Context,
+      // luôn là giá trị current-day đã rotate sẵn. Guard chờ Provider có
+      // giá trị (plannerToday có thể còn null trong khoảnh khắc đầu mount).
+      if (today === null) return;
 
+      // [PR0.4] Khung form cơ bản giờ dựng qua buildPlannerForm dùng chung
+      // — output giữ nguyên y hệt (không có goalMode/extraEvents ở bước
+      // này, đúng như setForm({...}) viết tay trước đây; targetXP truyền
+      // thẳng từ prop, không rơi về setts vì AIPlannerBeta không có setts).
       const now = new Date();
       const todayData = db?.[td] || {};
-      const bridged = bridgeDashboardToRawState({ todayData, td, now });
-
-      let metrics = { recent: "mixed", completionRate: 70 };
-      try {
-        metrics = computeBehaviorMetrics({ td, db, dayExp, targetXP });
-      } catch (e) {
-        console.error("[AI Planner Beta] behaviorMetrics failed:", e);
-      }
+      const baseForm = buildPlannerForm("aiPlannerBetaInit", { todayData, td, now, db, dayExp, targetXP });
 
       // [PATCH v37] MỤC 1: đọc lại check-in gần nhất (nếu có, cùng ngày —
       // ví dụ người dùng bấm "Tạo lại kế hoạch" nhiều lần trong ngày) để
@@ -4053,16 +5030,7 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
       } catch {}
 
       setForm({
-        nowTime: bridged.nowTime,
-        day: bridged.day,
-        energy: 3,
-        homework: null,
-        tiktok: bridged.tiktok,
-        recent: metrics.recent,
-        completionRate: metrics.completionRate,
-        event: "none",
-        daysToExam: 60,
-        freeNote: "",
+        ...baseForm,
         // ── [PATCH v37] MỤC 1: field mới của form check-in thông minh ──
         specialPlans: savedCheckin?.specialPlans || [],       // (a) mảng các lựa chọn đã tick
         specialOther: savedCheckin?.specialOther || "",       // (a) "Khác: ..."
@@ -4077,8 +5045,11 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
       setLoading(false);
     })();
     return () => { cancelled = true; };
+    // PR0.3: thêm `today` vào deps — hiệu ứng cần chạy lại khi Context vừa
+    // rotate xong (today chuyển từ null → giá trị thật) để build form đúng
+    // lúc, thay vì tự rotate tại chỗ như trước PR0.3.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [td]);
+  }, [td, today]);
 
   const updateForm = (patch) => setForm(f => ({ ...f, ...patch }));
 
@@ -4170,11 +5141,8 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
       extraEvents: [...todayExtraEvents, ...checkinExtraEvents],
       goalMode: form.mainGoal === "rest" ? "relax" : form.mainGoal === "fun" ? "relax" : "study",
     };
-    let deadlinePlan = null;
-    try {
-      const raw = await S.get(DEADLINE_PLAN_KEY);
-      deadlinePlan = raw && raw !== "null" ? JSON.parse(raw) : null;
-    } catch {}
+    // [PR0.4] Đọc deadlinePlan qua helper dùng chung — logic giữ nguyên.
+    const deadlinePlan = await readDeadlinePlan();
     return { runForm, deadlinePlan };
   };
 
@@ -4186,8 +5154,11 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
     if (!form) return null;
     const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
     const dayLog = today?.entries || [];
+    // [PR0.4 / A2] taskPool giờ được truyền vào đây (quyết định sản phẩm đã
+    // chốt: đồng nhất 3 entry point, bật nhánh (d) đa dạng hoá pool cho tab
+    // 11 — đây là thay đổi hành vi có chủ ý, không phải tác dụng phụ).
     return runAiPlannerPipeline({
-      core, storage, td, form: runForm, dayLog, db, deadlinePlan,
+      core, storage, td, form: runForm, dayLog, db, taskPool, deadlinePlan,
       previewMode: true, draftOverrides,
     });
   };
@@ -4198,12 +5169,13 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP }) {
     setErrorMsg(null);
     try {
       const dayLog = today?.entries || [];
-      // [PATCH v30] Truyền thêm db để enrichTasksWithContext có dữ liệu
-      // nếu người dùng có deadlinePlan đang hoạt động — tab này (form thủ
-      // công) không có taskPool trong props nên bỏ qua nhánh (d) đa dạng
-      // hoá pool, chỉ nhánh (a)(b)(c) hoạt động ở đây.
+      // [PR0.4 / A2] Truyền thêm db + taskPool để enrichTasksWithContext có
+      // đủ dữ liệu — quyết định đã chốt: tab này (form thủ công) GIỜ CÓ
+      // taskPool trong props, nhánh (d) đa dạng hoá pool bật cho tab 11
+      // giống MorningWidget/SmartSchedule (trước PR0.4 tab này bỏ qua nhánh
+      // (d) vì thiếu taskPool — nay đã đồng nhất theo quyết định A2).
       const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
-      const updatedToday = await runAiPlannerPipeline({ core, storage, td, form: runForm, dayLog, db, deadlinePlan });
+      const updatedToday = await runAiPlannerPipeline({ core, storage, td, form: runForm, dayLog, db, taskPool, deadlinePlan });
       setToday(updatedToday);
       // [PATCH v37] MỤC 1: lưu lại check-in hôm nay để lần "Tạo lại kế
       // hoạch" tiếp theo (hoặc mở lại tab) không mất lựa chọn đã chọn.
@@ -7899,6 +8871,7 @@ function App() {
     <ThemeContext.Provider value={theme}>
     <AccentContext.Provider value={accent}>
     <MediaContext.Provider value={media}>
+    <PlannerRuntimeProvider>
     <SplashScreen theme={theme} logo={media.settings?.logo || null} ready={appReady} />
     <div style={{position:"relative",background:theme.bg,minHeight:"100vh",fontFamily:"system-ui,sans-serif",color:theme.text,maxWidth:480,margin:"0 auto",paddingBottom:"calc(80px + env(safe-area-inset-bottom, 0px))",transition:"background 0.3s ease,color 0.3s ease"}}>
       {/* Ảnh nền toàn app — lớp cố định phía sau mọi nội dung, độ mờ chỉnh qua Media Settings */}
@@ -8067,7 +9040,7 @@ function App() {
         {tab===10 && <TaiChinh txs={finTxs||[]} onTxsChange={setFinTxs}/>}
         {tab===11 && (
           <AIPlannerErrorBoundary theme={theme}>
-            <AIPlannerBeta db={db} setDb={setDb} td={td} dayExp={dayExp} targetXP={setts.targetXP||150}/>
+            <AIPlannerBeta db={db} setDb={setDb} td={td} dayExp={dayExp} targetXP={setts.targetXP||150} taskPool={taskPool}/>
           </AIPlannerErrorBoundary>
         )}
       </div>
@@ -8087,6 +9060,7 @@ function App() {
       <MusicPlayer/>
       {mediaModalOpen && <MediaSettingsModal onClose={()=>setMediaModalOpen(false)}/>}
     </div>
+    </PlannerRuntimeProvider>
     </MediaContext.Provider>
     </AccentContext.Provider>
     </ThemeContext.Provider>
@@ -8905,13 +9879,59 @@ function TaskPoolManagerModal({taskPool,onAdd,onEdit,onDelete,onToggleHide,onClo
 // cho Kho mục tiêu lớn) — chỉ đổi tên component + copy hiển thị để đúng
 // tinh thần "One Big Win" thay vì "Mục tiêu hôm nay" (tên cũ dễ nhầm với
 // Nhiệm vụ hôm nay — TodaysGoalsCard).
-function OneBigWinCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount}) {
+// [V42 PR4.4] plannerToday/overrideLayer/taskPool là 3 prop TÙY CHỌN mới —
+// dùng để tính gợi ý khung giờ "Free Time dài nhất" cho One Big Win, đọc
+// TRỰC TIẾP từ dữ liệu Timeline hiện có (applyTimelineOverrides, KHÔNG sửa
+// hàm đó), KHÔNG tính lại gì mới, KHÔNG gọi AI Planner. Nếu thiếu bất kỳ
+// prop nào trong 3 prop này (component được dùng ở nơi khác chưa truyền),
+// phần gợi ý tự ẩn — component vẫn hoạt động y hệt trước PR4.4 (an toàn,
+// không breaking nơi gọi cũ). KHÔNG đổi field data (vẫn bigGoalsToday, cap
+// 1, vẫn +15XP) — gợi ý CHỈ hiển thị text, KHÔNG tự gán giờ (không gọi
+// assignGoalToSlot/setOverrideLayer — đúng yêu cầu "Chỉ Suggest, không
+// auto schedule"). Lý do KHÔNG dùng assignGoalToSlot để gán One Big Win
+// thật vào Timeline như Today's Goal (PR4.2): bigGoalsToday[].id có dạng
+// "bg_"+Date.now(), KHÔNG nằm trong taskPool (nguồn applyTimelineOverrides
+// dùng để tra tên goal đã gán giờ qua poolById[goalId], xem
+// applyTimelineOverrides) — gán id đó vào overrideLayer.goals sẽ tạo ra
+// mapping "treo" mà applyTimelineOverrides không bao giờ vẽ ra được (bị
+// lọc bỏ ở điều kiện `if (!g || !t...)`). Đây là khác biệt schema thật sự
+// giữa 2 nguồn dữ liệu (bigGoalsToday vs dailyPicks/taskPool) mà roadmap
+// không đặc tả rõ khi nói "tái dùng hạ tầng PR4.2" — phương án nhỏ nhất,
+// đúng phạm vi "chỉ gợi ý" đã ghi rõ trong Điều kiện hoàn thành PR4.4, là
+// không mở rộng assignGoalToSlot để nhận nguồn goalId thứ hai.
+function OneBigWinCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onBumpGoalDoneCount,onBumpGoalSkipCount,plannerToday,overrideLayer,taskPool}) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const [quickText,setQuickText]=useState("");
   const [pickerOpen,setPickerOpen]=useState(false);
   const [collapsed,setCollapsed]=useState(false);
   const todayGoals = Array.isArray(data.bigGoalsToday) ? data.bigGoalsToday : [];
+
+  // [V42 PR4.4] Tính gợi ý "Free Time dài nhất hiện có trên Timeline" —
+  // đọc finalRenderBlocks qua applyTimelineOverrides (PR1.1, KHÔNG sửa),
+  // CÙNG nguồn dữ liệu mà SmartSchedule dùng để vẽ Timeline (schedule lấy
+  // từ plannerToday.entries mới nhất, giống hệt cách SmartSchedule tính —
+  // xem SmartSchedule dòng ~11389). "Free Time" ở phạm vi PR4.4 = khoảng
+  // buffer (isBuffer, "Nghỉ giữa việc") dài nhất sau khi đã merge override/
+  // Reflow/goal — KHÔNG implement lại quy tắc phân loại Break-vs-Free-Time
+  // đầy đủ của thiết kế §9 mục 2.3 (đó là phạm vi Phase 1.2, ngoài PR4.4;
+  // dùng buffer sẵn có là phương án nhỏ nhất không mở rộng phạm vi). Nếu
+  // thiếu bất kỳ input nào (chưa có lịch AI hôm nay, chưa gán taskPool...),
+  // suggestion = null → phần gợi ý không hiển thị, không lỗi.
+  const suggestion = useMemo(() => {
+    if (!plannerToday) return null;
+    const entryCount = plannerToday?.entries?.length ?? 0;
+    const latestEntry = entryCount > 0 ? plannerToday.entries[entryCount - 1] : null;
+    const schedule = latestEntry?.plannerOutput?.schedule || [];
+    if (!schedule.length) return null;
+    const dailyPicks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
+    const blocks = applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks);
+    const freeBlocks = blocks.filter(b => b.isBuffer && typeof b.dur === "number" && b.dur > 0);
+    if (!freeBlocks.length) return null;
+    const longest = freeBlocks.reduce((best, b) => (!best || b.dur > best.dur) ? b : best, null);
+    if (!longest) return null;
+    return { start: longest.start, end: longest.end, dur: longest.dur };
+  }, [plannerToday, overrideLayer, taskPool, data.dailyPicks]);
 
   const addFromPool = (goalId)=>{
     const g = (goalPool||[]).find(x=>x.id===goalId);
@@ -8964,6 +9984,17 @@ function OneBigWinCard({td,data,goalPool,save,onOpenManager,onMarkGoalPicked,onB
           <span style={{flex:1,fontSize:12,minWidth:0}}>
             <span key={g.done?"done":"undone"} className={g.done?"task-text-done":""} style={{"--strike-color":theme.primary}}>{g.text}</span>
             {!g.done && <div style={{fontSize:10,color:theme.textDim,marginTop:2,fontWeight:400}}>Chỉ cần hoàn thành việc này là hôm nay đã thành công.</div>}
+            {/* [V42 PR4.4] Gợi ý khung giờ — CHỈ hiển thị text, KHÔNG có nút
+                "gán" nào ở đây (không auto schedule, không gọi
+                assignGoalToSlot/setOverrideLayer — người dùng tự quyết định
+                sắp xếp thời gian ngoài Timeline, đúng "Điều kiện hoàn thành"
+                PR4.4: "chỉ gợi ý không tự gán"). Chỉ hiện khi goal chưa done
+                và có suggestion hợp lệ. */}
+            {!g.done && suggestion && (
+              <div style={{fontSize:10,color:theme.primary,marginTop:3,fontWeight:600}}>
+                💡 Gợi ý: khung giờ rảnh dài nhất hôm nay là {suggestion.start}–{suggestion.end} ({suggestion.dur} phút)
+              </div>
+            )}
           </span>
           <span style={{fontSize:9,color:theme.textDim,flexShrink:0}}>+15XP</span>
           <button onClick={()=>remove(g.id)} style={{background:"none",border:"none",color:theme.danger,fontSize:15,cursor:"pointer",flexShrink:0}}>×</button>
@@ -9725,7 +10756,7 @@ function RecoveryBanner({ td, data, db, save, taskPool, onAddPoolTask }) {
   );
 }
 
-function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPool, onAddPoolTask, onEditPoolTask, plannerStorage, plannerToday, onPlannerTodayChange }) {
+function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPool, onAddPoolTask, onEditPoolTask, plannerStorage, plannerToday, onPlannerTodayChange, overrideLayer, setOverrideLayer }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
 
@@ -9746,6 +10777,13 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
   // cần làm") đã bị xoá cùng với checklist đó — xem comment ở chỗ render
   // "⭐ ONE BIG WIN" bên dưới để biết lý do.
   const [appliedAt, setAppliedAt] = useState(null);
+  // [V42 PR5.1] Lưu tạm (isUpdate, formOverride) khi cần hỏi xác nhận
+  // trước khi chạy pipeline thật (Edge case #5: Override Layer đang có dữ
+  // liệu). null = không có confirm nào đang chờ. Tách biệt hoàn toàn khỏi
+  // pendingDeadline (state đã có từ trước, dành cho modal "cần bao nhiêu
+  // giờ?") — hai luồng xác nhận độc lập, không gộp chung để tránh nhầm ý
+  // nghĩa 2 loại confirm khác nhau.
+  const [pendingRunConfirm, setPendingRunConfirm] = useState(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const [collapsed, setCollapsed] = useState(false);
 
@@ -9759,38 +10797,13 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
       // (rotateDay is idempotent, but calling it from two components at
       // once was the actual source of the race — this removes that.)
 
-      // 2. bridgeDashboardToRawState — identical call, no reimplementation.
+      // [PR0.4] Khung form khởi tạo giờ dựng qua buildPlannerForm dùng
+      // chung — output giữ nguyên y hệt object viết tay trước đây (cùng
+      // field, cùng giá trị mặc định, cùng goalMode:"study"/extraEvents:[]).
       const now = new Date();
       const todayData = db?.[td] || {};
-      const bridged = bridgeDashboardToRawState({ todayData, td, now });
-
-      // 3. computeBehaviorMetrics — identical call, no reimplementation.
-      let metrics = { recent: "mixed", completionRate: 70 };
-      try {
-        metrics = computeBehaviorMetrics({ td, db, dayExp, targetXP: setts.targetXP || 150 });
-      } catch (e) {
-        console.error("[Morning Widget] behaviorMetrics failed:", e);
-      }
-
       if (cancelled) return;
-      setQuickForm({
-        nowTime: bridged.nowTime,
-        day: bridged.day,
-        energy: 3,
-        homework: null,
-        tiktok: bridged.tiktok,
-        recent: metrics.recent,
-        completionRate: metrics.completionRate,
-        event: "none",
-        daysToExam: 60,
-        freeNote: "",
-        // [PATCH] 2 field mới, chỉ dùng ở lớp UI/wiring — core không có
-        // khái niệm goalMode; extraEvents core vốn đã hỗ trợ sẵn qua
-        // rawState.extraEvents (AIPlannerBeta's todayExtraEvents dùng y
-        // hệt cơ chế này, không phải field mới trong core).
-        goalMode: "study",
-        extraEvents: [],
-      });
+      setQuickForm(buildPlannerForm("morningWidgetInit", { todayData, td, now, db, dayExp, setts }));
 
       setAppliedAt(null);
       setLastUpdatedAt(null);
@@ -9849,38 +10862,44 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
   // line of the pipeline itself is reimplemented here — this only calls it.
   // [PATCH] optional formOverride lets the free-text flow run with the
   // freshly-parsed form directly, avoiding a state-update race.
-  const handleRun = async (isUpdate, formOverride) => {
+  // [V42 PR5.1] Tham số thứ 3 `skipConfirm` — NỘI BỘ, chỉ dùng khi
+  // handleRun tự gọi lại chính nó sau khi người dùng đã xác nhận qua
+  // InlineConfirm (xem confirmPendingRun bên dưới). Mặc định false — 4 call
+  // site HIỆN CÓ (dòng ~956/975/984/handleRun(false) ở nút chính) không đổi
+  // gì, vẫn gọi đúng 2 tham số như trước, tự động đi qua gate này.
+  const handleRun = async (isUpdate, formOverride, skipConfirm) => {
     const formToUse = formOverride || quickForm;
     if (!formToUse || running) return;
+    // [V42 PR5.1] Gate xác nhận — CHỈ chặn lại (không chạy pipeline ngay)
+    // khi: (a) chưa skipConfirm, (b) có setOverrideLayer (an toàn nếu
+    // MorningWidget được dùng ở nơi khác chưa truyền overrideLayer — giữ
+    // đúng hành vi cũ y hệt, không hỏi gì cả), (c) Override Layer đang có
+    // dữ liệu thật (Edge case #5). Khi cả 3 đều đúng, lưu tạm tham số vào
+    // pendingRunConfirm rồi return — InlineConfirm ở UI phía dưới sẽ gọi
+    // handleRun lại với skipConfirm=true khi người dùng bấm xác nhận.
+    if (!skipConfirm && setOverrideLayer && !isTimelineOverrideLayerEmpty(overrideLayer)) {
+      setPendingRunConfirm({ isUpdate, formOverride });
+      return;
+    }
     setRunning(true);
     setErrorMsg(null);
     try {
       const dayLog = today?.entries || [];
-      // [PATCH v30] Đọc deadlinePlan hiện tại (nếu có) mỗi lần chạy — để
-      // enrichTasksWithContext có thể chia nhỏ task deadline vào lịch,
-      // và ghi lại assignedMinutesToday để hôm sau settleDeadlineProgress
-      // đối chiếu được. Không đụng plannerOutput/Core — chỉ truyền thêm
-      // dữ liệu vào runAiPlannerPipeline (đã hỗ trợ optional params).
-      let deadlinePlan = null;
-      try {
-        const raw = await S.get(DEADLINE_PLAN_KEY);
-        deadlinePlan = raw && raw !== "null" ? JSON.parse(raw) : null;
-      } catch {}
+      // [PR0.4] Đọc/ghi deadlinePlan qua helper dùng chung — logic bên
+      // trong giữ nguyên 100% (xem readDeadlinePlan/writeAssignedMinutesToday).
+      const deadlinePlan = await readDeadlinePlan();
       const updatedToday = await runAiPlannerPipeline({
         core, storage, td, form: formToUse, dayLog, db, setts, taskPool, deadlinePlan,
       });
-      // [PATCH v30] Nếu deadlinePlan còn hiệu lực, ghi lại số phút vừa
-      // được giao cho hôm nay (để hôm sau đối chiếu đã làm đủ chưa).
-      if (deadlinePlan) {
-        const latest = updatedToday.entries[updatedToday.entries.length - 1];
-        const dlTask = (latest?.result?.tasks || []).find(t => (t.name || "").startsWith("Làm sự kiện:"));
-        if (dlTask) {
-          try {
-            await S.set(DEADLINE_PLAN_KEY, JSON.stringify({ ...deadlinePlan, assignedMinutesToday: dlTask.dur || 0 }));
-          } catch {}
-        }
-      }
+      await writeAssignedMinutesToday(deadlinePlan, updatedToday);
       setToday(updatedToday);
+      // [BUGFIX / PR5.1 wiring] Cùng lý do như SmartSchedule.regenerate —
+      // schedule[] gốc vừa đổi hoàn toàn, Override Layer cũ không còn ý
+      // nghĩa và có thể silently tái áp dụng lên block trùng doneKey của
+      // lịch mới. Chỉ reset sau khi pipeline thành công (không nằm trong
+      // catch), và chỉ khi prop có (an toàn nếu component được dùng ở nơi
+      // khác chưa truyền overrideLayer).
+      if (setOverrideLayer) setOverrideLayer(clearAllTimelineOverrides(overrideLayer));
       setAppliedAt(null);
       setCheckinOpen(false);
       if (isUpdate) setLastUpdatedAt(new Date());
@@ -9891,6 +10910,19 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
       setRunning(false);
     }
   };
+
+  // [V42 PR5.1] Xác nhận/huỷ dialog "Làm lại sẽ xoá điều chỉnh giờ thủ
+  // công hôm nay". Xác nhận → gọi lại handleRun với skipConfirm=true (bỏ
+  // qua gate, chạy pipeline thật). Huỷ → chỉ xoá pendingRunConfirm, KHÔNG
+  // chạy gì cả, KHÔNG mất Override Layer (đúng Regression PR5.1: "huỷ
+  // dialog → không mất override").
+  const confirmPendingRun = () => {
+    if (!pendingRunConfirm) return;
+    const { isUpdate, formOverride } = pendingRunConfirm;
+    setPendingRunConfirm(null);
+    handleRun(isUpdate, formOverride, true);
+  };
+  const cancelPendingRun = () => setPendingRunConfirm(null);
 
   // [PATCH v30] Modal "cần bao nhiêu giờ?" — chỉ hiện khi chip deadline
   // được chọn + ghi chú parse ra được 1 ngày cụ thể MỚI (khác plan đã lưu,
@@ -10054,6 +11086,20 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
       background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14,
       border: `1px solid ${theme.border}`,
     }}>
+      {/* [V42 PR5.1] Dialog xác nhận "Làm lại" khi Override Layer đang có
+          dữ liệu — đặt ngay đầu, hiển thị bất kể MorningWidget đang ở
+          trạng thái nào (loading/form/plan-exists), vì handleRun có thể
+          được gọi từ nhiều nhánh khác nhau (xem 4 call site của handleRun).
+          Không chạy gì cho tới khi người dùng bấm 1 trong 2 nút. */}
+      {pendingRunConfirm && (
+        <InlineConfirm
+          message="Làm lại sẽ xoá các điều chỉnh giờ thủ công hôm nay — tiếp tục?"
+          confirmLabel="Làm lại"
+          cancelLabel="Huỷ"
+          onConfirm={confirmPendingRun}
+          onCancel={cancelPendingRun}
+        />
+      )}
       {loading || !quickForm ? (
         <div style={{ fontSize: 12, color: theme.textDim, textAlign: "center", padding: "12px 0" }}>
           Đang tải trợ lý sáng nay…
@@ -10364,7 +11410,108 @@ function AddManualTaskRow({ theme, accent, onAdd }) {
   );
 }
 
-function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerStorage, plannerToday, onPlannerTodayChange }) {
+// ══════════════════════════ V42 PR4.1/4.2: UNSCHEDULED GOALS LANE ══════════
+// [PR4.1] Mục tiêu gốc: render data.dailyPicks (goal AI/Today's Goals) CHƯA
+// được gán giờ trên Timeline, thành 1 dải hiển thị riêng, đặt cạnh
+// SmartSchedule. KHÔNG đổi onAdd/onToggle/onRemove/onReorder hiện có
+// (component này không nhận các callback đó).
+//
+// [PR4.2] Mở rộng TỐI THIỂU: cho phép "Gán giờ" 1 goal vào Timeline. Theo
+// xác nhận rõ ràng trước khi code (không tự ý implement PR Break/Free Time
+// đã bỏ lỡ, coi toàn bộ buffer hiện tại là vùng có thể chứa goal, không xây
+// hệ thống drag-drop vì codebase chưa có hạ tầng cho việc đó trên
+// Timeline) — cơ chế đơn giản nhất phù hợp code hiện có: click nút "🕐 Gán
+// giờ" trên 1 chip → mở input type="time" INLINE ngay trên chính chip đó →
+// xác nhận → gọi assignGoalToSlot(overrideLayer, goalId, start, dur) rồi
+// setOverrideLayer(). Thời lượng dùng hằng số cố định 20 phút (đúng giá trị
+// ví dụ nêu ở roadmap mục 2.4: "thời lượng ước tính mặc định VD 20 phút, có
+// thể resize sau" — resize goal là phạm vi PR sau, KHÔNG làm ở đây).
+// KHÔNG validate chồng giờ với block/goal khác ở PR4.2 (edge case #4 —
+// "2 goal chồng giờ phải chặn" — được ghi rõ là Regression cần test của
+// chính PR4.2 trong roadmap, nhưng đây là validate nghiệp vụ THÊM, không
+// nằm trong 4 yêu cầu code cụ thể (assignGoalToSlot/applyTimelineOverrides/
+// SmartSchedule/UnscheduledGoalsLane) — defer, ghi rõ trong báo cáo).
+//
+// "Goal đã nằm trên Timeline" — đọc overrideLayer.goals (schema PR1.1,
+// KHÔNG đổi) để lọc goal đã gán giờ ra khỏi dải — goal biến mất khỏi lane
+// NGAY khi overrideLayer.goals[goalId] tồn tại (không cần chờ gì thêm, vì
+// UnscheduledGoalsLane và SmartSchedule đọc chung 1 state overrideLayer từ
+// Today qua useTimelineOverrides — cùng 1 nguồn chân lý).
+const GOAL_DEFAULT_DUR_MIN = 20;
+
+function UnscheduledGoalsLane({ data, taskPool, overrideLayer, setOverrideLayer }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [assigningId, setAssigningId] = useState(null);
+  const [timeValue, setTimeValue] = useState("");
+
+  const picks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
+  const poolById = Object.fromEntries((taskPool || []).map(t => [t.id, t]));
+  const scheduledGoalIds = (overrideLayer && overrideLayer.goals) || {};
+
+  const unscheduled = picks.filter(id => poolById[id] && !scheduledGoalIds[id]);
+
+  const startAssign = (id) => { setAssigningId(id); setTimeValue(""); };
+  const cancelAssign = () => { setAssigningId(null); setTimeValue(""); };
+  const confirmAssign = (id) => {
+    if (!timeValue) return;
+    const nextLayer = assignGoalToSlot(overrideLayer, id, timeValue, GOAL_DEFAULT_DUR_MIN);
+    setOverrideLayer(nextLayer);
+    setAssigningId(null);
+    setTimeValue("");
+  };
+
+  if (unscheduled.length === 0) return null; // không có gì chưa xếp giờ → không chiếm chỗ layout
+
+  return (
+    <div style={{
+      background: theme.surface, borderRadius: 16, padding: 14, marginBottom: 14,
+      border: `1px solid ${theme.border}`,
+    }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
+        🗂️ CHƯA XẾP GIỜ
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {unscheduled.map(id => {
+          const t = poolById[id];
+          const checked = !!data.poolDone?.[id];
+          const isAssigning = assigningId === id;
+          return (
+            <div key={id} style={{
+              display: "flex", alignItems: "center", gap: 6,
+              padding: "6px 10px", borderRadius: 999,
+              background: theme.surfaceAlt,
+              border: `1px solid ${theme.border}`,
+              opacity: checked ? 0.6 : 1,
+            }}>
+              <span style={{ fontSize: 13 }}>{t.i || "✅"}</span>
+              <span style={{ fontSize: 12, color: theme.text }}>{t.l}</span>
+              {isAssigning ? (
+                <>
+                  <input type="time" value={timeValue} onChange={e => setTimeValue(e.target.value)}
+                    autoFocus
+                    onKeyDown={e => { if (e.key === "Enter") confirmAssign(id); if (e.key === "Escape") cancelAssign(); }}
+                    style={{ background: theme.surface, border: `1px solid ${accent}44`, borderRadius: 6, padding: "2px 4px", color: theme.text, fontSize: 11, outline: "none" }}/>
+                  <button onClick={() => confirmAssign(id)} title="Xác nhận giờ"
+                    style={{ background: "none", border: "none", color: theme.success, fontSize: 14, cursor: "pointer", padding: 0 }}>✓</button>
+                  <button onClick={cancelAssign} title="Huỷ"
+                    style={{ background: "none", border: "none", color: theme.textDim, fontSize: 14, cursor: "pointer", padding: 0 }}>×</button>
+                </>
+              ) : (
+                <button onClick={() => startAssign(id)} title="Gán giờ vào Timeline"
+                  style={{ background: "none", border: "none", color: accent, fontSize: 11, cursor: "pointer", padding: 0 }}>🕐 Gán giờ</button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+
+function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerStorage, plannerToday, onPlannerTodayChange, overrideLayer, setOverrideLayer, onTogglePoolTask }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const core = useMemo(() => createAIPlannerCore(), []);
@@ -10374,6 +11521,12 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
 
   const [regenerating, setRegenerating] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+  // [V42 PR5.1] Cờ hiển thị InlineConfirm trước khi "Làm lại" thật sự chạy,
+  // CHỈ bật khi Override Layer đang có dữ liệu (Edge case #5: "cần một
+  // confirm dialog nhỏ nếu Override Layer không rỗng"). Dùng InlineConfirm
+  // đã có sẵn trong codebase (P-06, thay window.confirm bị chặn trong môi
+  // trường artifact) thay vì tạo cơ chế confirm mới.
+  const [confirmRegenerate, setConfirmRegenerate] = useState(false);
 
   const entryCount = today?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? today.entries[entryCount - 1] : null;
@@ -10392,18 +11545,33 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // [V41 REFACTOR] Thêm `doneKey` ổn định (start+tên, KHÔNG dùng index vì
   // index đổi mỗi lần "Làm lại") để checkbox mới trong mỗi block giữ đúng
   // trạng thái tick khi lịch được tính lại, miễn tên+giờ task đó không đổi.
+  // [V42 PR1.3] Thay tự tính filter/map bằng applyTimelineOverrides()
+  // (PR1.1, KHÔNG sửa hàm đó) — chỉ map thêm field `color` (trình bày,
+  // phụ thuộc theme) từ `sourceColor` mà applyTimelineOverrides trả về,
+  // vì hàm thuần đó cố ý không tự áp theme.textDim (xem comment PR1.1).
+  // Với overrideLayer rỗng, applyTimelineOverrides dùng đúng filter/field
+  // y hệt bản cũ nên output timelineItems KHÔNG đổi.
+  // [V42 PR4.2] Truyền thêm taskPool (prop đã có sẵn của SmartSchedule,
+  // KHÔNG thêm prop mới) để applyTimelineOverrides tra được tên/icon của
+  // goal đã gán giờ (overrideLayer.goals chỉ lưu {start,dur} theo schema
+  // PR1.1, không có tên). Khi overrideLayer.goals rỗng (mọi ngày trước khi
+  // người dùng gán goal nào), applyTimelineOverrides trả về đúng
+  // reflowedBlocks y hệt trước PR4.2 — không đổi hành vi cũ.
+  // [BUGFIX / Edge case #7] data.dailyPicks truyền thêm làm tham số thứ 4
+  // (đã sẵn có trong prop `data` của SmartSchedule, KHÔNG thêm prop mới) để
+  // applyTimelineOverrides tự lọc bỏ goal đã bị xoá khỏi "Nhiệm vụ hôm nay"
+  // (xem comment chi tiết tại applyTimelineOverrides). Không ảnh hưởng
+  // reflowedBlocks/Routine/Fixed/Buffer — chỉ thu hẹp thêm goalBlocks.
+  const dailyPicks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
   const timelineItems = useMemo(() => {
-    return schedule
-      .filter(b => b.type === "fixed" || b.type === "buffer" || (b.type === "task" && b.isFixedRoutine))
-      .map((b, i) => ({
-        key: (b.type === "fixed" ? "fx" : b.type === "buffer" ? "buf" : "rt") + i,
-        doneKey: `${b.start}|${b.name}`,
-        name: b.name, start: b.start, end: b.end,
-        isBuffer: b.type === "buffer",
-        isFixed: b.type === "fixed",
-        color: b.type === "buffer" ? theme.textDim : (b.color || "#EF4444"),
-      }));
-  }, [schedule, theme.textDim]);
+    return applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks).map(it => ({
+      ...it,
+      // [V42 PR4.2] Goal dùng màu riêng (accent theme, tách biệt khỏi màu
+      // đỏ mặc định #EF4444 của Routine) — "style riêng" theo đúng yêu cầu
+      // PR4.2, không đụng logic màu Routine/Fixed/Buffer đã có.
+      color: it.isGoal ? accent : (it.isBuffer ? theme.textDim : (it.sourceColor || "#EF4444")),
+    }));
+  }, [schedule, overrideLayer, taskPool, dailyPicks, theme.textDim, accent]);
 
   // [V41] Trạng thái tick trực quan CHO RIÊNG Timeline — field data MỚI,
   // tách biệt hoàn toàn khỏi data.dailyPicks/poolDone (Nhiệm vụ hôm nay)
@@ -10415,12 +11583,156 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // (thuộc DailySchedule đã bị xoá) để tránh vô tình cộng XP cho những
   // ngày cũ đã có dữ liệu ở field đó.
   const timelineDone = data.timelineDone || {};
-  const toggleTimelineItem = (doneKey) => {
+  // [V42 PR3.3] toggleTimelineItem giờ nhận cả `it` (item timeline đầy đủ,
+  // không chỉ doneKey) để có thể ghi thêm thời điểm done THỰC TẾ vào
+  // Timeline Override Layer qua markTimelineBlockDoneAt (PR3.1, KHÔNG sửa
+  // chữ ký/hành vi hàm đó) — đây là bước "gọi hàm này thật sự từ
+  // toggleTimelineItem" mà chính comment PR3.1 (dòng ~2219) đã để dành,
+  // giờ mới thực sự nối dây để Reflow (PR3.2 thuật toán + PR3.3 pin +
+  // PR3.4 edge case) có dữ liệu thật để chạy trên UI — trước PR này,
+  // markTimelineBlockDoneAt tồn tại nhưng KHÔNG có call site nào, nên
+  // Reflow không bao giờ kích hoạt được trong thực tế.
+  // - data.timelineDone (field cũ) vẫn được ghi y hệt như trước — hành vi
+  //   tick trực quan cũ hoàn toàn không đổi (đúng regression PR3.1).
+  // - Khi TICK (chuyển từ chưa-done sang done): ghi doneAt = giờ hiện tại
+  //   thật (HH:MM, làm tròn phút) vào Override Layer.
+  // - Khi UNTICK (chuyển từ done sang chưa-done): xoá doneAt (truyền null
+  //   cho markTimelineBlockDoneAt) — Reflow không còn áp dụng delta của
+  //   block này nữa, đúng ý nghĩa "huỷ tick thì huỷ luôn ảnh hưởng Reflow
+  //   của lần tick đó".
+  const toggleTimelineItem = (it) => {
+    const doneKey = it && it.doneKey;
     const wasDone = !!timelineDone[doneKey];
     if (!wasDone) playSound("tick");
     save(td, { timelineDone: { ...timelineDone, [doneKey]: !wasDone } });
+    if (doneKey) {
+      const nowDate = new Date();
+      const nowHHMM = String(nowDate.getHours()).padStart(2, "0") + ":" + String(nowDate.getMinutes()).padStart(2, "0");
+      const nextLayer = markTimelineBlockDoneAt(overrideLayer, doneKey, wasDone ? null : nowHHMM);
+      setOverrideLayer(nextLayer);
+    }
   };
 
+  // [V42 PR2.2] Resize UI — CHỈ cho block Routine (isFixedRoutine), tức
+  // trong timelineItems là những item có isBuffer=false VÀ isFixed=false
+  // (buffer/fixed không được resize theo phạm vi PR2.2). Gesture đơn giản
+  // tuyệt đối: theo dõi toạ độ Y chuột/ngón tay từ lúc nhấn xuống handle,
+  // tính newDur = durGốc(tại thời điểm bắt đầu kéo) + deltaY (1px = 1 phút),
+  // rồi gọi resizeTimelineBlock(overrideLayer, doneKey, newDur) → setOverrideLayer().
+  // KHÔNG tự đẩy block sau, KHÔNG tính lại schedule, KHÔNG animation/snap/
+  // inertia — chỉ commit số phút mới vào Override Layer, applyTimelineOverrides
+  // (không sửa) tự tính lại `end` để hiển thị. Override Layer là NGUỒN DUY
+  // NHẤT — không tạo state duration song song ngoài dragStateRef tạm thời
+  // dùng riêng cho phép tính trong lúc đang kéo (không phải nguồn hiển thị).
+  const dragStateRef = useRef(null);
+  const [dragTick, setDragTick] = useState(0); // ép re-render khi kéo, không lưu dữ liệu
+
+  const MIN_RESIZE_DUR = 5; // phút — ngưỡng tối thiểu, chỉ chặn ở bước commit
+
+  // [BUGFIX / memory leak] handleResizeStart gắn listener vào window và chỉ
+  // gỡ trong handleEnd (mouseup/touchend). Nếu component unmount GIỮA lúc
+  // đang kéo (vd người dùng chuyển tab khi đang resize trên mobile),
+  // handleEnd không bao giờ được gọi — listener bị rò rỉ vĩnh viễn, tiếp
+  // tục giữ closure cũ (overrideLayer/setOverrideLayer của lần render đó)
+  // và có thể setOverrideLayer với dữ liệu cũ sau khi component đã unmount.
+  // dragListenersRef giữ tham chiếu 2 hàm đang gắn (nếu có) để effect cleanup
+  // dưới đây có thể gỡ đúng listener khi unmount, không đổi hành vi kéo/thả
+  // bình thường (handleEnd vẫn tự gỡ + xoá ref khi thả tay như cũ).
+  const dragListenersRef = useRef(null);
+  useEffect(() => {
+    return () => {
+      const l = dragListenersRef.current;
+      if (l) {
+        window.removeEventListener("mousemove", l.move);
+        window.removeEventListener("mouseup", l.end);
+        window.removeEventListener("touchmove", l.move);
+        window.removeEventListener("touchend", l.end);
+        dragListenersRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleResizeStart = (e, it) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    dragStateRef.current = {
+      doneKey: it.doneKey,
+      startY: clientY,
+      startDur: it.dur,
+    };
+    setDragTick(t => t + 1);
+
+    const handleMove = (moveEvt) => {
+      if (!dragStateRef.current) return;
+      const y = moveEvt.touches ? moveEvt.touches[0].clientY : moveEvt.clientY;
+      dragStateRef.current.currentY = y;
+      setDragTick(t => t + 1);
+    };
+    const handleEnd = () => {
+      const drag = dragStateRef.current;
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleEnd);
+      window.removeEventListener("touchmove", handleMove);
+      window.removeEventListener("touchend", handleEnd);
+      dragListenersRef.current = null; // [BUGFIX / memory leak] gỡ xong bình thường — không còn gì để unmount cleanup phải gỡ
+      if (!drag) return;
+      const deltaY = (drag.currentY ?? drag.startY) - drag.startY;
+      const rawDur = drag.startDur + deltaY;
+      const newDur = Math.max(MIN_RESIZE_DUR, Math.round(rawDur));
+      dragStateRef.current = null;
+      setDragTick(t => t + 1);
+      const nextLayer = resizeTimelineBlock(overrideLayer, drag.doneKey, newDur);
+      setOverrideLayer(nextLayer);
+    };
+
+    // [BUGFIX / memory leak] Ghi lại đúng 2 hàm vừa gắn để effect cleanup
+    // (unmount) có thể gỡ nếu handleEnd không bao giờ được gọi.
+    dragListenersRef.current = { move: handleMove, end: handleEnd };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleEnd);
+    window.addEventListener("touchmove", handleMove, { passive: false });
+    window.addEventListener("touchend", handleEnd);
+  };
+
+  // Trong lúc đang kéo, hiển thị end tạm thời (chỉ để mắt thấy đang kéo tới
+  // đâu) — KHÔNG ghi vào Override Layer cho tới khi thả tay (handleEnd).
+  // Đây là preview thuần UI, không phải state duration song song: giá trị
+  // này KHÔNG được dùng làm nguồn cho bất kỳ tính toán nào khác ngoài chính
+  // dòng chữ hiển thị của block đang kéo.
+  const getDragPreviewDur = (doneKey, fallbackDur) => {
+    const drag = dragStateRef.current;
+    if (!drag || drag.doneKey !== doneKey || drag.currentY == null) return fallbackDur;
+    const deltaY = drag.currentY - drag.startY;
+    return Math.max(MIN_RESIZE_DUR, Math.round(drag.startDur + deltaY));
+  };
+
+  // [V42 PR2.3] Toggle pin cho 1 Routine block — chỉ ghi cờ `pinned` vào
+  // Override Layer qua pinTimelineBlock/unpinTimelineBlock đã có sẵn từ
+  // PR2.1 (KHÔNG sửa 2 hàm đó). Ở PR2.3 này, pin CHƯA chặn gì cả (không có
+  // Reflow, không có resize-đẩy-block-sau để chặn) — đây thuần là ghi dữ
+  // liệu + hiển thị trạng thái, chuẩn bị sẵn cờ cho Phase 3 (Reflow) đọc.
+  const handleTogglePin = (e, it) => {
+    e.stopPropagation(); // không kích hoạt toggleTimelineItem (tick done) của div cha
+    const nextLayer = it.pinned
+      ? unpinTimelineBlock(overrideLayer, it.doneKey)
+      : pinTimelineBlock(overrideLayer, it.doneKey);
+    setOverrideLayer(nextLayer);
+  };
+
+  // [V42 PR5.1] requestRegenerate — điểm vào MỚI cho nút "Làm lại". Kiểm
+  // tra Override Layer bằng isTimelineOverrideLayerEmpty (PR5.1, hàm thuần,
+  // KHÔNG side effect) TRƯỚC khi quyết định chạy ngay hay hỏi xác nhận.
+  // regenerate() bên dưới HOÀN TOÀN KHÔNG đổi — vẫn là nơi duy nhất gọi
+  // pipeline thật, requestRegenerate chỉ là một lớp gate mỏng phía trước.
+  const requestRegenerate = () => {
+    if (regenerating) return;
+    if (isTimelineOverrideLayerEmpty(overrideLayer)) {
+      regenerate();
+    } else {
+      setConfirmRegenerate(true);
+    }
+  };
 
   // ── "Làm lại" — tính lại toàn bộ lịch từ giờ hiện tại. Gọi thẳng cùng
   // pipeline MorningWidget dùng (runAiPlannerPipeline → aiPlannerCore.js),
@@ -10430,31 +11742,27 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
     setRegenerating(true);
     setErrorMsg(null);
     try {
+      // [PR0.4] Form + deadlinePlan giờ dựng qua buildPlannerForm/
+      // readDeadlinePlan dùng chung — output giữ nguyên y hệt object viết
+      // tay trước đây (không có goalMode/extraEvents, energy:3/homework:null
+      // cứng, đúng như thiết kế "quickRegenerate" ban đầu).
       const now = new Date();
       const todayDbData = db?.[td] || {};
-      const bridged = bridgeDashboardToRawState({ todayData: todayDbData, td, now });
-      let metrics = { recent: "mixed", completionRate: 70 };
-      try { metrics = computeBehaviorMetrics({ td, db, dayExp, targetXP: setts?.targetXP || 150 }); } catch {}
-      const form = {
-        nowTime: bridged.nowTime, day: bridged.day, energy: 3, homework: null,
-        tiktok: bridged.tiktok, recent: metrics.recent, completionRate: metrics.completionRate,
-        event: "none", daysToExam: 60, freeNote: "",
-      };
-      let deadlinePlan = null;
-      try {
-        const raw = await S.get(DEADLINE_PLAN_KEY);
-        deadlinePlan = raw && raw !== "null" ? JSON.parse(raw) : null;
-      } catch {}
+      const form = buildPlannerForm("smartScheduleRegenerate", { todayData: todayDbData, td, now, db, dayExp, setts });
+      const deadlinePlan = await readDeadlinePlan();
       const dayLog = today?.entries || [];
       const updatedToday = await runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts, taskPool, deadlinePlan });
-      if (deadlinePlan) {
-        const latest = updatedToday.entries[updatedToday.entries.length - 1];
-        const dlTask = (latest?.result?.tasks || []).find(t => (t.name || "").startsWith("Làm sự kiện:"));
-        if (dlTask) {
-          try { await S.set(DEADLINE_PLAN_KEY, JSON.stringify({ ...deadlinePlan, assignedMinutesToday: dlTask.dur || 0 })); } catch {}
-        }
-      }
+      await writeAssignedMinutesToday(deadlinePlan, updatedToday);
       setToday(updatedToday);
+      // [BUGFIX / PR5.1 wiring] schedule[] gốc vừa đổi hoàn toàn — Override
+      // Layer cũ (resize/pin/doneAt/goal đã gán giờ) không còn ý nghĩa với
+      // lịch mới và có thể silently tái áp dụng lên block trùng doneKey
+      // ("start|tên") của lịch mới, gây stale-state hiển thị sai. Dùng
+      // clearAllTimelineOverrides (đã có sẵn từ PR2.1, không sửa hàm đó)
+      // đúng như thiết kế §10.3.4 — CHỈ reset khi pipeline thành công (nằm
+      // sau setToday, không nằm trong catch) để không mất override nếu
+      // chạy lại thất bại.
+      setOverrideLayer(clearAllTimelineOverrides(overrideLayer));
     } catch (e) {
       console.error("[SmartSchedule] regenerate failed:", e);
       setErrorMsg("Chưa xếp lại được lịch — thử lại giúp mình nhé.");
@@ -10477,6 +11785,58 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       <div>
         {timelineItems.map((it) => {
           const done = !!timelineDone[it.doneKey];
+          // [V42 PR4.2] Goal block — render riêng, TÁCH HẲN khỏi nhánh
+          // Buffer/Routine phía dưới, để không vô tình rơi vào
+          // isRoutineBlock (vốn bật resize handle + nút pin — PR4.2 yêu
+          // cầu "Chưa làm: resize goal, pin goal"). Tick hoàn thành đọc/ghi
+          // qua data.poolDone[it.goalId] (ĐÚNG cơ chế cộng XP cũ của
+          // TodaysGoalsCard, KHÔNG dùng timelineDone/toggleTimelineItem —
+          // it.doneKey của goal luôn là null nên timelineDone[it.doneKey]
+          // ở dòng trên không áp dụng cho goal, phải đọc done riêng ở đây).
+          if (it.isGoal) {
+            const goalDone = !!data.poolDone?.[it.goalId];
+            return (
+              <div key={it.key}
+                onClick={() => onTogglePoolTask && onTogglePoolTask(it.goalId)}
+                style={{
+                  display: "flex", gap: 10, alignItems: "center", cursor: onTogglePoolTask ? "pointer" : "default",
+                  padding: "9px 10px", marginBottom: 6, borderRadius: 10,
+                  background: goalDone ? `${it.color}12` : theme.surfaceAlt,
+                  // [V42 PR4.2] Style riêng cho Goal: viền chấm (khác viền
+                  // liền của Routine/Fixed) để phân biệt rõ "đây là Today's
+                  // Goal được gán giờ thủ công", không nhầm với Routine.
+                  borderLeft: `3px dashed ${it.color}`,
+                  border: "1px solid transparent",
+                  opacity: goalDone ? 0.65 : 1,
+                }}>
+                <NeonCheckbox checked={goalDone} onChange={() => onTogglePoolTask && onTogglePoolTask(it.goalId)} accent={it.color}/>
+                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                  {it.start}–{it.end}
+                </span>
+                <span style={{ fontSize: 13 }}>🎯</span>
+                <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
+                  <span key={goalDone ? "done" : "undone"} className={goalDone ? "task-text-done" : ""} style={{ "--strike-color": it.color, color: theme.text }}>
+                    {it.name}
+                  </span>
+                </span>
+                {/* [V42 PR4.3] Gỡ goal khỏi Timeline — trả về dải "Chưa xếp
+                    giờ" (UnscheduledGoalsLane). Chỉ xoá mapping trong
+                    overrideLayer.goals qua unassignGoal (KHÔNG mutate input,
+                    hàm thuần từ PR4.3) — KHÔNG đụng data.dailyPicks/poolDone,
+                    KHÔNG đụng poolDone (đã tick vẫn giữ nguyên trạng thái tick
+                    dù gỡ khỏi Timeline, vì poolDone là nguồn XP độc lập, tách
+                    biệt khỏi việc "đã gán giờ hay chưa" — đúng thiết kế §9
+                    mục 2.4). stopPropagation để không kích hoạt toggle done
+                    của div cha (cùng pattern handleTogglePin ở trên). */}
+                <button
+                  onClick={(e) => { e.stopPropagation(); setOverrideLayer(unassignGoal(overrideLayer, it.goalId)); }}
+                  title="Gỡ khỏi Timeline"
+                  style={{ background: "none", border: "none", color: theme.textDim, fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}>
+                  ↩︎
+                </button>
+              </div>
+            );
+          }
           // Buffer ("Nghỉ giữa việc") không phải task thật — không cho tick,
           // vẫn hiển thị mờ như cũ để thấy khoảng trống trong lịch.
           if (it.isBuffer) {
@@ -10490,37 +11850,157 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
               </div>
             );
           }
+          // [V42 PR2.2] Resize handle CHỈ cho Routine block — trong
+          // timelineItems, Routine là item không phải buffer và không
+          // phải fixed (isBuffer=false, isFixed=false). Fixed (📌) và
+          // buffer đã return ở nhánh trên/giữ nguyên, không có handle.
+          const isRoutineBlock = !it.isBuffer && !it.isFixed;
+          const previewDur = isRoutineBlock ? getDragPreviewDur(it.doneKey, it.dur) : it.dur;
+          const previewEnd = isRoutineBlock && previewDur !== it.dur
+            ? minutesToHHMMV33(parseTimeToMinutesV33(it.start) + previewDur)
+            : it.end;
+          const isDraggingThis = dragStateRef.current && dragStateRef.current.doneKey === it.doneKey;
           return (
-            <div key={it.key} onClick={() => toggleTimelineItem(it.doneKey)}
+            <div key={it.key} onClick={() => toggleTimelineItem(it)}
+              title={it.overflow ? "Lịch quá tải — khối này không đủ chỗ, xem khu \"Chưa xếp được\" bên dưới" : undefined}
               style={{
                 display: "flex", gap: 10, alignItems: "center", cursor: "pointer",
                 padding: "9px 10px", marginBottom: 6, borderRadius: 10,
                 background: done ? `${it.color}12` : theme.surfaceAlt,
                 borderLeft: `3px solid ${it.color}`,
+                // [V42 PR3.4] Block bị Reflow đẩy tới mức không đủ chỗ (vượt
+                // giờ ngủ hoặc đè lên mốc pin kế tiếp) — viền cảnh báo màu
+                // danger bao quanh toàn khối, để không "âm thầm chồng đè"
+                // hay trông giống một block bình thường. Không đổi
+                // borderLeft (vẫn giữ màu gốc của block để nhận diện loại).
+                border: it.overflow ? `1px dashed ${theme.danger}` : "1px solid transparent",
                 opacity: done ? 0.65 : 1,
+                position: "relative",
               }}>
-              <NeonCheckbox checked={done} onChange={() => toggleTimelineItem(it.doneKey)} accent={it.color}/>
+              <NeonCheckbox checked={done} onChange={() => toggleTimelineItem(it)} accent={it.color}/>
               <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                {it.start}–{it.end}
+                {it.start}–{previewEnd}
               </span>
+              {/* [V42 PR2.3 fix] Icon đầu block chỉ biểu diễn LOẠI block
+                  (isFixed → 📌, còn lại → ⏰) — không được đổi theo trạng
+                  thái pinned. Trạng thái pin chỉ hiển thị qua nút pin riêng
+                  (📎/📍) ở dưới, để tránh nhầm "loại block" với "trạng thái". */}
               <span style={{ fontSize: 13 }}>{it.isFixed ? "📌" : "⏰"}</span>
               <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
                 <span key={done ? "done" : "undone"} className={done ? "task-text-done" : ""} style={{ "--strike-color": it.color, color: theme.text }}>
                   {it.name}
                 </span>
+                {/* [V42 PR3.4] Badge chữ tường minh — không chỉ dựa vào
+                    viền dashed (màu sắc/kiểu viền có thể không đủ nổi bật
+                    để "không âm thầm chồng đè" theo đúng yêu cầu edge case
+                    #9). Chỉ hiện khi block thật sự overflow. */}
+                {it.overflow && (
+                  <span style={{
+                    marginLeft: 6, fontSize: 10, fontWeight: 700,
+                    color: theme.danger, whiteSpace: "nowrap",
+                  }}>
+                    ⚠ quá tải
+                  </span>
+                )}
               </span>
+              {/* [V42 PR2.3] Nút pin/unpin — CHỈ cho Routine block, cùng điều
+                  kiện với resize handle (isRoutineBlock). Đặt cạnh resize
+                  handle, không che nó. Chỉ ghi cờ pinned qua
+                  pinTimelineBlock/unpinTimelineBlock (PR2.1, không sửa) —
+                  chưa chặn gì (Reflow/resize-đẩy thuộc Phase 3). */}
+              {isRoutineBlock && (
+                <button
+                  onClick={(e) => handleTogglePin(e, it)}
+                  title={it.pinned ? "Bỏ ghim" : "Ghim (Reflow sẽ không đẩy giờ khối này)"}
+                  style={{
+                    position: "absolute", right: 32, bottom: 2,
+                    width: 22, height: 18, cursor: "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    background: "transparent", border: "none", padding: 0,
+                    opacity: it.pinned ? 1 : 0.35,
+                    fontSize: 12, lineHeight: 1,
+                  }}
+                >
+                  {it.pinned ? "📍" : "📎"}
+                </button>
+              )}
+              {isRoutineBlock && (
+                <div
+                  onMouseDown={(e) => handleResizeStart(e, it)}
+                  onTouchStart={(e) => handleResizeStart(e, it)}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    position: "absolute", right: 6, bottom: 2,
+                    width: 22, height: 14, cursor: "ns-resize",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    opacity: isDraggingThis ? 1 : 0.35,
+                    touchAction: "none",
+                  }}
+                  title="Kéo để đổi thời lượng"
+                >
+                  <span style={{ width: 16, height: 3, borderRadius: 2, background: it.color }} />
+                </div>
+              )}
             </div>
           );
         })}
       </div>
 
+      {/* [V42 PR3.4] Khu "Chưa xếp được — quá tải hôm nay" (edge case #9,
+          Điều kiện hoàn thành PR3.3 gốc theo roadmap: "người dùng luôn
+          biết có bao nhiêu việc rớt ra khỏi ngày"). Đọc THUẦN từ field
+          `overflow` mà reflowTimelineBlocks (PR3.4) đã gắn sẵn trên từng
+          item — không tính toán lại, không state mới, không storage mới.
+          Chỉ hiện khi có ít nhất 1 block overflow, để không đổi giao diện
+          của những ngày lịch bình thường (không quá tải). */}
+      {(() => {
+        const overflowItems = timelineItems.filter(it => !it.isBuffer && it.overflow);
+        if (overflowItems.length === 0) return null;
+        return (
+          <div style={{
+            marginTop: 10, padding: "10px 12px", borderRadius: 10,
+            background: `${theme.danger}12`, border: `1px dashed ${theme.danger}`,
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: theme.danger, marginBottom: 6 }}>
+              ⚠ Chưa xếp được — quá tải hôm nay ({overflowItems.length})
+            </div>
+            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 6 }}>
+              Lịch hôm nay không đủ chỗ cho các việc dưới đây (do trễ giờ hoặc bị chặn bởi khối đã ghim). Không có việc nào bị xoá — cân nhắc ghim lại thời điểm hoặc bỏ ghim khối chặn.
+            </div>
+            {overflowItems.map(it => (
+              <div key={it.key} style={{ display: "flex", gap: 8, alignItems: "center", padding: "4px 0", fontSize: 12 }}>
+                <span style={{ width: 4, height: 4, borderRadius: "50%", background: theme.danger, flexShrink: 0 }} />
+                <span style={{ color: theme.text }}>{it.name}</span>
+                <span style={{ color: theme.textDim, fontSize: 10 }}>({it.dur}')</span>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
+
       <div style={{ marginTop: 10 }}>
-        <button onClick={regenerate} disabled={regenerating}
-          style={{ padding: "5px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: "transparent",
-            color: regenerating ? theme.textDim : theme.text, fontSize: 10, fontWeight: 600,
-            cursor: regenerating ? "default" : "pointer" }}>
-          {regenerating ? "Đang xếp lại…" : "🔄 Làm lại"}
-        </button>
+        {/* [V42 PR5.1] "Làm lại" giờ đi qua requestRegenerate — CHỈ hỏi xác
+            nhận (InlineConfirm) khi Override Layer đang có dữ liệu chưa
+            "chốt" (Edge case #5). Khi layer rỗng (trường hợp phổ biến nhất —
+            người dùng chưa từng resize/pin/gán goal), hành vi giữ NGUYÊN
+            100% như trước PR5.1: bấm là chạy ngay, không có bước xác nhận
+            thừa. */}
+        {confirmRegenerate ? (
+          <InlineConfirm
+            message="Làm lại sẽ xoá các điều chỉnh giờ thủ công hôm nay — tiếp tục?"
+            confirmLabel="Làm lại"
+            cancelLabel="Huỷ"
+            onConfirm={() => { setConfirmRegenerate(false); regenerate(); }}
+            onCancel={() => setConfirmRegenerate(false)}
+          />
+        ) : (
+          <button onClick={requestRegenerate} disabled={regenerating}
+            style={{ padding: "5px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: "transparent",
+              color: regenerating ? theme.textDim : theme.text, fontSize: 10, fontWeight: 600,
+              cursor: regenerating ? "default" : "pointer" }}>
+            {regenerating ? "Đang xếp lại…" : "🔄 Làm lại"}
+          </button>
+        )}
       </div>
       {errorMsg && <div style={{ fontSize: 10, color: theme.danger, marginTop: 6 }}>⚠ {errorMsg}</div>}
     </div>
@@ -10670,6 +12150,12 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
   const [goalManagerOpen,setGoalManagerOpen]=useState(false);
   const custom=Array.isArray(data.custom)?data.custom:[];
 
+  // [V42 PR1.3] Timeline Override Layer của ngày `td` — CHỈ state/storage,
+  // không business logic. Truyền overrideLayer xuống SmartSchedule để nó
+  // tự áp qua applyTimelineOverrides(); setOverrideLayer chưa có caller
+  // nào ở PR1.3 (đúng phạm vi PR2.2+ mới bắt đầu dùng).
+  const { overrideLayer: timelineOverrideLayer, setOverrideLayer: setTimelineOverrideLayer } = useTimelineOverrides(td);
+
   // XP fly-up + sound khi dayE tăng
   const prevDayERef = useRef(dayE);
   const [xpGain, setXpGain] = useState(null);
@@ -10718,23 +12204,14 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
   const mv=(id,dir)=>{const i=custom.findIndex(c=>c.id===id);if(i<0)return;const a=[...custom];const ni=i+dir;if(ni<0||ni>=a.length)return;[a[i],a[ni]]=[a[ni],a[i]];save(td,{custom:a});};
   const addRec=()=>{if(!newRec.trim())return;const r={id:"rec_"+Date.now(),label:newRec.trim()};saveSetts({recurring:[...(setts.recurring||[]),r]});save(td,{custom:[...custom,{...r,done:false}]});setNewRec("");};
 
-  // ── AI Planner "today" bucket — nâng lên đây để MorningWidget và
-  // DailyRouteCard dùng CHUNG 1 state, tránh trường hợp cả hai tự load
-  // storage độc lập rồi không đồng bộ với nhau sau khi người dùng bấm
-  // "Áp dụng"/"Làm lại" trong MorningWidget (DailyRouteCard trước đó chỉ
-  // load 1 lần lúc mount và không có cách nào biết MorningWidget vừa ghi
-  // entry mới, nên card cứ đứng im ở trạng thái rỗng ban đầu).
-  const plannerStorage = useMemo(() => createPlannerStorage(S), []);
-  const [plannerToday, setPlannerToday] = useState(null);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const rotated = await plannerStorage.rotateDay(td);
-      if (!cancelled) setPlannerToday(rotated);
-    })();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [td]);
+  // ── AI Planner "today" bucket — nâng lên PlannerRuntimeProvider (PR0.2)
+  // để MorningWidget và DailyRouteCard dùng CHUNG 1 state, tránh trường hợp
+  // cả hai tự load storage độc lập rồi không đồng bộ với nhau sau khi người
+  // dùng bấm "Áp dụng"/"Làm lại" trong MorningWidget. Trước PR0.2, Today tự
+  // tạo plannerStorage/plannerToday bằng useMemo/useState + effect rotateDay
+  // riêng; giờ đọc thẳng từ Context — Provider đã chạy rotateDay y hệt logic
+  // cũ (xem PlannerRuntimeProvider ở đầu file). Không đổi hành vi runtime.
+  const { plannerStorage, plannerToday, setPlannerToday } = useContext(PlannerRuntimeContext);
 
   // [PATCH] ── Tự động chọn 1 Mục tiêu lớn từ Kho mỗi ngày ────────────────
   // Chỉ chạy khi: (a) goalPool đã tải xong, (b) hôm nay CHƯA có goal nào
@@ -10804,7 +12281,8 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
       <Section title="Kế hoạch & Nhiệm vụ chính" icon="🎯" theme={theme} defaultOpen={true}>
         {/* Morning Widget (AI Planner check-in) */}
         <MorningWidget td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} onSwitchTab={onSwitchTab} taskPool={taskPool} onAddPoolTask={onAddPoolTask} onEditPoolTask={onEditPoolTask}
-          plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}/>
+          plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}
+          overrideLayer={timelineOverrideLayer} setOverrideLayer={setTimelineOverrideLayer}/>
 
         {/* AI đề xuất — chỉ hiển thị gợi ý, không tự thêm vào Today's Goals.
             Người dùng bấm "Áp dụng" (từng mục hoặc tất cả) mới chuyển sang
@@ -10813,9 +12291,14 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
           plannerStorage={plannerStorage} plannerToday={plannerToday}
           onAddPoolTask={onAddPoolTask} save={save}/>
 
-        {/* Mục tiêu lớn — "nếu hôm nay chỉ hoàn thành được 1 việc thì đó là việc gì" */}
+        {/* Mục tiêu lớn — "nếu hôm nay chỉ hoàn thành được 1 việc thì đó là việc gì"
+            [V42 PR4.4] plannerToday/overrideLayer/taskPool truyền thêm (đã
+            có sẵn ở Today qua PlannerRuntimeContext/useTimelineOverrides,
+            KHÔNG tạo state mới) để OneBigWinCard tự tính gợi ý Free Time dài
+            nhất — thuần đọc, không ghi Override Layer. */}
         <OneBigWinCard td={td} data={data} goalPool={goalPool} save={save} onOpenManager={()=>setGoalManagerOpen(true)}
-          onMarkGoalPicked={onMarkGoalPicked} onBumpGoalDoneCount={onBumpGoalDoneCount} onBumpGoalSkipCount={onBumpGoalSkipCount}/>
+          onMarkGoalPicked={onMarkGoalPicked} onBumpGoalDoneCount={onBumpGoalDoneCount} onBumpGoalSkipCount={onBumpGoalSkipCount}
+          plannerToday={plannerToday} overrideLayer={timelineOverrideLayer} taskPool={taskPool}/>
 
         {/* Mục tiêu hôm nay — danh sách nhiều việc cần hoàn thành trong ngày,
             KHÔNG phải Routine. AI có thể đề xuất (qua AISuggestionsCard ở
@@ -10824,12 +12307,28 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
           onToggle={onTogglePoolTask} onAdd={onAddTodayGoal} onRemove={onRemoveTodayGoal}
           onReorder={onReorderTodayGoals} onEditPoolTask={onEditPoolTask} onOpenManager={()=>setPoolManagerOpen(true)}/>
 
+        {/* [V42 PR4.1/4.2] Dải "Chưa xếp giờ" — hiển thị các goal trong
+            dailyPicks/Today's Goals chưa được gán giờ trên Timeline bên
+            dưới. [PR4.2] Thêm khả năng "Gán giờ" tối thiểu (chọn giờ bắt
+            đầu qua input, không drag-drop) — vẫn KHÔNG có gesture kéo-thả.
+            Đặt ngay trên SmartSchedule vì đây là "dải cạnh timeline" theo
+            đúng mô tả roadmap PR4.1. */}
+        <UnscheduledGoalsLane data={data} taskPool={taskPool}
+          overrideLayer={timelineOverrideLayer} setOverrideLayer={setTimelineOverrideLayer}/>
+
         {/* Lịch trình thông minh theo giờ — CHỈ trả lời "hôm nay đến mấy giờ
             thì làm gì?" (Routine + lịch học thêm cố định theo giờ thật).
             Không còn danh sách nhiệm vụ/mục tiêu để tick trong card này nữa —
-            việc đó đã chuyển hẳn sang TodaysGoalsCard/OneBigWinCard ở trên. */}
+            việc đó đã chuyển hẳn sang TodaysGoalsCard/OneBigWinCard ở trên.
+            [V42 PR4.2] onTogglePoolTask được truyền thêm để Goal ĐÃ gán giờ
+            hiển thị trên Timeline có thể tick hoàn thành NGAY tại đó, dùng
+            ĐÚNG cơ chế poolDone cũ (togglePoolTaskToday, KHÔNG sửa hàm đó) —
+            không tạo nguồn cộng XP thứ hai, không đi qua timelineDone/
+            toggleTimelineItem (vốn dành riêng cho Routine/Fixed). */}
         <SmartSchedule td={td} data={data} db={db} dayExp={dayExp} setts={setts} save={save} taskPool={taskPool}
-          plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}/>
+          plannerStorage={plannerStorage} plannerToday={plannerToday} onPlannerTodayChange={setPlannerToday}
+          overrideLayer={timelineOverrideLayer} setOverrideLayer={setTimelineOverrideLayer}
+          onTogglePoolTask={onTogglePoolTask}/>
 
         {/* Chuẩn bị ngày mai */}
         <TomorrowPrepCard td={td} data={data} save={save}/>
