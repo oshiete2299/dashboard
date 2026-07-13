@@ -1715,6 +1715,7 @@ function buildScheduleV33(tasks, ctx) {
        // 1-1 với timelineDone nếu cần đối chiếu).
        [doneKey]: {
          durOverride: number | null,  // phút, ghi đè dur gốc nếu đã resize (PR2.x)
+         startOverride: string | null,// "HH:MM", ghi đè start gốc nếu đã Reschedule (PR44.2)
          pinned: boolean,             // ghim — Reflow không đẩy giờ (PR2.3)
          doneAt: string | null,       // "HH:MM" thời điểm tick thực tế (PR3.x)
        }
@@ -1814,18 +1815,27 @@ function applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks) {
       // sàng nhận override thật từ PR2.x/PR3.x trở đi.
       // [V42 PR2.1] durOverride giờ được ÁP DỤNG THẬT (từ PR2.1 trở đi)
       // khi người dùng resize — end được tính lại từ start gốc + dur mới.
+      // [PR44.2] startOverride — ghi đè start gốc khi người dùng đổi giờ
+      // qua popup "Đổi thời gian" (Reschedule, thay thế hoàn toàn cơ chế
+      // kéo-thả đổi thứ tự hiển thị của PR44.1 mục 3, đã bị xoá). Áp DỤNG
+      // TRƯỚC khi tính dur/end, để end luôn được tính từ start HIỂN THỊ
+      // (đã override, nếu có) + dur HIỂN THỊ (đã override, nếu có) — đúng
+      // 1 nguồn chân lý duy nhất cho mỗi block.
+      const start = override && typeof override.startOverride === "string" && override.startOverride.length > 0
+        ? override.startOverride
+        : b.start;
       const dur = override && typeof override.durOverride === "number"
         ? override.durOverride
         : (typeof b.dur === "number" ? b.dur : minutesBetweenHHMM(b.start, b.end));
-      const end = override && typeof override.durOverride === "number"
-        ? minutesToHHMMV33(parseTimeToMinutesV33(b.start) + dur)
+      const end = (start !== b.start) || (override && typeof override.durOverride === "number")
+        ? minutesToHHMMV33(parseTimeToMinutesV33(start) + dur)
         : b.end;
 
       return {
         key: (b.type === "fixed" ? "fx" : b.type === "buffer" ? "buf" : "rt") + i,
         doneKey,
         name: b.name,
-        start: b.start,
+        start,
         end,
         dur,
         isBuffer: b.type === "buffer",
@@ -1850,7 +1860,75 @@ function applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks) {
   // không sửa/không ảnh hưởng hành vi Reflow đã chốt ở PR3.2/3.3/3.4 theo
   // đúng yêu cầu phạm vi PR4.2 ("Không sửa Reflow"). Goal được merge vào
   // SAU khi Reflow đã chạy xong trên block thường.
-  const reflowedBlocks = reflowTimelineBlocks(localBlocks);
+  // [PR44.2] Sắp lại localBlocks theo `start` THẬT (đã áp startOverride ở
+  // bước map phía trên) TRƯỚC khi đưa vào reflowTimelineBlocks — Reflow
+  // (PR3.2/3.3/3.4, KHÔNG sửa thuật toán bên trong hàm đó) giả định mảng
+  // đầu vào đã theo đúng thứ tự thời gian (dùng chỉ số mảng để tính
+  // cumulativeDeltaMin cộng dồn + tìm mốc pin kế tiếp qua
+  // nextBoundaryMinByIndex) — nếu 1 block bị Reschedule ra khỏi vị trí gốc
+  // trong schedule[] (vd dời "Ngủ" 23:00 lên 06:00, giữa "Học" và "Ăn
+  // trưa"), Reflow phải THẤY đúng vị trí thời gian mới của nó thì mới dồn
+  // đúng các block bị chồng giờ phía sau — đây là sửa NGUỒN dữ liệu đưa
+  // vào Reflow, không phải một bước sort thêm ở tầng UI sau khi kéo (đúng
+  // yêu cầu "đừng vá bug bằng cách sort lại sau khi kéo" — sort này nằm
+  // NGAY TRONG applyTimelineOverrides, hàm thuần tính timeline, không phải
+  // ở component SmartSchedule). NO-OP với mọi dữ liệu cũ (không có
+  // startOverride nào) vì schedule[] gốc vốn đã theo thứ tự thời gian.
+  const sortedLocalBlocks = [...localBlocks].sort(
+    (a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start)
+  );
+
+  const reflowedBlocks = reflowTimelineBlocks(sortedLocalBlocks);
+
+  // [PR44.2] Sắp lại reflowedBlocks theo `start` THẬT (sau khi
+  // startOverride/Reflow đã áp) — đây LÀ NGUỒN DỮ LIỆU, không phải một bước
+  // "sort lại sau khi kéo" ở tầng UI: applyTimelineOverrides là hàm THUẦN
+  // duy nhất tính ra thứ tự hiển thị, nên khi startOverride đổi giờ một
+  // block ra khỏi vị trí gốc trong schedule[] (vd dời "Ngủ" 23:00 lên
+  // 06:00), mảng trả về phải phản ánh đúng thứ tự thời gian mới NGAY TẠI
+  // ĐÂY — không có khái niệm "thứ tự hiển thị" nào khác tách rời khỏi
+  // start thật của từng block (đúng mô hình "Reschedule" PR44.2 yêu cầu:
+  // "Timeline luôn hiển thị theo thứ tự thời gian thực"). Trước PR44.2,
+  // không cần bước này vì chưa có startOverride nào tồn tại — schedule[]
+  // gốc (từ buildScheduleV33) vốn đã theo thứ tự thời gian, nên sort ở đây
+  // là NO-OP với mọi dữ liệu cũ (không đổi hành vi khi overrideLayer rỗng).
+  const sortedReflowedBlocks = [...reflowedBlocks].sort(
+    (a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start)
+  );
+
+  // [PR44.2] resolveTimelineOverlaps — bước MỚI, chạy SAU Reflow (không
+  // đụng reflowTimelineBlocks, PR3.x): dồn các block bị CHỒNG GIỜ do
+  // Reschedule (startOverride đưa 1 block vào giữa/đè lên khoảng thời gian
+  // của block khác — Reflow (PR3.x) chỉ dịch theo delta của doneAt sớm/
+  // trễ, KHÔNG biết xử lý va chạm phát sinh từ việc đổi giờ thủ công).
+  // Quét tuần tự theo thứ tự đã sort ở trên; mỗi block KHÔNG pinned mà có
+  // start sớm hơn end của block liền trước (đã xử lý ở vòng lặp này) bị
+  // đẩy lùi đúng bằng phần chồng, giữ nguyên dur — đúng yêu cầu PR44.2
+  // "Không được chồng nhau" + "nếu có block bị chồng thì hệ thống tự dồn
+  // xuống". Block pinned giữ nguyên vị trí (không bị đẩy bởi block trước
+  // nó) — cùng nguyên tắc "ghim = không dịch" đã áp dụng nhất quán từ
+  // PR2.3/PR3.3, để không phá vỡ ngữ nghĩa pin đã có.
+  const deOverlappedBlocks = (() => {
+    const out = [];
+    let prevEndMin = null;
+    for (const b of sortedReflowedBlocks) {
+      if (b.pinned) {
+        out.push(b);
+        prevEndMin = parseTimeToMinutesV33(b.end);
+        continue;
+      }
+      let startMin = parseTimeToMinutesV33(b.start);
+      let endMin = parseTimeToMinutesV33(b.end);
+      const dur = endMin - startMin;
+      if (prevEndMin != null && startMin < prevEndMin) {
+        startMin = prevEndMin;
+        endMin = startMin + dur;
+      }
+      out.push({ ...b, start: minutesToHHMMV33(startMin), end: minutesToHHMMV33(endMin) });
+      prevEndMin = endMin;
+    }
+    return out;
+  })();
 
   // [V42 PR4.2] Merge Goal đã gán giờ (overrideLayer.goals, schema PR1.1,
   // KHÔNG đổi) thành block hiển thị trên timeline — hoàn toàn TÁCH biệt
@@ -1901,15 +1979,168 @@ function applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks) {
     })
     .filter(Boolean);
 
-  if (goalBlocks.length === 0) return reflowedBlocks;
+  if (goalBlocks.length === 0) return deOverlappedBlocks;
 
   // Gộp rồi sắp theo `start` để hiển thị đúng thứ tự thời gian trên
-  // Timeline (reflowedBlocks vốn đã theo thứ tự thời gian của schedule[]
-  // gốc; chèn thêm goalBlocks rồi sort lại theo start là cách đơn giản
-  // nhất để giữ đúng thứ tự hiển thị mà không cần thuật toán chèn xen kẽ).
-  return [...reflowedBlocks, ...goalBlocks].sort(
+  // Timeline (deOverlappedBlocks đã theo thứ tự thời gian thật, không
+  // chồng giờ, PR44.2; chèn thêm goalBlocks rồi sort lại theo start là
+  // cách đơn giản nhất để giữ đúng thứ tự hiển thị mà không cần thuật
+  // toán chèn xen kẽ).
+  return [...deOverlappedBlocks, ...goalBlocks].sort(
     (a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start)
   );
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   [V45 PR45.2] FREE TIME ENGINE — hàm thuần, tách riêng khỏi
+   applyTimelineOverrides/reflowTimelineBlocks (KHÔNG sửa 2 hàm đó).
+   ══════════════════════════════════════════════════════════════════════
+   Bối cảnh: trước PR45, buffer (khoảng trống giữa các block Routine/
+   Fixed) chỉ tồn tại ở TẦNG DỮ LIỆU cho Reflow tính delta — KHÔNG có
+   entry point nào tự lấp goal chưa xếp giờ vào đó, và không có khái
+   niệm hiển thị "Thời gian tự do" (xem comment PR4.2 ở
+   UnscheduledGoalsLane: "không tự ý implement PR Break/Free Time đã bỏ
+   lỡ" — PR45.2 CHÍNH LÀ phần việc đó, làm đúng sau khi đã xác nhận rõ
+   phạm vi với Bảo).
+
+   Nguyên tắc thiết kế (đúng yêu cầu PR45 mục 4-7):
+     - Không có khoảng chết vô nghĩa: mọi khoảng trống thật giữa 2 block
+       liền kề (sau khi đã Reflow + de-overlap, tức timelineItems cuối
+       cùng) phải HOẶC chứa 1 Goal chưa xếp giờ, HOẶC được đánh dấu rõ
+       "Thời gian tự do" — không bao giờ hiển thị im lặng không có gì.
+     - Goal chưa xếp giờ được ƯU TIÊN lấp vào khoảng trống LỚN NHẤT
+       trước (đúng thứ tự dailyPicks cho các khoảng bằng nhau) — không
+       phải khoảng ĐẦU TIÊN, để tránh nhét 1 goal 60' vào khe 15' rồi bỏ
+       phí khe 90' ngay sau đó.
+     - CHỈ tính khoảng trống GIỮA các block đã có + SAU block cuối cùng
+       tới giờ ngủ (SLEEP_BOUNDARY_MIN, cùng hằng số Reflow dùng) — KHÔNG
+       tính khoảng ĐẦU NGÀY trước block đầu tiên (an toàn, không đụng
+       phần thời gian đã/đang qua — xác nhận rõ với Bảo trước khi code).
+     - Nếu Goal dài hơn khoảng trống lớn nhất hiện có: BỎ QUA goal đó
+       (không cắt dur, không ép vào), để nguyên trong
+       UnscheduledGoalsLane chờ Bảo tự gán giờ — xác nhận rõ với Bảo.
+     - Đây là 1 lớp tính toán HIỂN THỊ THÊM, chạy SAU applyTimelineOverrides
+       (nhận thẳng output của nó) — KHÔNG ghi ngược vào overrideLayer.goals
+       tại đây (goal "tự động lấp" chỉ là gợi ý hiển thị real-time, KHÔNG
+       phải 1 lần gán cứng — nếu Bảo xoá goal đó khỏi dailyPicks hoặc tự
+       gán giờ chỗ khác, lần render sau engine tự tính lại, không để lại
+       state "ma" trong overrideLayer). Nếu muốn CHỐT một suggestion thành
+       giờ thật cố định, dùng nút "🕐 Gán giờ" sẵn có ở UnscheduledGoalsLane
+       (gọi assignGoalToSlot, cùng schema PR4.2, không đổi).
+   ────────────────────────────────────────────────────────────────────── */
+
+// [PR45.2] computeFreeTimeGaps(timelineItems) — hàm thuần. Nhận
+// timelineItems (output CUỐI CÙNG của applyTimelineOverrides, đã Reflow +
+// de-overlap + merge goal đã gán giờ), trả về mảng các khoảng trống thật
+// { start, end, dur } giữa các block liền kề + từ block cuối cùng tới giờ
+// ngủ. Bỏ qua các item isBuffer (buffer chỉ là dữ liệu nội bộ cũ cho
+// Reflow, không phải "khoảng trống thật" theo nghĩa PR45 — khoảng trống
+// thật được TÍNH LẠI ở đây từ start/end thật sau cùng của mọi block hiển
+// thị, để không phụ thuộc vào cách buffer được sinh ra trong buildScheduleV33).
+function computeFreeTimeGaps(timelineItems) {
+  const SLEEP_BOUNDARY_MIN = parseTimeToMinutesV33("23:30");
+  const realBlocks = (timelineItems || [])
+    .filter(it => !it.isBuffer)
+    .map(it => ({ startMin: parseTimeToMinutesV33(it.start), endMin: parseTimeToMinutesV33(it.end) }))
+    .sort((a, b) => a.startMin - b.startMin);
+
+  const gaps = [];
+  let cursor = realBlocks.length ? realBlocks[0].endMin : null;
+  for (let i = 1; i < realBlocks.length; i++) {
+    const b = realBlocks[i];
+    if (b.startMin > cursor) {
+      gaps.push({ startMin: cursor, endMin: b.startMin });
+    }
+    cursor = Math.max(cursor, b.endMin);
+  }
+  // Khoảng sau block cuối cùng tới giờ ngủ — CHỈ tính nếu còn dương và có
+  // ít nhất 1 block thật trong ngày (nếu timeline hoàn toàn rỗng, không
+  // có "block cuối" nào làm mốc, engine không tự bịa ra khoảng trống từ
+  // đầu ngày — đúng phạm vi đã xác nhận "không tính khoảng đầu ngày").
+  if (cursor !== null && cursor < SLEEP_BOUNDARY_MIN) {
+    gaps.push({ startMin: cursor, endMin: SLEEP_BOUNDARY_MIN });
+  }
+
+  return gaps
+    .map(g => ({
+      start: minutesToHHMMV33(g.startMin),
+      end: minutesToHHMMV33(g.endMin),
+      dur: g.endMin - g.startMin,
+    }))
+    .filter(g => g.dur > 0);
+}
+
+// [PR45.2] autoFillUnscheduledGoals(timelineItems, unscheduledGoals) —
+// hàm thuần. Nhận timelineItems (output applyTimelineOverrides) +
+// unscheduledGoals (mảng {id, name, dur} — CHỈ những goal trong
+// dailyPicks CHƯA có trong overrideLayer.goals, do component tự lọc
+// trước khi gọi, cùng điều kiện UnscheduledGoalsLane đã dùng). Trả về:
+//   {
+//     placedSuggestions: [{ goalId, name, dur, start, end }],  // gợi ý
+//       lấp goal vào khoảng trống — CHỈ HIỂN THỊ, chưa ghi overrideLayer.
+//     freeTimeBlocks: [{ start, end, dur }],  // khoảng trống còn lại
+//       SAU khi đã "lấp" hết goal có thể lấp — đây mới là phần hiện
+//       "Thời gian tự do" theo đúng yêu cầu #7 ("nếu không còn Goal thì
+//       mới hiện Thời gian tự do").
+//   }
+// Thuật toán: sắp khoảng trống theo dur giảm dần (khoảng LỚN NHẤT trước —
+// đúng yêu cầu #6 "ưu tiên khoảng trống lớn nhất"), với goal chưa xếp giữ
+// nguyên THỨ TỰ dailyPicks (không sort lại goal — đúng thứ tự Bảo đã sắp ở
+// Today's Goals). Với mỗi khoảng trống (lớn→nhỏ), lấp goal ĐẦU TIÊN còn lại
+// trong danh sách mà dur <= khoảng trống đó (không cắt dur — nếu goal dài
+// hơn MỌI khoảng trống còn lại, bỏ qua goal đó, giữ nguyên trong
+// UnscheduledGoalsLane, đúng xác nhận với Bảo). 1 khoảng trống chỉ nhận
+// TỐI ĐA 1 goal ở PR45.2 (không chia nhỏ khoảng trống để nhét nhiều goal —
+// giữ đơn giản, đúng phạm vi tối thiểu; phần còn lại của khoảng trống sau
+// khi đặt 1 goal vào đầu khoảng đó sẽ tự động xuất hiện lại như 1 khoảng
+// trống mới, ngắn hơn, ở lượt tính freeTimeBlocks bên dưới).
+function autoFillUnscheduledGoals(timelineItems, unscheduledGoals) {
+  const gaps = computeFreeTimeGaps(timelineItems);
+  const gapsByDurDesc = [...gaps].sort((a, b) => b.dur - a.dur);
+
+  const remainingGoals = [...(unscheduledGoals || [])].filter(
+    g => g && typeof g.dur === "number" && g.dur > 0
+  );
+  const placedSuggestions = [];
+  // Khoảng trống CÒN LẠI sau khi đặt goal — dùng object-keyed-by-start để
+  // dễ tra/patch từng khoảng khi 1 goal chiếm phần ĐẦU của khoảng đó,
+  // tương tự cách overrideLayer.blocks dùng object-keyed-by-doneKey.
+  const leftoverByStart = {};
+  gaps.forEach(g => { leftoverByStart[g.start] = { ...g }; });
+
+  for (const gap of gapsByDurDesc) {
+    const leftover = leftoverByStart[gap.start];
+    if (!leftover || leftover.dur <= 0) continue;
+    const idx = remainingGoals.findIndex(g => g.dur <= leftover.dur);
+    if (idx === -1) continue; // không goal nào vừa khoảng này — để trống, thử khoảng khác
+    const [goal] = remainingGoals.splice(idx, 1);
+    const startMin = parseTimeToMinutesV33(leftover.start);
+    const endMin = startMin + goal.dur;
+    placedSuggestions.push({
+      goalId: goal.id,
+      name: goal.name,
+      dur: goal.dur,
+      start: leftover.start,
+      end: minutesToHHMMV33(endMin),
+    });
+    // Phần còn lại của khoảng trống này (nếu goal không chiếm hết) trượt
+    // start lên, dur giảm tương ứng — để freeTimeBlocks bên dưới đọc đúng.
+    leftoverByStart[gap.start] = {
+      start: minutesToHHMMV33(endMin),
+      end: leftover.end,
+      dur: leftover.end ? parseTimeToMinutesV33(leftover.end) - endMin : 0,
+    };
+  }
+
+  const freeTimeBlocks = Object.values(leftoverByStart)
+    .filter(g => g.dur > 0)
+    .sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start));
+
+  // placedSuggestions hiển thị theo thứ tự THỜI GIAN (không theo thứ tự
+  // đặt vào, vì đặt theo dur giảm dần có thể ra thứ tự thời gian lộn xộn).
+  placedSuggestions.sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start));
+
+  return { placedSuggestions, freeTimeBlocks };
 }
 
 
@@ -2299,6 +2530,52 @@ function resizeTimelineBlock(layer, doneKey, newDur) {
     ...next.blocks,
     [doneKey]: {
       durOverride: newDur,
+      startOverride: existing.startOverride || null,
+      pinned: !!existing.pinned,
+      doneAt: existing.doneAt || null,
+    },
+  };
+  return next;
+}
+
+// [PR44.2] rescheduleTimelineBlock(layer, doneKey, newStart, newDur)
+// Ghi đè CẢ startOverride VÀ durOverride cho ĐÚNG 1 block (nhận diện qua
+// doneKey — công thức "start|tên" gốc, KHÔNG đổi vì đó là khoá tra cứu
+// trong overrideLayer.blocks, không phải giá trị hiển thị). Đây là hàm
+// GHI DUY NHẤT cho popup "Đổi thời gian" (thay thế hoàn toàn mô hình
+// "Reorder" của PR44.1 mục 3 — đổi THỜI GIAN THẬT thay vì đổi vị trí
+// render).
+// - Cùng pattern THUẦN với resizeTimelineBlock/pinTimelineBlock (PR2.1):
+//   nhận layer hiện tại + tham số thao tác, trả về layer MỚI, KHÔNG
+//   mutate input, KHÔNG đọc/ghi storage, KHÔNG side effect, KHÔNG React.
+// - newStart phải là "HH:MM" hợp lệ (00:00–23:59); newDur phải là số
+//   dương hữu hạn. Nếu 1 trong 2 không hợp lệ, trả về layer KHÔNG đổi
+//   (bản sao, không mutate) — validate "không cho lưu nếu sai" là việc
+//   của UI (RescheduleBlockPopup) TRƯỚC khi gọi hàm này; hàm thuần ở đây
+//   chỉ là một lớp chặn an toàn thứ 2, không tự làm tròn/áp ngưỡng.
+// - Không tự đẩy/dồn các block phía sau — đó là việc của
+//   applyTimelineOverrides (đọc start/dur mới) + reflowTimelineBlocks
+//   (PR3.2, không sửa) để dồn các block bị chồng giờ, y hệt cách resize
+//   (durOverride) đã hoạt động từ PR2.1.
+// - Giữ nguyên pinned/doneAt hiện có của block đó nếu có; chỉ patch
+//   startOverride + durOverride.
+function isValidHHMMV442(s) {
+  if (typeof s !== "string") return false;
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(s);
+  return !!m;
+}
+function rescheduleTimelineBlock(layer, doneKey, newStart, newDur) {
+  const next = cloneTimelineOverrideLayer(layer);
+  if (!doneKey || !isValidHHMMV442(newStart)
+      || typeof newDur !== "number" || !isFinite(newDur) || newDur <= 0) {
+    return next;
+  }
+  const existing = next.blocks[doneKey] || {};
+  next.blocks = {
+    ...next.blocks,
+    [doneKey]: {
+      durOverride: newDur,
+      startOverride: newStart,
       pinned: !!existing.pinned,
       doneAt: existing.doneAt || null,
     },
@@ -2319,6 +2596,7 @@ function pinTimelineBlock(layer, doneKey) {
     ...next.blocks,
     [doneKey]: {
       durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      startOverride: existing.startOverride || null,
       pinned: true,
       doneAt: existing.doneAt || null,
     },
@@ -2340,6 +2618,7 @@ function unpinTimelineBlock(layer, doneKey) {
     ...next.blocks,
     [doneKey]: {
       durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      startOverride: existing.startOverride || null,
       pinned: false,
       doneAt: existing.doneAt || null,
     },
@@ -2506,6 +2785,11 @@ function markTimelineBlockDoneAt(layer, doneKey, doneAt) {
     ...next.blocks,
     [doneKey]: {
       durOverride: typeof existing.durOverride === "number" ? existing.durOverride : null,
+      // [PR44.2] Giữ nguyên startOverride hiện có — field mới thêm ở
+      // PR44.2, markTimelineBlockDoneAt (thân hàm PR3.1 giữ nguyên 100%)
+      // chỉ cần bảo toàn field này khi patch doneAt, không tự ý xoá giờ
+      // đã Reschedule của block đó.
+      startOverride: existing.startOverride || null,
       pinned: !!existing.pinned,
       doneAt: doneAt,
     },
@@ -2588,6 +2872,11 @@ function minutesToHHMMV33(min) {
 function minutesBetweenHHMM(start, end) {
   return Math.max(0, parseTimeToMinutesV33(end) - parseTimeToMinutesV33(start));
 }
+
+// [PR44.2] formatFreeGapV441 (PR44.1 mục 4 — format "🕒 Trống X giờ Y
+// phút") đã bị XOÁ: call site duy nhất (dải Buffer trên Timeline) không
+// còn render gì nữa (xem SmartSchedule, nhánh it.isBuffer). Không còn
+// dead code.
 
 // (spec §2) Không cầm điện thoại — tăng dần theo streak, reset nếu bỏ lỡ 1
 // ngày. Streak được đọc/ghi qua storage key riêng (v33:phoneFreeStreak),
@@ -6308,6 +6597,15 @@ const blank = () => ({
   scheduleDone:{},       // [LEGACY — DailySchedule đã bị xoá] {[scheduleItemKey]:true} — không còn component nào ghi field này nữa, giữ lại CHỈ để dayExpFull cộng đúng XP cho các ngày cũ đã có dữ liệu, không xoá để không mất XP lịch sử.
   scheduleXp:{},         // [LEGACY — DailySchedule đã bị xoá] {[scheduleItemKey]:number} — cùng lý do trên.
   timelineDone:{},       // [V41] {[doneKey]:true} — tick TRỰC QUAN cho từng block trong SmartSchedule (Lịch trình hôm nay). doneKey = "start|tên task". KHÔNG cộng XP (quyết định của Bảo, để an toàn tuyệt đối cho dữ liệu XP hiện có) — hoàn toàn tách biệt khỏi dailyPicks/poolDone và bigGoalsToday.
+  // ── PR44.1 (SmartSchedule — Actual Time) ──
+  actualCompletedAt:{},  // [PR44.1] {[doneKey]:"HH:MM"} — giờ HOÀN THÀNH THỰC TẾ do người dùng xác nhận (popup "Bây giờ"/"Chọn thời gian") khi tick 1 block Routine/Fixed trong SmartSchedule. CHỈ dùng để HIỂN THỊ "Kế hoạch/Thực tế" — hoàn toàn tách biệt khỏi timelineOverrideLayer.blocks[doneKey].doneAt (field cũ, dùng cho Reflow — PR44.1 KHÔNG đụng, KHÔNG đọc, KHÔNG ghi field đó) và khỏi timelineDone (tick trực quan cũ, vẫn giữ nguyên hành vi). KHÔNG cộng/trừ XP. doneKey dùng chung công thức "start|tên" như timelineDone/timelineOverrideLayer để không phát minh khoá mới.
+  // [PR44.2] manualOrder (PR44.1 mục 3 — kéo-thả đổi thứ tự hiển thị) đã bị
+  // XOÁ HOÀN TOÀN khỏi schema data (field, đọc, ghi, UI) — mô hình "Reorder"
+  // đã sai UX (đổi vị trí render nhưng không đổi giờ thật) nên được thay
+  // thế bằng "Reschedule" (đổi start/dur THẬT qua overrideLayer.blocks
+  // [doneKey].startOverride, xem rescheduleTimelineBlock). Dữ liệu
+  // manualOrder cũ (nếu còn sót trong storage của người dùng từ trước
+  // PR44.2) sẽ tự bị bỏ qua vì không còn code nào đọc field này nữa.
   // ── V30 (SmartSchedule) ──
   eveningNote:"",        // [PATCH v30] ghi chú tự do từ checklist cuối ngày trong SmartSchedule, không tính XP — thuần lưu để đọc lại/phân tích sau này
   // ── V38 (SmartSchedule kéo-thả + giãn cách cộng dồn) ──
@@ -8872,6 +9170,16 @@ function App() {
     <AccentContext.Provider value={accent}>
     <MediaContext.Provider value={media}>
     <PlannerRuntimeProvider>
+    {/* ======================================================
+        PR43.6 — Mount GameWidgetZone
+        ======================================================
+        GameDataProvider (PR43.2) được mount song song với
+        PlannerRuntimeProvider, KHÔNG lồng bên trong nó và không được
+        PlannerRuntimeContext tiêu thụ — đúng mục 2.3/2.4 của
+        V43_Final_Architecture.md. Đây là điểm mount duy nhất của
+        GameDataProvider trong toàn bộ cây component. */}
+    <GameDataProvider>
+    {/* ====================================================== */}
     <SplashScreen theme={theme} logo={media.settings?.logo || null} ready={appReady} />
     <div style={{position:"relative",background:theme.bg,minHeight:"100vh",fontFamily:"system-ui,sans-serif",color:theme.text,maxWidth:480,margin:"0 auto",paddingBottom:"calc(80px + env(safe-area-inset-bottom, 0px))",transition:"background 0.3s ease,color 0.3s ease"}}>
       {/* Ảnh nền toàn app — lớp cố định phía sau mọi nội dung, độ mờ chỉnh qua Media Settings */}
@@ -9060,6 +9368,8 @@ function App() {
       <MusicPlayer/>
       {mediaModalOpen && <MediaSettingsModal onClose={()=>setMediaModalOpen(false)}/>}
     </div>
+    {/* PR43.6 — đóng GameDataProvider, xem điểm mount ở đầu return() phía trên */}
+    </GameDataProvider>
     </PlannerRuntimeProvider>
     </MediaContext.Provider>
     </AccentContext.Provider>
@@ -9236,11 +9546,840 @@ const DASH_RANGES = [
   {k:"30d",   l:"30 ngày", days:30},
 ];
 
+// ======================================================
+// PR43.6 — Mount GameWidgetZone
+// ======================================================
+// Theo mục 11 (PR43.6) và bảng Regression Risk (mục 10): điểm chèn được
+// bọc trong feature flag để khi tắt, DashboardHome render pixel-identical
+// với trước PR này. GameWidgetZone (PR43.5) và GameDataProvider (PR43.2)
+// KHÔNG bị sửa — chỉ tiêu thụ đúng API đã có (`slot`, `entries`).
+//
+// V43_GAME_WIDGET_ENTRIES là dữ liệu cấu hình tĩnh, KHÔNG phải logic rẽ
+// nhánh: mỗi phần tử khai báo `slot` ("home-top" | "home-bottom") để
+// GameWidgetZone tự lọc theo đúng Data Flow ở mục 2.4/PR43.5 — không có
+// if/switch theo gameId hay loại widget ở đây, chỉ là entries truyền vào
+// Zone. Đặt "home-top": Energy Tracker cho từng game đã có trong
+// GAME_REGISTRY (PR43.1) — Genshin Impact và Zenless Zone Zero — để có nội
+// dung hiển thị ngay; "home-bottom": Event Countdown theo dõi tất cả game
+// (gameIds: null, đã là default của Widget Registry — không cần khai báo
+// lại) để không hardcode theo game cụ thể.
+//
+// PR43.8 — bổ sung entry "home-top-energy-zenless": Zenless Zone Zero
+// (gameId "zenless_zone_zero", resourceId "battery_charge") đã có sẵn
+// trong GAME_REGISTRY (PR43.1) và trong ENERGY_EDITOR_TARGETS (PR43.6.5)
+// từ trước, nhưng chưa từng được mount ra Dashboard vì thiếu đúng một entry
+// ở đây. GameWidgetZone (PR43.5) render nhiều entry cùng slot theo danh
+// sách dọc (flex column, đã có sẵn từ PR43.5) nên chỉ cần thêm dữ liệu,
+// không sửa Zone/Registry. Không hardcode: entry chỉ tham chiếu gameId/
+// resourceId đã tồn tại sẵn trong GAME_REGISTRY, GameWidgetZone tự tra
+// GameDefinition + energyResource tương ứng qua prepareProps (PR43.5).
+const V43_GAME_LAYER_ENABLED = true; // tắt cờ này để khôi phục DashboardHome về trạng thái trước PR43.6 (mục 10, Rollback Strategy)
+
+const V43_GAME_WIDGET_ENTRIES = [
+  {
+    id: "home-top-energy-genshin",
+    type: "energyTracker",
+    slot: "home-top",
+    config: { gameId: "genshin_impact", resourceId: "original_resin" },
+  },
+  {
+    id: "home-top-energy-zenless",
+    type: "energyTracker",
+    slot: "home-top",
+    config: { gameId: "zenless_zone_zero", resourceId: "battery_charge" },
+  },
+  {
+    id: "home-bottom-event-countdown",
+    type: "eventCountdown",
+    slot: "home-bottom",
+  },
+];
+// ======================================================
+// End PR43.6 (config — điểm mount JSX ở trong DashboardHome bên dưới)
+// ======================================================
+
+// ======================================================
+// PR43.6.5 — Game Energy Editor (Modal)
+// ======================================================
+// Mục tiêu (yêu cầu tác vụ "Game Data Editor"): cho phép người dùng cập
+// nhật thủ công EnergyState (lastValue + lastCheckedAt) cho các resource đã
+// có trong GAME_REGISTRY (PR43.1) — hiện tại là Original Resin (Genshin
+// Impact) và Battery Charge (Zenless Zone Zero) — thông qua một popup mở từ
+// nút ⚙️ trên khu vực Energy Tracker ở home-top.
+//
+// LƯU Ý VỀ PHẠM VI so với roadmap gốc (V43_Final_Architecture.md, mục 11):
+// PR này KHÔNG phải "PR43.7 — Settings UI: Event CRUD và Registry Override"
+// đã ghi trong roadmap. Đây là một PR bổ sung, phạm vi hẹp hơn nhiều (chỉ
+// EnergyState, không đụng GameEvent/registryOverrides), được đặt tên
+// PR43.6.5 để không xung đột số hiệu với PR43.7 gốc (Event CRUD) vẫn còn
+// nguyên trong roadmap, chưa triển khai.
+//
+// Ràng buộc đã tuân thủ:
+//   - KHÔNG sửa GameWidgetZone, GAME_WIDGET_REGISTRY, GameDataContext/
+//     GameDataProvider, readGameData/writeGameData, GAME_REGISTRY (PR43.1-5).
+//   - KHÔNG ghi storage trực tiếp — mọi ghi đi qua updateEnergyState() của
+//     GameDataContext (PR43.2), vốn đã tự clamp [0, max] và tự debounce ghi
+//     xuống v43:gameData (PR43.1).
+//   - KHÔNG tạo tab/page/Settings riêng — chỉ một modal cục bộ, mở từ nút
+//     ⚙️ đặt cạnh GameWidgetZone slot="home-top" trong DashboardHome.
+//   - KHÔNG sửa DashboardHome ngoài đúng điểm chèn nút ⚙️ + modal (xem JSX
+//     bên dưới, trong return() của DashboardHome).
+
+// ── formatDatetimeLocalValue(isoString) ─────────────────────────────────
+// Chuyển ISO string → giá trị phù hợp cho <input type="datetime-local">
+// (định dạng "YYYY-MM-DDTHH:mm", theo giờ local của thiết bị — input này
+// không có khái niệm timezone riêng). Hàm thuần, không side-effect.
+function formatDatetimeLocalValue(isoString) {
+  const d = isoString ? new Date(isoString) : new Date();
+  if (isNaN(d.getTime())) return "";
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ── GameEnergyEditorModal ────────────────────────────────────────────────
+// Popup chỉnh EnergyState cho từng (gameId, resourceId) trong GAME_REGISTRY.
+// Hiện tại danh sách cố định (Genshin Resin, Zenless Battery) — mở rộng
+// game mới trong tương lai chỉ cần thêm entry vào ENERGY_EDITOR_TARGETS
+// bên dưới, không sửa logic modal.
+//
+// Props:
+//   onClose — đóng modal (không lưu gì thêm ngoài các lần Save đã bấm)
+const ENERGY_EDITOR_TARGETS = [
+  { gameId: "genshin_impact", resourceId: "original_resin" },
+  { gameId: "zenless_zone_zero", resourceId: "battery_charge" },
+];
+
+function GameEnergyEditorModal({ onClose }) {
+  const { gameData, updateEnergyState } = useGameData();
+
+  // ── ESC để đóng ──────────────────────────────────────────────────────
+  // "Click ngoài popup để đóng" đã có sẵn qua onClick={onClose} trên
+  // backdrop (JSX bên dưới). Bổ sung ESC theo đúng yêu cầu PR43.6.5 mục
+  // POPUP/UI. Listener cục bộ gắn/gỡ theo vòng đời modal (cleanup khi
+  // unmount) — đây là event listener phản ứng theo input người dùng, KHÔNG
+  // phải interval/tick định kỳ, nên không vi phạm nguyên tắc "không
+  // polling nền" ở mục 6.1/6.3 của kiến trúc V43.
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  // Local draft state cho từng target — khởi tạo từ EnergyState hiện có
+  // trong Context (nếu có) hoặc rỗng. Không ghi Context/storage cho tới khi
+  // người dùng bấm "Lưu" — draft chỉ tồn tại trong modal.
+  const [drafts, setDrafts] = useState(() => {
+    const init = {};
+    for (const t of ENERGY_EDITOR_TARGETS) {
+      const key = t.gameId + "::" + t.resourceId;
+      const existing = (gameData?.energyStates || []).find(
+        es => es.gameId === t.gameId && es.resourceId === t.resourceId
+      );
+      init[key] = {
+        value: existing ? String(existing.lastValue) : "",
+        datetimeLocal: formatDatetimeLocalValue(existing?.lastCheckedAt),
+        savedFlash: false,
+      };
+    }
+    return init;
+  });
+
+  const setDraftField = (key, field, val) => {
+    setDrafts(prev => ({ ...prev, [key]: { ...prev[key], [field]: val, savedFlash: false } }));
+  };
+
+  const handleNow = (key) => {
+    setDraftField(key, "datetimeLocal", formatDatetimeLocalValue(new Date().toISOString()));
+  };
+
+  const handleSave = (target) => {
+    const key = target.gameId + "::" + target.resourceId;
+    const draft = drafts[key];
+    const def = GAME_REGISTRY_BY_ID[target.gameId];
+    const resDef = def?.energyResources?.find(r => r.resourceId === target.resourceId);
+    if (!resDef) return; // resource không tồn tại trong registry — không có gì để lưu
+
+    const parsedValue = Number(draft.value);
+    if (!Number.isFinite(parsedValue)) return; // input rỗng/không hợp lệ — không gửi lên Context
+
+    // Clamp [0, max] ở tầng UI trước khi gửi — updateEnergyState() (PR43.2)
+    // tự clamp lại lần nữa nên đây không phải điểm chặn duy nhất, chỉ là
+    // phản hồi tức thời cho người dùng trước khi gọi mutation API.
+    const clamped = Math.min(resDef.max, Math.max(0, parsedValue));
+
+    // datetime-local không có timezone — hiểu theo giờ local thiết bị,
+    // new Date(string) parse đúng theo local time cho định dạng này.
+    const lastCheckedAtDate = draft.datetimeLocal ? new Date(draft.datetimeLocal) : new Date();
+    const lastCheckedAt = isNaN(lastCheckedAtDate.getTime())
+      ? new Date().toISOString()
+      : lastCheckedAtDate.toISOString();
+
+    // Đi đúng đường bắt buộc: UI → GameDataContext mutation API → writeGameData → Storage.
+    // Không gọi writeGameData()/S.set() trực tiếp ở đây.
+    updateEnergyState(target.gameId, target.resourceId, { lastValue: clamped, lastCheckedAt });
+
+    setDrafts(prev => ({
+      ...prev,
+      [key]: { ...prev[key], value: String(clamped), savedFlash: true },
+    }));
+  };
+
+  return (
+    <div
+      className="gb-modal-backdrop-fade"
+      style={{ position: "fixed", inset: 0, zIndex: 210, background: "rgba(0,0,0,.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ background: "#1a1a1ff5", borderRadius: 14, padding: 18, width: "min(92vw, 420px)", maxHeight: "86vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 16 }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#fff" }}>⚙️ Cập nhật năng lượng</div>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "#aaa", fontSize: 18, cursor: "pointer", lineHeight: 1 }}>✕</button>
+        </div>
+
+        {ENERGY_EDITOR_TARGETS.map(target => {
+          const key = target.gameId + "::" + target.resourceId;
+          const draft = drafts[key];
+          const def = GAME_REGISTRY_BY_ID[target.gameId];
+          const resDef = def?.energyResources?.find(r => r.resourceId === target.resourceId);
+          if (!def || !resDef || !draft) return null;
+
+          return (
+            <div key={key} style={{ border: `1px solid ${def.color || "#888"}55`, borderRadius: 12, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span aria-hidden="true">{def.icon}</span>
+                <span style={{ fontWeight: 600, color: "#fff", fontSize: 14 }}>{def.displayName}</span>
+              </div>
+
+              <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+                {resDef.label} (0–{resDef.max})
+                <input
+                  type="number"
+                  min={0}
+                  max={resDef.max}
+                  value={draft.value}
+                  onChange={e => setDraftField(key, "value", e.target.value)}
+                  style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 14 }}
+                />
+              </label>
+
+              <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+                Last Updated
+                <div style={{ display: "flex", gap: 6 }}>
+                  <input
+                    type="datetime-local"
+                    value={draft.datetimeLocal}
+                    onChange={e => setDraftField(key, "datetimeLocal", e.target.value)}
+                    style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }}
+                  />
+                  <button
+                    onClick={() => handleNow(key)}
+                    style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #555", background: "#2a2a2e", color: "#fff", fontSize: 12, cursor: "pointer", whiteSpace: "nowrap" }}
+                  >
+                    Now
+                  </button>
+                </div>
+              </label>
+
+              <button
+                onClick={() => handleSave(target)}
+                style={{ padding: "9px 0", borderRadius: 8, border: "none", background: def.color || "#4FA8D8", color: "#0a0a0a", fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+              >
+                {draft.savedFlash ? "✓ Đã lưu" : "Lưu"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+// ======================================================
+// End PR43.6.5
+// ======================================================
+
+// ======================================================
+// PR43.7 — Game Event CRUD + Registry Override (Modal)
+// ======================================================
+// Mục tiêu (đúng phạm vi task PR43.7): giao diện Create/Edit/Delete/
+// Duplicate cho GameEvent (PR43.1, mục 3.2), và giao diện chỉnh các trường
+// được phép override trong registryOverrides (mục 5.3 kiến trúc: chỉ
+// displayName/color/icon/energyResources[].{label,max,recoveryMinutesPerUnit},
+// KHÔNG bao giờ id/schemaVersion/source/resetRules).
+//
+// LƯU Ý VỀ PHẠM VI so với roadmap gốc (mục "Nhiệm vụ" của task này, đã xác
+// nhận qua trao đổi trước khi code):
+//   - "Enable / Disable Event" bị BỎ KHỎI PR này — trường `enabled` chưa
+//     tồn tại trong GameEvent schema (PR43.1: validateGameData, addGameEvent,
+//     updateGameEvent đều không có trường này), và PR43.7 bị cấm sửa storage
+//     schema / PR43.1-43.6.5. Thêm `enabled` đòi hỏi sửa validateGameData +
+//     mutation API (PR43.1/43.2) — ngoài phạm vi cho phép của PR này theo
+//     xác nhận của người yêu cầu. Nếu cần Enable/Disable trong tương lai,
+//     đó phải là một PR riêng có sửa PR43.1/43.2 tường minh.
+//   - Recurrence "Monthly" và "Days Of Week" ĐƯỢC GIỮ trong dropdown (theo
+//     xác nhận của người yêu cầu), vì Derive Layer (deriveNextOccurrence,
+//     ngay phía trên trong file — hàm gốc thuộc PR43.4) đã được MỞ RỘNG
+//     trong chính PR43.7 này để tính đúng hai trường hợp đó (thêm nhánh mới
+//     theo `frequency`, không đổi hành vi nhánh cũ cho daily/weekly/interval
+//     không có daysOfWeek — xem addCalendarMonths/findNextDayOfWeekOccurrence
+//     và các nhánh mới trong deriveNextOccurrence/deriveEventStatus). Đây là
+//     ngoại lệ DUY NHẤT với yêu cầu "không sửa PR43.1→43.6.5" của task này,
+//     đã được xác nhận trước khi code.
+//
+// Ràng buộc đã tuân thủ (đúng "KHÔNG ĐƯỢC SỬA" của task):
+//   - KHÔNG sửa GameDataProvider, GameWidgetZone, GAME_WIDGET_REGISTRY,
+//     GAME_REGISTRY, EnergyTrackerWidget, EventCountdownWidget, Dashboard
+//     layout, App(), storage schema, readGameData/writeGameData/
+//     validateGameData.
+//   - Mọi ghi đi qua mutation API có sẵn của GameDataContext (PR43.2):
+//     addGameEvent, updateGameEvent, removeGameEvent, updateRegistryOverride.
+//     KHÔNG gọi writeGameData()/S.set() trực tiếp.
+//   - Recurrence dùng đúng shape đã tồn tại (mục 3.2): { frequency,
+//     interval?, daysOfWeek?, end? } hoặc null — không tạo shape mới.
+//   - Game list lấy từ GAME_REGISTRY (PR43.1), không hardcode.
+//   - UI theo đúng khuôn mẫu GameEnergyEditorModal ở trên: dark theme, blur
+//     backdrop, ESC đóng, click ngoài đóng, Cancel/Save.
+
+// ── generateGameEventId() ──────────────────────────────────────────────
+// Cùng quy ước sinh id đã dùng ở các nơi khác trong file (ví dụ dòng ~1551,
+// ~8537: crypto.randomUUID() nếu có, fallback Date.now()+random). addGameEvent
+// (PR43.2) tự từ chối nếu id trùng nên đây chỉ cần đủ tốt để tránh trùng
+// trong thực tế, không cần đảm bảo tuyệt đối.
+function generateGameEventId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return "evt_" + crypto.randomUUID();
+  return "evt_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+const GAME_EVENT_KIND_OPTIONS = [
+  { value: "reset", label: "Đặt lại" },
+  { value: "livestream", label: "Livestream" },
+  { value: "banner", label: "Banner" },
+  { value: "maintenance", label: "Bảo trì" },
+  { value: "custom", label: "Khác (tuỳ chỉnh)" },
+];
+// GameEvent.kind hợp lệ theo validateGameData/addGameEvent (PR43.1/43.2) là:
+// event, livestream, banner, update, maintenance, reset — KHÔNG có "custom".
+// Yêu cầu UI của task này liệt kê "custom" trong dropdown Kind; vì không
+// được sửa validateGameData (thuộc PR43.1, bị khoá), "custom" ở đây được
+// map sang kind="event" đã tồn tại trong schema (kind gần nghĩa nhất với
+// "sự kiện tuỳ ý, không thuộc nhóm cụ thể nào") — xem GAME_EVENT_KIND_TO_STORED
+// và GAME_EVENT_KIND_FROM_STORED ngay dưới đây để biết ánh xạ hai chiều.
+const GAME_EVENT_KIND_TO_STORED = { reset: "reset", livestream: "livestream", banner: "banner", maintenance: "maintenance", custom: "event" };
+const GAME_EVENT_KIND_FROM_STORED = { reset: "reset", livestream: "livestream", banner: "banner", maintenance: "maintenance", event: "custom", update: "custom" };
+
+const GAME_EVENT_RECURRENCE_OPTIONS = [
+  { value: "none", label: "Không lặp" },
+  { value: "daily", label: "Hàng ngày" },
+  { value: "weekly", label: "Hàng tuần" },
+  { value: "monthly", label: "Hàng tháng" },
+  { value: "interval", label: "Theo chu kỳ" },
+  { value: "daysOfWeek", label: "Ngày trong tuần (hàng tuần)" },
+];
+
+const WEEKDAY_LABELS = [
+  { value: 0, label: "CN" }, { value: 1, label: "T2" }, { value: 2, label: "T3" },
+  { value: 3, label: "T4" }, { value: 4, label: "T5" }, { value: 5, label: "T6" },
+  { value: 6, label: "T7" },
+];
+
+// ── recurrenceModeFromEvent / recurrenceModeToObject ────────────────────
+// Chuyển đổi hai chiều giữa lựa chọn UI (một trong 6 mode ở
+// GAME_EVENT_RECURRENCE_OPTIONS) và shape recurrence thật sự lưu trong
+// GameEvent (mục 3.2: null hoặc { frequency, interval?, daysOfWeek?, end? }).
+// "Days Of Week (weekly)" và "Weekly" đều lưu frequency:"weekly" — khác
+// nhau ở việc có daysOfWeek hay không; "Interval" lưu frequency:"daily" với
+// interval tuỳ chỉnh (không có frequency "interval" riêng trong shape gốc).
+function recurrenceModeFromEvent(recurrence) {
+  if (!recurrence || typeof recurrence !== "object") return "none";
+  if (recurrence.frequency === "weekly" && Array.isArray(recurrence.daysOfWeek) && recurrence.daysOfWeek.length > 0) return "daysOfWeek";
+  if (recurrence.frequency === "weekly") return "weekly";
+  if (recurrence.frequency === "monthly") return "monthly";
+  if (recurrence.frequency === "daily" && recurrence.interval && recurrence.interval > 1) return "interval";
+  return "daily";
+}
+
+function recurrenceModeToObject(mode, interval, daysOfWeek) {
+  const safeInterval = Number.isFinite(interval) && interval > 0 ? Math.floor(interval) : 1;
+  switch (mode) {
+    case "none": return null;
+    case "daily": return { frequency: "daily", interval: 1 };
+    case "weekly": return { frequency: "weekly", interval: safeInterval };
+    case "monthly": return { frequency: "monthly", interval: safeInterval };
+    case "interval": return { frequency: "daily", interval: safeInterval };
+    case "daysOfWeek": return { frequency: "weekly", interval: safeInterval, daysOfWeek: Array.isArray(daysOfWeek) && daysOfWeek.length > 0 ? daysOfWeek : [1] };
+    default: return null;
+  }
+}
+
+// ── blankEventDraft(defaultGameId) ───────────────────────────────────────
+function blankEventDraft(defaultGameId) {
+  const nowLocal = formatDatetimeLocalValue(new Date().toISOString());
+  return {
+    id: null, // null = đang tạo mới; string = đang sửa event có id đó
+    title: "",
+    kindUi: "reset",
+    gameId: defaultGameId || (GAME_REGISTRY[0]?.id ?? ""),
+    occursAtLocal: nowLocal,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    recurrenceMode: "none",
+    recurrenceInterval: 1,
+    recurrenceDaysOfWeek: [1],
+    priority: 0,
+  };
+}
+
+function eventToDraft(ev) {
+  return {
+    id: ev.id,
+    title: ev.title,
+    kindUi: GAME_EVENT_KIND_FROM_STORED[ev.kind] || "custom",
+    gameId: ev.gameId,
+    occursAtLocal: formatDatetimeLocalValue(ev.occursAt),
+    timezone: ev.timezone || (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"),
+    recurrenceMode: recurrenceModeFromEvent(ev.recurrence),
+    recurrenceInterval: (ev.recurrence && ev.recurrence.interval) || 1,
+    recurrenceDaysOfWeek: (ev.recurrence && Array.isArray(ev.recurrence.daysOfWeek) && ev.recurrence.daysOfWeek.length > 0) ? ev.recurrence.daysOfWeek : [1],
+    priority: typeof ev.priority === "number" ? ev.priority : 0,
+  };
+}
+
+// draftToEventPayload: chuyển draft UI → payload đúng shape GameEvent (mục
+// 3.2) để truyền vào addGameEvent/updateGameEvent. Trả về null nếu draft
+// thiếu trường bắt buộc (title rỗng, gameId rỗng, occursAt không parse
+// được) — caller hiển thị lỗi cục bộ, không gửi lên Context.
+function draftToEventPayload(draft) {
+  if (!draft.title || !draft.title.trim()) return null;
+  if (!draft.gameId) return null;
+  if (!draft.occursAtLocal) return null;
+  const occursAtDate = new Date(draft.occursAtLocal);
+  if (isNaN(occursAtDate.getTime())) return null;
+
+  return {
+    id: draft.id || generateGameEventId(),
+    gameId: draft.gameId,
+    title: draft.title.trim(),
+    kind: GAME_EVENT_KIND_TO_STORED[draft.kindUi] || "event",
+    timezone: draft.timezone || "UTC",
+    occursAt: occursAtDate.toISOString(),
+    recurrence: recurrenceModeToObject(draft.recurrenceMode, draft.recurrenceInterval, draft.recurrenceDaysOfWeek),
+    priority: typeof draft.priority === "number" ? draft.priority : Number(draft.priority) || 0,
+  };
+}
+
+// ── EventListRow ──────────────────────────────────────────────────────
+const EventListRow = React.memo(function EventListRow({ event, gameDefinition, onEdit, onDuplicate, onDelete }) {
+  const meta = EVENT_KIND_META[event.kind] || ORPHANED_EVENT_META;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 10, border: `1px solid ${(gameDefinition?.color || "#888")}33` }}>
+      <span aria-hidden="true" style={{ fontSize: 16 }}>{gameDefinition ? (gameDefinition.icon || meta.icon) : ORPHANED_EVENT_META.icon}</span>
+      <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#fff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{event.title}</div>
+        <div style={{ fontSize: 11, opacity: 0.6 }}>
+          {(gameDefinition ? gameDefinition.displayName : event.gameId)} · {meta.label} · {new Date(event.occursAt).toLocaleString()}
+        </div>
+      </div>
+      <button onClick={() => onEdit(event)} title="Sửa" style={{ padding: "5px 8px", borderRadius: 6, border: "1px solid #444", background: "#2a2a2e", color: "#fff", fontSize: 11, cursor: "pointer" }}>Sửa</button>
+      <button onClick={() => onDuplicate(event)} title="Nhân bản" style={{ padding: "5px 8px", borderRadius: 6, border: "1px solid #444", background: "#2a2a2e", color: "#fff", fontSize: 11, cursor: "pointer" }}>Nhân bản</button>
+      <button onClick={() => onDelete(event)} title="Xoá" style={{ padding: "5px 8px", borderRadius: 6, border: "1px solid #663333", background: "#3a1f1f", color: "#ff9d9d", fontSize: 11, cursor: "pointer" }}>Xoá</button>
+    </div>
+  );
+});
+
+// ── EventEditorForm ───────────────────────────────────────────────────
+// Form dùng chung cho cả Create và Edit — draft điều khiển bởi state cha
+// (GameEventEditorModal), form chỉ render input + gọi onChange.
+function EventEditorForm({ draft, onChange, onSubmit, onCancel, submitLabel, error }) {
+  const patch = (field, val) => onChange({ ...draft, [field]: val });
+  const toggleWeekday = (d) => {
+    const cur = draft.recurrenceDaysOfWeek || [];
+    const next = cur.includes(d) ? cur.filter(x => x !== d) : [...cur, d].sort((a, b) => a - b);
+    patch("recurrenceDaysOfWeek", next);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10, border: "1px solid #444", borderRadius: 12, padding: 14 }}>
+      <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+        Tiêu đề
+        <input type="text" value={draft.title} onChange={e => patch("title", e.target.value)}
+          style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 14 }} />
+      </label>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <label style={{ flex: 1, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Trò chơi
+          <select value={draft.gameId} onChange={e => patch("gameId", e.target.value)}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }}>
+            {GAME_REGISTRY.map(g => <option key={g.id} value={g.id}>{g.displayName}</option>)}
+          </select>
+        </label>
+        <label style={{ flex: 1, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Loại
+          <select value={draft.kindUi} onChange={e => patch("kindUi", e.target.value)}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }}>
+            {GAME_EVENT_KIND_OPTIONS.map(k => <option key={k.value} value={k.value}>{k.label}</option>)}
+          </select>
+        </label>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <label style={{ flex: 1, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Thời điểm
+          <input type="datetime-local" value={draft.occursAtLocal} onChange={e => patch("occursAtLocal", e.target.value)}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }} />
+        </label>
+        <label style={{ flex: 1, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Múi giờ
+          <input type="text" value={draft.timezone} onChange={e => patch("timezone", e.target.value)}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }} />
+        </label>
+      </div>
+
+      <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+        Lặp lại
+        <select value={draft.recurrenceMode} onChange={e => patch("recurrenceMode", e.target.value)}
+          style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }}>
+          {GAME_EVENT_RECURRENCE_OPTIONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+        </select>
+      </label>
+
+      {(draft.recurrenceMode === "weekly" || draft.recurrenceMode === "monthly" || draft.recurrenceMode === "interval" || draft.recurrenceMode === "daysOfWeek") && (
+        <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          {draft.recurrenceMode === "interval" ? "Mỗi N ngày" : draft.recurrenceMode === "monthly" ? "Mỗi N tháng" : "Mỗi N tuần"}
+          <input type="number" min={1} value={draft.recurrenceInterval}
+            onChange={e => patch("recurrenceInterval", Math.max(1, Number(e.target.value) || 1))}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13, width: 100 }} />
+        </label>
+      )}
+
+      {draft.recurrenceMode === "daysOfWeek" && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {WEEKDAY_LABELS.map(w => {
+            const active = (draft.recurrenceDaysOfWeek || []).includes(w.value);
+            return (
+              <button key={w.value} type="button" onClick={() => toggleWeekday(w.value)}
+                style={{ padding: "6px 10px", borderRadius: 8, border: `1px solid ${active ? "#4FA8D8" : "#444"}`, background: active ? "#4FA8D833" : "#0f0f12", color: active ? "#4FA8D8" : "#bbb", fontSize: 12, cursor: "pointer" }}>
+                {w.label}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+        Độ ưu tiên
+        <input type="number" value={draft.priority} onChange={e => patch("priority", Number(e.target.value) || 0)}
+          style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13, width: 100 }} />
+      </label>
+
+      {error && <div style={{ fontSize: 12, color: "#ff9d9d" }}>{error}</div>}
+
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        <button onClick={onCancel} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #555", background: "transparent", color: "#bbb", fontSize: 13, cursor: "pointer" }}>Hủy</button>
+        <button onClick={onSubmit} style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: "#4FA8D8", color: "#0a0a0a", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>{submitLabel}</button>
+      </div>
+    </div>
+  );
+}
+
+// ── RegistryOverrideForm ──────────────────────────────────────────────
+// Chỉnh registryOverrides cho một GameDefinition — chỉ đúng các trường
+// được phép ở mục 5.3: displayName, color, icon, energyResources[].{label,
+// max, recoveryMinutesPerUnit} khi resourceId khớp phần tử gốc. id/
+// schemaVersion/source/resetRules KHÔNG hiển thị input (bất biến, và
+// updateRegistryOverride ở PR43.2 cũng tự lọc bỏ nếu patch có các trường
+// này — form này chỉ không tạo input cho chúng ngay từ đầu).
+function RegistryOverrideForm({ gameId, gameData, updateRegistryOverride }) {
+  const def = GAME_REGISTRY_BY_ID[gameId];
+  const existingOverride = gameData?.registryOverrides?.[gameId];
+
+  const [displayName, setDisplayName] = useState(existingOverride?.displayName ?? def?.displayName ?? "");
+  const [color, setColor] = useState(existingOverride?.color ?? def?.color ?? "#888888");
+  const [icon, setIcon] = useState(existingOverride?.icon ?? def?.icon ?? "");
+  const [resourceOverrides, setResourceOverrides] = useState(() => {
+    const map = {};
+    for (const r of (def?.energyResources || [])) {
+      const ov = (existingOverride?.energyResources || []).find(x => x.resourceId === r.resourceId);
+      map[r.resourceId] = {
+        label: ov?.label ?? r.label,
+        max: ov?.max ?? r.max,
+        recoveryMinutesPerUnit: ov?.recoveryMinutesPerUnit ?? r.recoveryMinutesPerUnit,
+      };
+    }
+    return map;
+  });
+  const [savedFlash, setSavedFlash] = useState(false);
+
+  if (!def) return null;
+
+  const patchResource = (resourceId, field, val) => {
+    setResourceOverrides(prev => ({ ...prev, [resourceId]: { ...prev[resourceId], [field]: val } }));
+    setSavedFlash(false);
+  };
+
+  const handleSave = () => {
+    const energyResources = (def.energyResources || []).map(r => ({
+      resourceId: r.resourceId,
+      label: resourceOverrides[r.resourceId]?.label ?? r.label,
+      max: Number(resourceOverrides[r.resourceId]?.max) || r.max,
+      recoveryMinutesPerUnit: Number(resourceOverrides[r.resourceId]?.recoveryMinutesPerUnit) || r.recoveryMinutesPerUnit,
+    }));
+    // Đi đúng đường bắt buộc: UI → GameDataContext mutation API. Trường bất
+    // biến (id/schemaVersion/source/resetRules) không được gửi trong patch
+    // này — updateRegistryOverride (PR43.2) cũng tự lọc lại nếu có.
+    updateRegistryOverride(gameId, { displayName, color, icon, energyResources });
+    setSavedFlash(true);
+  };
+
+  return (
+    <div style={{ border: `1px solid ${def.color || "#888"}55`, borderRadius: 12, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span aria-hidden="true">{def.icon}</span>
+        <span style={{ fontWeight: 600, color: "#fff", fontSize: 14 }}>{def.displayName}</span>
+        <span style={{ fontSize: 10, opacity: 0.5 }}>schemaVersion {def.schemaVersion} · {def.source}</span>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <label style={{ flex: 1, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Tên hiển thị
+          <input type="text" value={displayName} onChange={e => { setDisplayName(e.target.value); setSavedFlash(false); }}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }} />
+        </label>
+        <label style={{ width: 90, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Màu
+          <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(color) ? color : "#888888"} onChange={e => { setColor(e.target.value); setSavedFlash(false); }}
+            style={{ padding: 2, height: 34, borderRadius: 8, border: "1px solid #444", background: "#0f0f12" }} />
+        </label>
+        <label style={{ width: 70, fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+          Biểu tượng
+          <input type="text" value={icon} onChange={e => { setIcon(e.target.value); setSavedFlash(false); }}
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13, textAlign: "center" }} />
+        </label>
+      </div>
+
+      {(def.energyResources || []).map(r => (
+        <div key={r.resourceId} style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+          <label style={{ flex: 1, fontSize: 11, color: "#999", display: "flex", flexDirection: "column", gap: 4 }}>
+            {r.resourceId} — Tên hiển thị
+            <input type="text" value={resourceOverrides[r.resourceId]?.label ?? ""} onChange={e => patchResource(r.resourceId, "label", e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 12 }} />
+          </label>
+          <label style={{ width: 80, fontSize: 11, color: "#999", display: "flex", flexDirection: "column", gap: 4 }}>
+            Tối đa
+            <input type="number" value={resourceOverrides[r.resourceId]?.max ?? ""} onChange={e => patchResource(r.resourceId, "max", e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 12 }} />
+          </label>
+          <label style={{ width: 110, fontSize: 11, color: "#999", display: "flex", flexDirection: "column", gap: 4 }}>
+            Phút hồi/đơn vị
+            <input type="number" value={resourceOverrides[r.resourceId]?.recoveryMinutesPerUnit ?? ""} onChange={e => patchResource(r.resourceId, "recoveryMinutesPerUnit", e.target.value)}
+              style={{ padding: "6px 8px", borderRadius: 6, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 12 }} />
+          </label>
+        </div>
+      ))}
+
+      <button onClick={handleSave}
+        style={{ padding: "9px 0", borderRadius: 8, border: "none", background: def.color || "#4FA8D8", color: "#0a0a0a", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+        {savedFlash ? "✓ Đã lưu" : "Lưu Override"}
+      </button>
+    </div>
+  );
+}
+
+// ── GameEventEditorModal ────────────────────────────────────────────────
+// Popup chính của PR43.7: 2 tab — "Events" (CRUD danh sách GameEvent) và
+// "Registry Override" (chỉnh registryOverrides theo từng game). Cùng khuôn
+// mẫu dark theme / blur backdrop / ESC đóng / click ngoài đóng như
+// GameEnergyEditorModal ở trên.
+//
+// Props:
+//   onClose — đóng modal.
+function GameEventEditorModal({ onClose }) {
+  const { gameData, addGameEvent, updateGameEvent, removeGameEvent, updateRegistryOverride } = useGameData();
+
+  const [tab, setTab] = useState("events"); // "events" | "override"
+  const [formMode, setFormMode] = useState(null); // null | "create" | "edit"
+  const [draft, setDraft] = useState(null);
+  const [formError, setFormError] = useState("");
+  const [overrideGameId, setOverrideGameId] = useState(GAME_REGISTRY[0]?.id ?? "");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  // ESC để đóng — cùng cách GameEnergyEditorModal đã làm (event listener
+  // phản ứng theo input người dùng, không phải interval/tick định kỳ).
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  const events = gameData?.events || [];
+
+  const openCreate = () => {
+    setDraft(blankEventDraft(GAME_REGISTRY[0]?.id));
+    setFormMode("create");
+    setFormError("");
+  };
+  const openEdit = (ev) => {
+    setDraft(eventToDraft(ev));
+    setFormMode("edit");
+    setFormError("");
+  };
+  const openDuplicate = (ev) => {
+    const d = eventToDraft(ev);
+    d.id = null; // nhân bản = tạo mới, id mới sẽ được sinh khi submit
+    d.title = ev.title + " (copy)";
+    setDraft(d);
+    setFormMode("create");
+    setFormError("");
+  };
+  const closeForm = () => { setFormMode(null); setDraft(null); setFormError(""); };
+
+  const handleSubmit = () => {
+    const payload = draftToEventPayload(draft);
+    if (!payload) { setFormError("Thiếu Title, Game, hoặc Occurs At không hợp lệ."); return; }
+
+    if (formMode === "create") {
+      // Đi đúng đường bắt buộc: UI → GameDataContext mutation API.
+      // addGameEvent (PR43.2) tự từ chối nếu id trùng — payload luôn có id
+      // mới sinh (generateGameEventId) trừ khi bị trùng ngẫu nhiên, nên
+      // trường hợp từ chối ở đây gần như không xảy ra trong thực tế.
+      const ok = addGameEvent(payload);
+      if (!ok) { setFormError("Không thể tạo sự kiện (id bị trùng hoặc dữ liệu không hợp lệ)."); return; }
+    } else if (formMode === "edit") {
+      // updateGameEvent không cho đổi id qua patch (PR43.2) — không gửi id
+      // trong patch để tránh gây hiểu nhầm, dù có gửi cũng bị ghi đè lại
+      // đúng id gốc.
+      const { id, ...patch } = payload;
+      updateGameEvent(draft.id, patch);
+    }
+    closeForm();
+  };
+
+  const handleDelete = (ev) => setConfirmDeleteId(ev.id);
+  const confirmDelete = () => {
+    if (confirmDeleteId) removeGameEvent(confirmDeleteId);
+    setConfirmDeleteId(null);
+  };
+
+  return (
+    <div
+      className="gb-modal-backdrop-fade"
+      style={{ position: "fixed", inset: 0, zIndex: 210, background: "rgba(0,0,0,.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ background: "#1a1a1ff5", borderRadius: 14, padding: 18, width: "min(94vw, 520px)", maxHeight: "88vh", overflowY: "auto", display: "flex", flexDirection: "column", gap: 14 }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#fff" }}>🗓️ Sự kiện game & Tùy chỉnh trò chơi</div>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: "#aaa", fontSize: 18, cursor: "pointer", lineHeight: 1 }}>✕</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={() => setTab("events")}
+            style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: `1px solid ${tab === "events" ? "#4FA8D8" : "#444"}`, background: tab === "events" ? "#4FA8D822" : "transparent", color: tab === "events" ? "#4FA8D8" : "#bbb", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+            Sự kiện
+          </button>
+          <button onClick={() => setTab("override")}
+            style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: `1px solid ${tab === "override" ? "#4FA8D8" : "#444"}`, background: tab === "override" ? "#4FA8D822" : "transparent", color: tab === "override" ? "#4FA8D8" : "#bbb", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+            Tùy chỉnh trò chơi
+          </button>
+        </div>
+
+        {tab === "events" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {formMode ? (
+              <EventEditorForm
+                draft={draft}
+                onChange={setDraft}
+                onSubmit={handleSubmit}
+                onCancel={closeForm}
+                submitLabel={formMode === "create" ? "Tạo" : "Lưu"}
+                error={formError}
+              />
+            ) : (
+              <button onClick={openCreate}
+                style={{ padding: "9px 0", borderRadius: 8, border: "1px dashed #4FA8D8", background: "transparent", color: "#4FA8D8", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+                + Thêm sự kiện
+              </button>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {events.length === 0 && (
+                <div style={{ padding: "12px 4px", opacity: 0.6, fontSize: 13 }}>Chưa có sự kiện nào.</div>
+              )}
+              {events.map(ev => (
+                <EventListRow
+                  key={ev.id}
+                  event={ev}
+                  gameDefinition={GAME_REGISTRY_BY_ID[ev.gameId] || null}
+                  onEdit={openEdit}
+                  onDuplicate={openDuplicate}
+                  onDelete={handleDelete}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {tab === "override" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <label style={{ fontSize: 12, color: "#bbb", display: "flex", flexDirection: "column", gap: 4 }}>
+              Chọn Game
+              <select value={overrideGameId} onChange={e => setOverrideGameId(e.target.value)}
+                style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #444", background: "#0f0f12", color: "#fff", fontSize: 13 }}>
+                {GAME_REGISTRY.map(g => <option key={g.id} value={g.id}>{g.displayName}</option>)}
+              </select>
+            </label>
+            {overrideGameId && (
+              <RegistryOverrideForm
+                key={overrideGameId}
+                gameId={overrideGameId}
+                gameData={gameData}
+                updateRegistryOverride={updateRegistryOverride}
+              />
+            )}
+          </div>
+        )}
+
+        {confirmDeleteId && (
+          <div style={{ position: "fixed", inset: 0, zIndex: 220, background: "rgba(0,0,0,.7)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+            onClick={() => setConfirmDeleteId(null)}>
+            <div style={{ background: "#1a1a1ff5", borderRadius: 12, padding: 18, width: "min(90vw, 340px)", display: "flex", flexDirection: "column", gap: 12 }}
+              onClick={e => e.stopPropagation()}>
+              <div style={{ fontSize: 13, color: "#fff" }}>Xoá sự kiện này? Không thể hoàn tác.</div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button onClick={() => setConfirmDeleteId(null)} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #555", background: "transparent", color: "#bbb", fontSize: 13, cursor: "pointer" }}>Hủy</button>
+                <button onClick={confirmDelete} style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: "#a83a3a", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Xoá</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+// ======================================================
+// End PR43.7
+// ======================================================
+
 function DashboardHome({td,data,dayE,db,txp,str,lv,rt,dayExp,setts,finTxs,onOpenMood,onOpenPomodoro,onSwitchTab}) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
   const [open,setOpen]=useState(true);
   const [range,setRange]=useState("7d"); // today | 7d | 30d
+  // PR43.6.5 — trạng thái mở/đóng Game Energy Editor modal (cục bộ, không
+  // persist, không liên quan GameDataContext — chỉ là UI toggle).
+  const [gameEnergyEditorOpen,setGameEnergyEditorOpen]=useState(false);
+  // PR43.7 — trạng thái mở/đóng Game Event Editor modal (cục bộ, không
+  // persist, không liên quan GameDataContext — chỉ là UI toggle, cùng
+  // nguyên tắc như gameEnergyEditorOpen ở trên).
+  const [gameEventEditorOpen,setGameEventEditorOpen]=useState(false);
 
   const rangeDef = DASH_RANGES.find(r=>r.k===range) || DASH_RANGES[1];
   const rangeDays = rangeDef.days;
@@ -9414,6 +10553,70 @@ function DashboardHome({td,data,dayE,db,txp,str,lv,rt,dayExp,setts,finTxs,onOpen
             ))}
           </div>
 
+          {/* ======================================================
+              PR43.6 — Mount GameWidgetZone (slot="home-top")
+              ======================================================
+              Đúng MỘT lần cho slot này, mount qua GameWidgetZone (PR43.5)
+              — không mount từng widget riêng lẻ (EnergyTrackerWidget/
+              EventCountdownWidget), giữ đúng kiến trúc Registry. Khi
+              không có entry nào khớp slot, GameWidgetZone tự return null
+              (PR43.5) nên không tạo khoảng trắng bất thường. Bọc trong
+              feature flag (mục 10, Regression Risk PR43.6) để có thể tắt
+              tức thời, khôi phục DashboardHome pixel-identical. */}
+          {V43_GAME_LAYER_ENABLED && (
+            <div style={{marginBottom:8, position:"relative"}}>
+              <GameWidgetZone slot="home-top" entries={V43_GAME_WIDGET_ENTRIES} />
+              {/* ====================================================
+                  PR43.6.5 — Click trực tiếp vào card để mở Editor
+                  ====================================================
+                  Yêu cầu: "nhấn trực tiếp vào card Energy Tracker" mở
+                  popup, KHÔNG sửa GameWidgetZone/EnergyTrackerWidget (cả
+                  hai đều bị khoá — không nhận onClick, không phải nơi
+                  được phép sửa). Giải pháp: một overlay trong suốt phủ
+                  đúng vùng GameWidgetZone(slot="home-top"), nằm DƯỚI nút
+                  ⚙️ về z-index — click vào bất kỳ đâu trong overlay (tức
+                  là bất kỳ đâu trong khu vực card) mở modal; nút ⚙️ vẫn
+                  nhận click riêng vì z-index cao hơn overlay. Overlay
+                  không chặn scroll/không đổi layout vì dùng position:
+                  absolute + inset:0 trong cùng container position:relative
+                  đã có sẵn — không thêm chiều cao, không đổi kích thước
+                  GameWidgetZone. */}
+              <div
+                onClick={()=>setGameEnergyEditorOpen(true)}
+                role="button"
+                tabIndex={0}
+                aria-label="Mở chỉnh sửa dữ liệu năng lượng game"
+                onKeyDown={e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); setGameEnergyEditorOpen(true); } }}
+                style={{position:"absolute", inset:0, cursor:"pointer", zIndex:1, background:"transparent"}}
+              />
+              {/* ====================================================
+                  PR43.6.5 — Nút mở Game Energy Editor
+                  ====================================================
+                  Nút ⚙️ nhỏ, đặt tuyệt đối ở góc trên-phải của khu vực
+                  GameWidgetZone(slot="home-top"), không sửa GameWidgetZone/
+                  EnergyTrackerWidget để chèn nút vào bên trong card — giữ
+                  đúng ràng buộc "không sửa Widget Registry/Zone" trong khi
+                  vẫn cho cảm giác nút gắn liền với Energy Tracker. Chỉ
+                  hiển thị khi layer đang bật (cùng điều kiện feature flag).
+                  zIndex cao hơn overlay click-catcher ở trên để nút vẫn
+                  nhận click độc lập (cả hai đều mở cùng một modal nên
+                  không có xung đột hành vi — chỉ là hai điểm bấm khác
+                  nhau dẫn tới cùng kết quả, event không cần stopPropagation). */}
+              <button
+                onClick={()=>setGameEnergyEditorOpen(true)}
+                aria-label="Chỉnh sửa dữ liệu năng lượng game"
+                style={{position:"absolute", top:6, right:6, width:26, height:26, borderRadius:"50%", border:`1px solid ${theme.border}`, background:theme.card||"#1a1a1e", color:theme.textDim, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", padding:0, zIndex:5}}
+              >
+                ⚙️
+              </button>
+            </div>
+          )}
+          {V43_GAME_LAYER_ENABLED && gameEnergyEditorOpen && (
+            <GameEnergyEditorModal onClose={()=>setGameEnergyEditorOpen(false)} />
+          )}
+          {/* End PR43.6.5 */}
+          {/* ====================================================== */}
+
           {/* Hàng 1: Streak / XP / Rank / Việc nhỏ hôm nay (V24 MỤC 8: x/5 task) */}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6,marginBottom:8}}>
             <StatCell icon="🔥" label="Streak" value={`${str}d`} color={str>=7?theme.success:theme.warning}/>
@@ -9559,6 +10762,52 @@ function DashboardHome({td,data,dayE,db,txp,str,lv,rt,dayExp,setts,finTxs,onOpen
           <div style={{marginTop:10}}>
             <AiInsightWidget db={db} dayExp={dayExp} finTxs={finTxs} setts={setts} str={str} txp={txp} onOpenAiInsight={()=>onSwitchTab?.(9)}/>
           </div>
+
+          {/* ======================================================
+              PR43.6 — Mount GameWidgetZone (slot="home-bottom")
+              ======================================================
+              Đúng MỘT lần cho slot này, cùng nguyên tắc như slot
+              "home-top" ở trên: mount qua GameWidgetZone (PR43.5), không
+              mount widget riêng lẻ, tự return null khi rỗng, bọc feature
+              flag để rollback tức thời. */}
+          {V43_GAME_LAYER_ENABLED && (
+            <div style={{marginTop:10, position:"relative"}}>
+              <GameWidgetZone slot="home-bottom" entries={V43_GAME_WIDGET_ENTRIES} />
+              {/* ====================================================
+                  PR43.7 — Click trực tiếp vào card Event Countdown để mở
+                  Event Editor
+                  ====================================================
+                  Cùng giải pháp overlay đã dùng ở PR43.6.5 cho Energy
+                  Editor (home-top): KHÔNG sửa GameWidgetZone/
+                  EventCountdownWidget (cả hai bị khoá — không nhận onClick).
+                  Overlay trong suốt phủ đúng vùng GameWidgetZone(slot=
+                  "home-bottom"), z-index thấp hơn nút ⚙️; click bất kỳ đâu
+                  trong khu vực card mở modal Event Editor. */}
+              <div
+                onClick={()=>setGameEventEditorOpen(true)}
+                role="button"
+                tabIndex={0}
+                aria-label="Mở quản lý sự kiện game"
+                onKeyDown={e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); setGameEventEditorOpen(true); } }}
+                style={{position:"absolute", inset:0, cursor:"pointer", zIndex:1, background:"transparent"}}
+              />
+              {/* ====================================================
+                  PR43.7 — Nút mở Game Event Editor
+                  ==================================================== */}
+              <button
+                onClick={()=>setGameEventEditorOpen(true)}
+                aria-label="Quản lý sự kiện game"
+                style={{position:"absolute", top:6, right:6, width:26, height:26, borderRadius:"50%", border:`1px solid ${theme.border}`, background:theme.card||"#1a1a1e", color:theme.textDim, fontSize:13, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", padding:0, zIndex:5}}
+              >
+                🗓️
+              </button>
+            </div>
+          )}
+          {V43_GAME_LAYER_ENABLED && gameEventEditorOpen && (
+            <GameEventEditorModal onClose={()=>setGameEventEditorOpen(false)} />
+          )}
+          {/* End PR43.7 entrypoint */}
+          {/* ====================================================== */}
         </div>
       )}
     </div>
@@ -9588,8 +10837,22 @@ function AISuggestionsCard({ td, data, taskPool, db, plannerStorage, plannerToda
   const entryCount = plannerToday?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? plannerToday.entries[entryCount - 1] : null;
   const plannerOutput = latestEntry?.plannerOutput || null;
-  const oneBigWin = plannerOutput?.oneBigWin || null;
   const allTasks = plannerOutput?.tasks || [];
+  const rawOneBigWin = plannerOutput?.oneBigWin || null;
+  // [PR45.3] Chặn Routine lọt vào One Big Win ở LỚP TIÊU THỤ dữ liệu
+  // (KHÔNG sửa AI Planner Core — Core đã tự lọc isFixedRoutine khi chọn
+  // oneBigWin, NHƯNG có fallback "nếu sau khi lọc không còn ứng viên nào
+  // thì dùng lại toàn bộ tasks" — xem runPlannerEngine trong
+  // createAIPlannerCore(), khối bị khoá "no logic changes. Ever."). Khi
+  // fallback đó xảy ra, oneBigWin.label có thể trùng tên 1 task
+  // isFixedRoutine (vd "Ăn tối"). Ở đây, so khớp TÊN oneBigWin.label với
+  // allTasks để xác định nó có phải Routine không — nếu phải, coi như
+  // KHÔNG có One Big Win hợp lệ cho hôm nay (không hiển thị, không cho
+  // Áp dụng), đúng yêu cầu "One Big Win chỉ được chọn từ Goal thật".
+  const oneBigWinIsRoutine = !!(rawOneBigWin && allTasks.some(
+    t => t.isFixedRoutine && normalizeTaskName(t.name) === normalizeTaskName(rawOneBigWin.label)
+  ));
+  const oneBigWin = oneBigWinIsRoutine ? null : rawOneBigWin;
 
   // Chỉ AI task thật — bỏ Routine (isFixedRoutine) và bỏ chính oneBigWin
   // (oneBigWin có nút Áp dụng riêng, không lặp lại trong danh sách dưới).
@@ -9756,6 +11019,18 @@ function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onE
       {picks.map((id,idx)=>{
         const t = poolById[id];
         if(!t) return null; // task đã bị xoá khỏi kho — bỏ qua an toàn, không crash
+        // [PR45.1] Entry đã hidden (Routine/legacy cố định, vd Ăn sáng/Ăn
+        // trưa/Ăn tối/Ngủ — xem FIXED_OR_LEGACY_POOL_IDS) — bỏ qua an toàn,
+        // giống hệt cách dòng trên xử lý task đã xoá. KHÔNG xoá khỏi
+        // dailyPicks (dữ liệu ngày cũ giữ nguyên, đúng nguyên tắc không sửa
+        // schema/lịch sử) — chỉ ẩn khỏi hiển thị "Mục tiêu hôm nay", vì
+        // Routine giờ chỉ thuộc Timeline (SmartSchedule), không phải Goal.
+        // Đây là gốc rễ thật của bug "Routine lọt vào Goal": các đường ghi
+        // MỚI vào dailyPicks (addTodayGoal/AISuggestionsCard) đã lọc
+        // isFixedRoutine từ patch V32, nhưng dailyPicks của những NGÀY CŨ
+        // (lưu trước patch đó) vẫn còn id routine — component render trước
+        // đây không kiểm tra t.hidden nên các id đó hiện vĩnh viễn.
+        if(t.hidden) return null;
         const checked = !!data.poolDone?.[id];
         const isDragging = draggingId===id;
         const isDragOver = dragOverIdx===idx && draggingId!=null && draggingId!==id;
@@ -11015,8 +12290,16 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
   const entryCount = today?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? today.entries[entryCount - 1] : null;
   const plannerOutput = latestEntry?.plannerOutput || null;
-  const oneBigWin = plannerOutput?.oneBigWin || null;
   const tasks = plannerOutput?.tasks || [];
+  const rawOneBigWin = plannerOutput?.oneBigWin || null;
+  // [PR45.3] Cùng chặn Routine lọt vào One Big Win như AISuggestionsCard —
+  // xem comment chi tiết ở AISuggestionsCard (root cause: fallback trong
+  // runPlannerEngine/createAIPlannerCore(), khối bị khoá "no logic changes.
+  // Ever." — không sửa được ở đó, phải chặn ở lớp tiêu thụ dữ liệu này).
+  const oneBigWinIsRoutine = !!(rawOneBigWin && tasks.some(
+    t => t.isFixedRoutine && normalizeTaskName(t.name) === normalizeTaskName(rawOneBigWin.label)
+  ));
+  const oneBigWin = oneBigWinIsRoutine ? null : rawOneBigWin;
   const backupPlan = plannerOutput?.backupPlan || null;
   const confidence = plannerOutput?.confidence || null;
 
@@ -11449,7 +12732,11 @@ function UnscheduledGoalsLane({ data, taskPool, overrideLayer, setOverrideLayer 
   const poolById = Object.fromEntries((taskPool || []).map(t => [t.id, t]));
   const scheduledGoalIds = (overrideLayer && overrideLayer.goals) || {};
 
-  const unscheduled = picks.filter(id => poolById[id] && !scheduledGoalIds[id]);
+  // [PR45.1] Cùng fix với TodaysGoalsCard: loại id đã hidden (Routine/
+  // legacy cố định còn sót trong dailyPicks của ngày cũ, trước patch V32)
+  // khỏi dải "CHƯA XẾP GIỜ" — nếu không, Routine cũ vẫn hiện ở đây kèm nút
+  // "Gán giờ" dù nó không phải Goal.
+  const unscheduled = picks.filter(id => poolById[id] && !poolById[id].hidden && !scheduledGoalIds[id]);
 
   const startAssign = (id) => { setAssigningId(id); setTimeValue(""); };
   const cancelAssign = () => { setAssigningId(null); setTimeValue(""); };
@@ -11511,6 +12798,179 @@ function UnscheduledGoalsLane({ data, taskPool, overrideLayer, setOverrideLayer 
 
 
 
+// [PR44.1 mục 1] Popup nhỏ hỏi giờ hoàn thành THỰC TẾ khi tick 1 block
+// Routine/Fixed trong "Lịch trình hôm nay". Hoàn toàn tách biệt khỏi
+// Reflow/Override Layer — chỉ trả về 1 chuỗi "HH:MM" qua onConfirm(hhmm),
+// không tự đọc/ghi storage, không side-effect. "Bây giờ" dùng giờ hệ
+// thống hiện tại (làm tròn phút); "Chọn thời gian" cho nhập tự do qua
+// <input type="time">, mặc định = giờ hiện tại để đỡ phải gõ lại từ đầu.
+function ActualTimeConfirmPopup({ item, onConfirm, onCancel }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const nowHHMM = (() => {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  })();
+  const [mode, setMode] = useState("now"); // "now" | "custom"
+  const [customTime, setCustomTime] = useState(nowHHMM);
+
+  const confirm = () => {
+    if (mode === "now") onConfirm(nowHHMM);
+    else onConfirm(customTime || nowHHMM);
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 1000, padding: 16,
+    }} onClick={onCancel}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: theme.surface, borderRadius: 16, padding: 18,
+        width: "100%", maxWidth: 320, border: `1px solid ${theme.border}`,
+        boxShadow: "0 12px 40px rgba(0,0,0,0.4)",
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: theme.text, marginBottom: 4 }}>
+          Hoàn thành lúc
+        </div>
+        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 12 }}>
+          {item?.name}
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0", cursor: "pointer" }}>
+          <input type="radio" checked={mode === "now"} onChange={() => setMode("now")} />
+          <span style={{ fontSize: 12, color: theme.text }}>Bây giờ ({nowHHMM})</span>
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0", cursor: "pointer" }}>
+          <input type="radio" checked={mode === "custom"} onChange={() => setMode("custom")} />
+          <span style={{ fontSize: 12, color: theme.text }}>Chọn thời gian</span>
+          {mode === "custom" && (
+            <input type="time" value={customTime} onChange={e => setCustomTime(e.target.value)}
+              style={{ marginLeft: 4, padding: "4px 6px", borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }} />
+          )}
+        </label>
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <button onClick={onCancel}
+            style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
+            Huỷ
+          </button>
+          <button onClick={confirm}
+            style={{ flex: 1, padding: 8, borderRadius: 8, border: "none", background: accent, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+            Xác nhận
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// [PR44.2] RescheduleBlockPopup — popup "Đổi thời gian", điểm vào DUY NHẤT
+// cho việc đổi giờ/thời lượng THẬT của 1 block Routine/Fixed trên
+// Timeline. Thay thế HOÀN TOÀN mô hình kéo-thả đổi thứ tự hiển thị
+// (manualOrder, PR44.1 mục 3, đã xoá) — đúng yêu cầu PR44.2 "đổi mô hình
+// UX từ Reorder → Reschedule". Cùng style/pattern với ActualTimeConfirmPopup
+// ở trên (modal overlay, cùng theme/accent, cùng bố cục nút Huỷ/Áp dụng).
+//
+// - Validate CỤC BỘ trong popup (không sửa hàm thuần rescheduleTimelineBlock
+//   để làm 2 lớp chặn độc lập, giống pattern MIN_RESIZE_DUR/resizeTimelineBlock
+//   đã có):
+//     + Giờ bắt đầu phải đúng định dạng "HH:MM" hợp lệ (00:00–23:59) — sai
+//       thì hiện "Giờ không hợp lệ", KHÔNG cho bấm Áp dụng.
+//     + Thời lượng phải là số nguyên dương (> 0 phút) — <= 0 hoặc không
+//       phải số thì KHÔNG cho lưu (đúng yêu cầu "Nếu duration <=0 không
+//       cho lưu").
+// - onApply(newStart, newDurMin) chỉ được gọi khi CẢ 2 điều kiện trên đều
+//   hợp lệ — caller (SmartSchedule) chỉ việc gọi thẳng
+//   rescheduleTimelineBlock(overrideLayer, doneKey, newStart, newDurMin).
+function RescheduleBlockPopup({ item, onApply, onCancel }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [startVal, setStartVal] = useState(item?.start || "00:00");
+  const [durVal, setDurVal] = useState(String(item?.dur ?? ""));
+
+  const startValid = /^([01]\d|2[0-3]):([0-5]\d)$/.test(startVal);
+  const durNum = Number(durVal);
+  const durValid = durVal.trim().length > 0 && Number.isFinite(durNum) && durNum > 0;
+  const canApply = startValid && durValid;
+
+  const apply = () => {
+    if (!canApply) return;
+    onApply(startVal, Math.round(durNum));
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)",
+      display: "flex", alignItems: "center", justifyContent: "center",
+      zIndex: 1000, padding: 16,
+    }} onClick={onCancel}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: theme.surface, borderRadius: 16, padding: 18,
+        width: "100%", maxWidth: 320, border: `1px solid ${theme.border}`,
+        boxShadow: "0 12px 40px rgba(0,0,0,0.4)",
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: theme.text, marginBottom: 4 }}>
+          Đổi thời gian
+        </div>
+        <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 14 }}>
+          {item?.name}
+        </div>
+
+        <label style={{ display: "block", fontSize: 11, color: theme.textDim, marginBottom: 4 }}>
+          Giờ bắt đầu
+        </label>
+        <input
+          type="time"
+          value={startVal}
+          onChange={e => setStartVal(e.target.value)}
+          style={{
+            width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 8,
+            border: `1px solid ${startValid ? theme.border : theme.danger}`,
+            background: theme.bg, color: theme.text, fontSize: 13, marginBottom: 4,
+          }}
+        />
+        {!startValid && (
+          <div style={{ fontSize: 10, color: theme.danger, marginBottom: 6 }}>Giờ không hợp lệ</div>
+        )}
+
+        <label style={{ display: "block", fontSize: 11, color: theme.textDim, marginTop: 10, marginBottom: 4 }}>
+          Thời lượng (phút)
+        </label>
+        <input
+          type="number"
+          min="1"
+          step="1"
+          value={durVal}
+          onChange={e => setDurVal(e.target.value)}
+          style={{
+            width: "100%", boxSizing: "border-box", padding: "8px 10px", borderRadius: 8,
+            border: `1px solid ${durValid ? theme.border : theme.danger}`,
+            background: theme.bg, color: theme.text, fontSize: 13, marginBottom: 4,
+          }}
+        />
+        {!durValid && (
+          <div style={{ fontSize: 10, color: theme.danger, marginBottom: 6 }}>Thời lượng phải lớn hơn 0</div>
+        )}
+
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          <button onClick={onCancel}
+            style={{ flex: 1, padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.textDim, fontSize: 12, cursor: "pointer" }}>
+            Huỷ
+          </button>
+          <button onClick={apply} disabled={!canApply}
+            style={{
+              flex: 1, padding: 8, borderRadius: 8, border: "none",
+              background: canApply ? accent : theme.border,
+              color: canApply ? "#fff" : theme.textDim,
+              fontSize: 12, fontWeight: 700, cursor: canApply ? "pointer" : "default",
+            }}>
+            Áp dụng
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerStorage, plannerToday, onPlannerTodayChange, overrideLayer, setOverrideLayer, onTogglePoolTask }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
@@ -11563,6 +13023,13 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   // (xem comment chi tiết tại applyTimelineOverrides). Không ảnh hưởng
   // reflowedBlocks/Routine/Fixed/Buffer — chỉ thu hẹp thêm goalBlocks.
   const dailyPicks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
+  // [PR44.2] `timelineItems` LUÔN đúng nguyên kết quả applyTimelineOverrides
+  // (Planner Engine/Reflow) — không còn bước "áp thứ tự hiển thị riêng"
+  // (manualOrder, PR44.1 mục 3) chèn phía sau nữa. applyTimelineOverrides
+  // (đã tự sort theo `start`, xem cuối hàm đó) là NGUỒN DUY NHẤT quyết định
+  // thứ tự render — Timeline luôn phản ánh đúng thứ tự thời gian thực, đúng
+  // mô hình "Reschedule" (đổi giờ thật) thay cho "Reorder" (đổi thứ tự
+  // hiển thị) mà PR44.2 yêu cầu.
   const timelineItems = useMemo(() => {
     return applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks).map(it => ({
       ...it,
@@ -11572,6 +13039,31 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       color: it.isGoal ? accent : (it.isBuffer ? theme.textDim : (it.sourceColor || "#EF4444")),
     }));
   }, [schedule, overrideLayer, taskPool, dailyPicks, theme.textDim, accent]);
+
+  // [PR45.2] unscheduledGoalsForFreeTime — CÙNG điều kiện lọc với
+  // UnscheduledGoalsLane (poolById[id] tồn tại, chưa hidden — PR45.1,
+  // chưa có trong overrideLayer.goals) để 2 nơi luôn nói cùng 1 danh sách
+  // "goal chưa xếp giờ". Giữ nguyên THỨ TỰ dailyPicks (không sort) — đúng
+  // yêu cầu autoFillUnscheduledGoals ("giữ nguyên thứ tự dailyPicks").
+  const poolByIdForFreeTime = useMemo(
+    () => Object.fromEntries((taskPool || []).map(t => [t.id, t])),
+    [taskPool]
+  );
+  const unscheduledGoalsForFreeTime = useMemo(() => {
+    const scheduledGoalIds = (overrideLayer && overrideLayer.goals) || {};
+    return dailyPicks
+      .filter(id => poolByIdForFreeTime[id] && !poolByIdForFreeTime[id].hidden && !scheduledGoalIds[id])
+      .map(id => ({ id, name: poolByIdForFreeTime[id].l, dur: GOAL_DEFAULT_DUR_MIN }));
+  }, [dailyPicks, poolByIdForFreeTime, overrideLayer]);
+
+  // [PR45.2] freeTimeResult — { placedSuggestions, freeTimeBlocks }, tính
+  // THUẦN từ timelineItems (đã Reflow + de-overlap) + goal chưa xếp giờ.
+  // Đây CHỈ là gợi ý hiển thị (không ghi overrideLayer) — xem chi tiết
+  // thiết kế ở comment đầu autoFillUnscheduledGoals.
+  const freeTimeResult = useMemo(
+    () => autoFillUnscheduledGoals(timelineItems, unscheduledGoalsForFreeTime),
+    [timelineItems, unscheduledGoalsForFreeTime]
+  );
 
   // [V41] Trạng thái tick trực quan CHO RIÊNG Timeline — field data MỚI,
   // tách biệt hoàn toàn khỏi data.dailyPicks/poolDone (Nhiệm vụ hôm nay)
@@ -11600,11 +13092,33 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   //   cho markTimelineBlockDoneAt) — Reflow không còn áp dụng delta của
   //   block này nữa, đúng ý nghĩa "huỷ tick thì huỷ luôn ảnh hưởng Reflow
   //   của lần tick đó".
-  const toggleTimelineItem = (it) => {
+  // [PR44.1 mục 1] actualCompletedAt — field MỚI, tách biệt hoàn toàn khỏi
+  // timelineOverrideLayer.blocks[doneKey].doneAt (field cũ dùng cho Reflow
+  // ở trên — KHÔNG đụng, KHÔNG đọc, KHÔNG ghi field đó ở đây). Chỉ dùng để
+  // HIỂN THỊ "Kế hoạch/Thực tế" trên mỗi block, không ảnh hưởng Reflow,
+  // không ảnh hưởng start/end của bất kỳ block nào.
+  const actualCompletedAt = data.actualCompletedAt || {};
+  // [PR44.1] pendingActualTimeFor — item đang chờ người dùng xác nhận giờ
+  // hoàn thành qua popup (null = không có popup nào đang mở).
+  const [pendingActualTimeFor, setPendingActualTimeFor] = useState(null);
+
+  // [PR44.1] doTickTimelineItem — GIỮ NGUYÊN 100% thân hàm toggleTimelineItem
+  // cũ (đổi tên để phân biệt với hàm gate mới bên dưới). KHÔNG sửa 1 dòng
+  // logic doneAt/Reflow/timelineDone hiện có — chỉ thêm 1 tham số
+  // actualAt (tuỳ chọn) để ghi kèm data.actualCompletedAt khi TICK.
+  const doTickTimelineItem = (it, actualAt) => {
     const doneKey = it && it.doneKey;
     const wasDone = !!timelineDone[doneKey];
     if (!wasDone) playSound("tick");
-    save(td, { timelineDone: { ...timelineDone, [doneKey]: !wasDone } });
+    const nextActual = { ...actualCompletedAt };
+    if (wasDone) {
+      // UNTICK: xoá giờ thực tế đã ghi trước đó (nếu có), đối xứng với
+      // việc markTimelineBlockDoneAt(..., null) xoá doneAt bên dưới.
+      if (doneKey) delete nextActual[doneKey];
+    } else if (doneKey && actualAt) {
+      nextActual[doneKey] = actualAt;
+    }
+    save(td, { timelineDone: { ...timelineDone, [doneKey]: !wasDone }, actualCompletedAt: nextActual });
     if (doneKey) {
       const nowDate = new Date();
       const nowHHMM = String(nowDate.getHours()).padStart(2, "0") + ":" + String(nowDate.getMinutes()).padStart(2, "0");
@@ -11612,6 +13126,39 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       setOverrideLayer(nextLayer);
     }
   };
+
+  // [PR44.1 mục 1] toggleTimelineItem — điểm vào từ UI (onClick/onChange
+  // của checkbox), giờ là 1 LỚP GATE mỏng phía trước doTickTimelineItem:
+  //   - UNTICK (đang done → bỏ tick): chạy NGAY như cũ, không hỏi gì thêm
+  //     (yêu cầu chỉ nói "khi tick hoàn thành" mới hỏi popup).
+  //   - TICK (đang chưa done → tick): nếu block CHƯA có actualCompletedAt,
+  //     mở popup hỏi "Bây giờ"/"Chọn thời gian" TRƯỚC, chưa ghi gì cả —
+  //     doTickTimelineItem chỉ chạy sau khi người dùng xác nhận trong popup.
+  const toggleTimelineItem = (it) => {
+    const doneKey = it && it.doneKey;
+    const wasDone = !!timelineDone[doneKey];
+    if (wasDone) {
+      doTickTimelineItem(it);
+      return;
+    }
+    if (!doneKey || actualCompletedAt[doneKey]) {
+      // Không có doneKey hợp lệ, hoặc đã có actualCompletedAt từ trước
+      // (vd tick lại sau khi đã từng ghi) — tick thẳng như hành vi cũ,
+      // không hỏi lại popup mỗi lần.
+      doTickTimelineItem(it);
+      return;
+    }
+    setPendingActualTimeFor(it);
+  };
+
+  // [PR44.2] pendingRescheduleFor — item Routine/Fixed đang chờ người
+  // dùng nhập giờ bắt đầu + thời lượng mới qua popup "Đổi thời gian"
+  // (null = không có popup nào đang mở). Thay thế HOÀN TOÀN cơ chế kéo-thả
+  // đổi thứ tự hiển thị (draggingKey/dragOverIdx/handleTimelineDrop,
+  // manualOrder) của PR44.1 mục 3 — đã xoá sạch, không còn dead code. Mô
+  // hình mới: "Reschedule" (đổi giờ THẬT của block) thay cho "Reorder"
+  // (đổi vị trí RENDER) — xem rescheduleTimelineBlock (PR44.2, hàm thuần).
+  const [pendingRescheduleFor, setPendingRescheduleFor] = useState(null);
 
   // [V42 PR2.2] Resize UI — CHỈ cho block Routine (isFixedRoutine), tức
   // trong timelineItems là những item có isBuffer=false VÀ isFixed=false
@@ -11763,6 +13310,14 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       // sau setToday, không nằm trong catch) để không mất override nếu
       // chạy lại thất bại.
       setOverrideLayer(clearAllTimelineOverrides(overrideLayer));
+      // [PR44.1, cập nhật PR44.2] Cùng lý do bugfix PR5.1 ở trên: schedule[]
+      // mới có thể sinh doneKey trùng tên với lịch cũ nhưng ý nghĩa khác
+      // hẳn — nếu giữ nguyên actualCompletedAt cũ, nhãn "Thực tế" có thể áp
+      // nhầm lên block mới. Reset về mặc định khi pipeline thành công,
+      // KHÔNG đụng timelineDone (giữ đúng hành vi cũ của field đó, ngoài
+      // phạm vi PR44.1/PR44.2). [PR44.2] manualOrder đã bị xoá hoàn toàn
+      // khỏi schema data — không còn gì để reset ở đây nữa.
+      save(td, { actualCompletedAt: {} });
     } catch (e) {
       console.error("[SmartSchedule] regenerate failed:", e);
       setErrorMsg("Chưa xếp lại được lịch — thử lại giúp mình nhé.");
@@ -11783,7 +13338,113 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         📅 LỊCH TRÌNH HÔM NAY
       </div>
       <div>
-        {timelineItems.map((it) => {
+        {/* [PR45.2] renderItems = timelineItems (Routine/Fixed/Goal đã
+            gán giờ) HOÀ CHUNG với gợi ý tự động lấp goal chưa xếp giờ
+            (isFreeTimeSuggestion) + khoảng trống thật còn lại
+            (isFreeTimeBlock), sắp theo `start` để hiển thị đúng thứ tự
+            thời gian — đúng yêu cầu PR45 "Timeline luôn kín, không
+            khoảng chết, đúng thứ tự thời gian". 2 loại mới này KHÔNG có
+            trong timelineItems gốc (KHÔNG sửa applyTimelineOverrides) —
+            chỉ chèn thêm ở tầng render, tính từ freeTimeResult (PR45.2,
+            hàm thuần, đã tính SAU applyTimelineOverrides). */}
+        {[
+          ...timelineItems,
+          ...freeTimeResult.placedSuggestions.map(s => ({
+            key: "freesug_" + s.goalId, isFreeTimeSuggestion: true,
+            goalId: s.goalId, name: s.name, start: s.start, end: s.end, dur: s.dur,
+          })),
+          ...freeTimeResult.freeTimeBlocks.map((g, i) => ({
+            key: "freeblock_" + i, isFreeTimeBlock: true,
+            start: g.start, end: g.end, dur: g.dur,
+          })),
+        ]
+          .sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start))
+          .map((it) => {
+          // [PR45.2] Gợi ý tự động lấp goal chưa xếp giờ — hiển thị NHẸ
+          // HƠN goal đã gán giờ thật (viền chấm, nút "Chốt giờ này" gọi
+          // ĐÚNG assignGoalToSlot, cùng schema PR4.2 UnscheduledGoalsLane
+          // dùng — không tạo cơ chế ghi mới). Bấm "Chốt" biến gợi ý thành
+          // 1 goal thật trong timelineItems (overrideLayer.goals) — lần
+          // render sau, freeTimeResult tự tính lại vì goal đó không còn
+          // "chưa xếp giờ" nữa.
+          if (it.isFreeTimeSuggestion) {
+            return (
+              <div key={it.key} style={{
+                display: "flex", gap: 10, alignItems: "center",
+                padding: "9px 10px", marginBottom: 6, borderRadius: 10,
+                background: "transparent", border: `1px dashed ${accent}66`,
+              }}>
+                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                  {it.start}–{it.end}
+                </span>
+                <span style={{ fontSize: 13 }}>💡</span>
+                <span style={{ flex: 1, fontSize: 13, minWidth: 0, color: theme.textDim }}>
+                  Gợi ý: {it.name}
+                </span>
+                <button
+                  onClick={() => setOverrideLayer(assignGoalToSlot(overrideLayer, it.goalId, it.start, it.dur))}
+                  style={{ background: "none", border: `1px solid ${accent}66`, borderRadius: 999, padding: "3px 10px", color: accent, fontSize: 10, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
+                  Chốt giờ này
+                </button>
+              </div>
+            );
+          }
+          // [PR45.2] Khoảng trống thật KHÔNG còn goal nào để lấp — hiện rõ
+          // "Thời gian tự do" thay vì im lặng bỏ trống (đúng yêu cầu #7,
+          // đối lập với hành vi cũ "Timeline chỉ hiện task" của PR44.2 —
+          // PR44.2 ẩn buffer vì lúc đó buffer không mang thông tin gì hữu
+          // ích; giờ khoảng trống ĐÃ được xác nhận không còn goal nào lấp
+          // được, nên hiển thị lại có chủ đích, khác bản chất với buffer
+          // cũ). Bỏ qua khoảng quá ngắn (<10 phút) — không đáng hiển thị
+          // thành 1 dòng riêng, tránh rối mắt với các khe hở tự nhiên nhỏ.
+          // [PR45.3] Khoảng trống LỚN (>=90 phút) đổi sang hiển thị gợi ý
+          // UI dạng danh sách thay vì chỉ 1 dòng "Thời gian tự do" đơn giản
+          // — tránh cảm giác "khoảng chết" nhìn trống trải với khoảng lớn.
+          // Đây CHỈ là gợi ý HIỂN THỊ tĩnh (hardcode, không đọc/ghi
+          // storage, không tạo Goal, không gọi save/setOverrideLayer) —
+          // đúng yêu cầu mục 5 "Danh sách này chỉ là gợi ý UI".
+          if (it.isFreeTimeBlock) {
+            if (it.dur < 10) return null;
+            const isLargeGap = it.dur >= 90;
+            if (isLargeGap) {
+              return (
+                <div key={it.key} style={{
+                  padding: "10px 12px", marginBottom: 6, borderRadius: 10,
+                  background: "transparent", border: `1px dashed ${theme.border}`,
+                }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                      {it.start}–{it.end}
+                    </span>
+                    <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
+                      ✨ Chưa có việc nào được lên lịch ({it.dur}')
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: theme.textDim, paddingLeft: 86, lineHeight: 1.7 }}>
+                    Bạn có thể:
+                    <br />• Đi bơi
+                    <br />• Học
+                    <br />• Dashboard
+                    <br />• Nghỉ ngơi
+                  </div>
+                </div>
+              );
+            }
+            return (
+              <div key={it.key} style={{
+                display: "flex", gap: 10, alignItems: "center",
+                padding: "7px 10px", marginBottom: 6, borderRadius: 10,
+                background: "transparent",
+              }}>
+                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                  {it.start}–{it.end}
+                </span>
+                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
+                  🕊️ Thời gian tự do ({it.dur}')
+                </span>
+              </div>
+            );
+          }
           const done = !!timelineDone[it.doneKey];
           // [V42 PR4.2] Goal block — render riêng, TÁCH HẲN khỏi nhánh
           // Buffer/Routine phía dưới, để không vô tình rơi vào
@@ -11837,18 +13498,16 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
               </div>
             );
           }
-          // Buffer ("Nghỉ giữa việc") không phải task thật — không cho tick,
-          // vẫn hiển thị mờ như cũ để thấy khoảng trống trong lịch.
+          // [PR44.2] Buffer ("Nghỉ giữa việc") KHÔNG còn render gì trên
+          // Timeline nữa — bỏ hoàn toàn dải "🕒 Trống X giờ Y phút" (PR44.1
+          // mục 4). Timeline giờ CHỈ hiện task thật (Routine/Fixed/Goal),
+          // đúng yêu cầu PR44.2 "Timeline chỉ hiện task". Buffer vẫn tồn
+          // tại ở TẦNG DỮ LIỆU (schedule[]/reflowTimelineBlocks vẫn sinh ra
+          // item isBuffer:true để Reflow tính khoảng trống chính xác giữa
+          // các block) — đây thuần là bỏ 1 nhánh RENDER, không đụng
+          // Planner Engine/buildScheduleV33/Reflow.
           if (it.isBuffer) {
-            return (
-              <div key={it.key} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 10px", marginBottom: 6 }}>
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                  {it.start}–{it.end}
-                </span>
-                <span style={{ width: 4, height: 4, borderRadius: "50%", background: it.color, flexShrink: 0 }} />
-                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>{it.name}</span>
-              </div>
-            );
+            return null;
           }
           // [V42 PR2.2] Resize handle CHỈ cho Routine block — trong
           // timelineItems, Routine là item không phải buffer và không
@@ -11861,7 +13520,8 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
             : it.end;
           const isDraggingThis = dragStateRef.current && dragStateRef.current.doneKey === it.doneKey;
           return (
-            <div key={it.key} onClick={() => toggleTimelineItem(it)}
+            <div key={it.key}>
+              <div onClick={() => toggleTimelineItem(it)}
               title={it.overflow ? "Lịch quá tải — khối này không đủ chỗ, xem khu \"Chưa xếp được\" bên dưới" : undefined}
               style={{
                 display: "flex", gap: 10, alignItems: "center", cursor: "pointer",
@@ -11878,9 +13538,22 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
                 position: "relative",
               }}>
               <NeonCheckbox checked={done} onChange={() => toggleTimelineItem(it)} accent={it.color}/>
-              <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                {it.start}–{previewEnd}
-              </span>
+              {/* [PR44.1 mục 2] Khi đã hoàn thành VÀ có actualCompletedAt
+                  (ghi qua popup ở toggleTimelineItem), đổi hiển thị "giờ kế
+                  hoạch" đơn thuần thành 2 dòng "Kế hoạch/Thực tế" — KHÔNG
+                  đổi it.start/it.end (giờ kế hoạch gốc giữ nguyên tuyệt
+                  đối). Chưa hoàn thành (hoặc chưa từng ghi actual — vd data
+                  cũ trước PR44.1) → giữ đúng hiển thị "start–end" như cũ. */}
+              {done && actualCompletedAt[it.doneKey] ? (
+                <div style={{ fontSize: 10, color: theme.textDim, flexShrink: 0, minWidth: 76, lineHeight: 1.35 }}>
+                  <div>Kế hoạch<br/>{it.start}</div>
+                  <div style={{ marginTop: 2 }}>Thực tế<br/>{actualCompletedAt[it.doneKey]}</div>
+                </div>
+              ) : (
+                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
+                  {it.start}–{previewEnd}
+                </span>
+              )}
               {/* [V42 PR2.3 fix] Icon đầu block chỉ biểu diễn LOẠI block
                   (isFixed → 📌, còn lại → ⏰) — không được đổi theo trạng
                   thái pinned. Trạng thái pin chỉ hiển thị qua nút pin riêng
@@ -11913,7 +13586,7 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
                   onClick={(e) => handleTogglePin(e, it)}
                   title={it.pinned ? "Bỏ ghim" : "Ghim (Reflow sẽ không đẩy giờ khối này)"}
                   style={{
-                    position: "absolute", right: 32, bottom: 2,
+                    position: "absolute", right: 58, bottom: 2,
                     width: 22, height: 18, cursor: "pointer",
                     display: "flex", alignItems: "center", justifyContent: "center",
                     background: "transparent", border: "none", padding: 0,
@@ -11930,7 +13603,7 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
                   onTouchStart={(e) => handleResizeStart(e, it)}
                   onClick={(e) => e.stopPropagation()}
                   style={{
-                    position: "absolute", right: 6, bottom: 2,
+                    position: "absolute", right: 32, bottom: 2,
                     width: 22, height: 14, cursor: "ns-resize",
                     display: "flex", alignItems: "center", justifyContent: "center",
                     opacity: isDraggingThis ? 1 : 0.35,
@@ -11941,6 +13614,29 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
                   <span style={{ width: 16, height: 3, borderRadius: 2, background: it.color }} />
                 </div>
               )}
+              {/* [PR44.2] Nút "Đổi thời gian" — mở popup Reschedule
+                  (RescheduleBlockPopup) để nhập giờ bắt đầu + thời lượng
+                  mới. Áp dụng cho CẢ Routine VÀ Fixed (đúng luật PR44.2:
+                  "Routine/Fixed block ✔ được đổi giờ ✔ được đổi duration") —
+                  khác isRoutineBlock (chỉ Routine) dùng cho pin/resize-kéo
+                  ở trên. Goal/Buffer không có nút này (Goal "không sửa",
+                  Buffer "không sửa trực tiếp" — engine tự tính lại qua
+                  Reflow). stopPropagation để không kích hoạt toggle done
+                  của div cha (cùng pattern handleTogglePin/resize handle). */}
+              <button
+                onClick={(e) => { e.stopPropagation(); setPendingRescheduleFor(it); }}
+                title="Đổi thời gian"
+                style={{
+                  position: "absolute", right: 6, bottom: 2,
+                  width: 22, height: 18, cursor: "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  background: "transparent", border: "none", padding: 0,
+                  opacity: 0.45, fontSize: 12, lineHeight: 1,
+                }}
+              >
+                🕐
+              </button>
+              </div>
             </div>
           );
         })}
@@ -12003,6 +13699,40 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
         )}
       </div>
       {errorMsg && <div style={{ fontSize: 10, color: theme.danger, marginTop: 6 }}>⚠ {errorMsg}</div>}
+
+      {/* [PR44.1 mục 1] Popup xác nhận giờ hoàn thành thực tế — chỉ mở khi
+          tick 1 block Routine/Fixed lần đầu (chưa có actualCompletedAt).
+          onConfirm chạy đúng doTickTimelineItem gốc (không đổi logic
+          doneAt/Reflow), kèm actualAt để ghi data.actualCompletedAt. */}
+      {pendingActualTimeFor && (
+        <ActualTimeConfirmPopup
+          item={pendingActualTimeFor}
+          onCancel={() => setPendingActualTimeFor(null)}
+          onConfirm={(hhmm) => {
+            const it = pendingActualTimeFor;
+            setPendingActualTimeFor(null);
+            doTickTimelineItem(it, hhmm);
+          }}
+        />
+      )}
+
+      {/* [PR44.2] Popup "Đổi thời gian" — mở khi bấm nút 🕐 trên 1 block
+          Routine/Fixed. onApply gọi rescheduleTimelineBlock (hàm thuần,
+          PR44.2) → setOverrideLayer — applyTimelineOverrides/Reflow (không
+          sửa) tự tính lại toàn bộ Timeline theo giờ mới, dồn các block
+          phía sau nếu bị chồng giờ. KHÔNG regenerate lại AI Planner — chỉ
+          rebuild Timeline (đúng yêu cầu "Chỉ rebuild timeline"). */}
+      {pendingRescheduleFor && (
+        <RescheduleBlockPopup
+          item={pendingRescheduleFor}
+          onCancel={() => setPendingRescheduleFor(null)}
+          onApply={(newStart, newDur) => {
+            const it = pendingRescheduleFor;
+            setPendingRescheduleFor(null);
+            setOverrideLayer(rescheduleTimelineBlock(overrideLayer, it.doneKey, newStart, newDur));
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -17594,6 +19324,1550 @@ class GlobalErrorBoundary extends Component {
     return this.props.children;
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// ── V43 · PR43.1 — GAME REGISTRY + STORAGE MODULE ──────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+// Nền móng của Game Layer (Home Dashboard Game Layer, xem
+// V43_Final_Architecture.md). PR43.1 CHỈ tạo: Game Registry (dữ liệu tĩnh),
+// schema (GameDefinition / GameEvent / EnergyState / GameData), và storage
+// module (read/write/validate/migrate) cho key `v43:gameData`.
+//
+// KHÔNG có ở đây (thuộc các PR sau, theo đúng roadmap mục 11):
+//   - GameDataContext / Provider          → PR43.2
+//   - Derive Layer (current energy, next occurrence) → PR43.3 / PR43.4
+//   - Widget Registry / GameWidgetZone    → PR43.5
+//   - Mount vào DashboardHome             → PR43.6
+//   - Settings UI (Event CRUD, Override)  → PR43.7
+//   - Cleanup / polish                    → PR43.8
+//
+// Module này hoàn toàn độc lập: không được import/gọi bởi bất kỳ component
+// nào khác trong file (Planner, Timeline, DashboardHome, Widget, AI
+// Planner, Settings đều không đổi). Namespace `v43:` tách biệt hoàn toàn
+// khỏi `v38:*`, `v25:*`, `v30:*`, `v33:*`, ... của Planner core — không đọc,
+// không ghi bất kỳ key nào khác ngoài GAME_DATA_KEY bên dưới.
+
+// ── 3.1 GameDefinition — Game Registry (chỉ sửa qua release code) ─────────
+// Danh sách cố định các GameDefinition. Thêm game mới = thêm 1 phần tử vào
+// mảng này; không sửa logic/component nào khác (Registry pattern, mục 12).
+const GAME_REGISTRY = [
+  {
+    id: "genshin_impact",
+    displayName: "Genshin Impact",
+    energyResources: [
+      {
+        resourceId: "original_resin",
+        label: "Original Resin",
+        max: 200,
+        recoveryMinutesPerUnit: 8,
+      },
+    ],
+    resetRules: [
+      {
+        id: "daily_reset",
+        label: "Daily Reset",
+        type: "daily",
+        timezone: "Asia/Shanghai", // reset server-side cố định theo server game, không theo local device
+        recurrence: { frequency: "daily", interval: 1 },
+      },
+    ],
+    color: "#4FA8D8",
+    icon: "🌊",
+    schemaVersion: 1,
+    source: "built-in",
+  },
+  {
+    id: "zenless_zone_zero",
+    displayName: "Zenless Zone Zero",
+    energyResources: [
+      {
+        resourceId: "battery_charge",
+        label: "Battery Charge",
+        max: 240,
+        recoveryMinutesPerUnit: 5,
+      },
+    ],
+    resetRules: [
+      {
+        id: "daily_reset",
+        label: "Daily Reset",
+        type: "daily",
+        timezone: "Asia/Shanghai",
+        recurrence: { frequency: "daily", interval: 1 },
+      },
+    ],
+    color: "#F2C438",
+    icon: "⚡",
+    schemaVersion: 1,
+    source: "built-in",
+  },
+];
+
+// Index tra cứu nhanh theo id — dùng nội bộ trong validate/migrate bên dưới
+// và sẽ được Derive Layer / Widget Registry ở các PR sau tái sử dụng. Đây
+// là dữ liệu suy ra (derived), không phải nguồn sự thật — nguồn sự thật
+// luôn là GAME_REGISTRY ở trên.
+const GAME_REGISTRY_BY_ID = Object.fromEntries(GAME_REGISTRY.map(g => [g.id, g]));
+
+// ── 3.4 GameData — shape tổng, version hiện hành của schema store ─────────
+const GAME_DATA_SCHEMA_VERSION = 1;
+
+// Trạng thái rỗng hợp lệ — dùng làm fallback bất cứ khi nào dữ liệu đọc
+// được không hợp lệ (mục 4.4), và làm giá trị khởi tạo cho lần ghi đầu
+// tiên (mục 4.2: version được thiết lập ngay từ lần ghi đầu tiên).
+function emptyGameData() {
+  return {
+    version: GAME_DATA_SCHEMA_VERSION,
+    energyStates: [],   // EnergyState[], khoá duy nhất theo (gameId, resourceId)
+    events: [],         // GameEvent[], id duy nhất
+    registryOverrides: {}, // { [gameId]: { schemaVersion, ...overridableFields } }
+  };
+}
+
+// ── 4.1 Storage key — namespace riêng, tách biệt hoàn toàn khỏi Planner ───
+const GAME_DATA_KEY = "v43:gameData";
+
+// ── 8. Validation Rules ─────────────────────────────────────────────────
+// validateGameData: kiểm tra shape một cách khoan dung với các trường lẻ tẻ
+// sai (loại bỏ bản ghi hỏng thay vì fail toàn bộ) nhưng NGHIÊM NGẶT với
+// những gì làm hỏng bất biến cốt lõi (version không nhận diện được, hoặc
+// dữ liệu gốc không phải object) — những trường hợp đó trả về null để
+// caller (readGameData) fallback về emptyGameData(), đúng mục 4.4.
+//
+// Trả về: GameData đã được làm sạch (bản ghi lỗi bị loại, không throw), hoặc
+// null nếu bản thân toàn bộ blob không thể tin cậy được ở mức tối thiểu.
+function validateGameData(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  // version bắt buộc có mặt và phải là version đã biết. V43 hiện chỉ nhận
+  // diện version 1 — mọi version khác (kể cả version tương lai lớn hơn,
+  // vì chưa có bước migrate tương ứng ở bản này) đều coi là không nhận
+  // diện được (mục 4.4 "version không nhận diện được").
+  if (raw.version !== GAME_DATA_SCHEMA_VERSION) return null;
+
+  // energyStates: lọc bỏ phần tử sai kiểu / thiếu trường bắt buộc / trùng
+  // khoá (gameId, resourceId) — giữ bản ghi hợp lệ đầu tiên gặp, bỏ các
+  // bản ghi trùng sau đó (duplicate detection, theo yêu cầu tác vụ).
+  const seenEnergyKeys = new Set();
+  const energyStates = Array.isArray(raw.energyStates)
+    ? raw.energyStates.filter(es => {
+        if (!es || typeof es !== "object") return false;
+        if (typeof es.gameId !== "string" || !es.gameId) return false;
+        if (typeof es.resourceId !== "string" || !es.resourceId) return false;
+        if (typeof es.lastValue !== "number" || !Number.isFinite(es.lastValue)) return false;
+        if (typeof es.lastCheckedAt !== "string" || !es.lastCheckedAt) return false;
+        const key = es.gameId + "::" + es.resourceId;
+        if (seenEnergyKeys.has(key)) return false; // duplicate (gameId,resourceId) — bỏ bản ghi trùng
+        seenEnergyKeys.add(key);
+        return true;
+      }).map(es => {
+        // clamp lastValue vào [0, max] nếu tra được max từ registry (mục 8:
+        // "giới hạn trong khoảng từ không đến giá trị tối đa của tài
+        // nguyên tương ứng tại thời điểm ghi"). Nếu không tra được (game/
+        // resource không còn tồn tại trong registry), giữ nguyên giá trị
+        // đã ghi — không suy đoán một max không có căn cứ.
+        const def = GAME_REGISTRY_BY_ID[es.gameId];
+        const resDef = def?.energyResources?.find(r => r.resourceId === es.resourceId);
+        if (!resDef) return es;
+        const clamped = Math.min(resDef.max, Math.max(0, es.lastValue));
+        return clamped === es.lastValue ? es : { ...es, lastValue: clamped };
+      })
+    : [];
+
+  // events: lọc bỏ phần tử sai kiểu / thiếu trường bắt buộc / trùng id
+  // (mục 3.2, mục 8). gameId được PHÉP trỏ đến id không còn tồn tại trong
+  // registry (orphaned, mục 3.2) — validate ở đây không loại bỏ trường
+  // hợp đó, chỉ yêu cầu gameId có mặt và là string không rỗng.
+  const seenEventIds = new Set();
+  const events = Array.isArray(raw.events)
+    ? raw.events.filter(ev => {
+        if (!ev || typeof ev !== "object") return false;
+        if (typeof ev.id !== "string" || !ev.id) return false;
+        if (seenEventIds.has(ev.id)) return false; // duplicate id — bỏ bản ghi trùng
+        if (typeof ev.gameId !== "string" || !ev.gameId) return false;
+        if (typeof ev.title !== "string" || !ev.title) return false;
+        if (!["event", "livestream", "banner", "update", "maintenance", "reset"].includes(ev.kind)) return false;
+        // occursAt + timezone luôn phải đi cùng nhau (mục 3.2, mục 8)
+        if (typeof ev.occursAt !== "string" || !ev.occursAt) return false;
+        if (typeof ev.timezone !== "string" || !ev.timezone) return false;
+        // recurrence: null hợp lệ (sự kiện một lần), hoặc object có frequency
+        if (ev.recurrence !== null && ev.recurrence !== undefined &&
+            (typeof ev.recurrence !== "object" || Array.isArray(ev.recurrence) || typeof ev.recurrence.frequency !== "string")) {
+          return false;
+        }
+        seenEventIds.add(ev.id);
+        return true;
+      }).map(ev => ({
+        // priority bắt buộc có giá trị mặc định (mục 3.2)
+        ...ev,
+        recurrence: ev.recurrence ?? null,
+        priority: typeof ev.priority === "number" ? ev.priority : 0,
+        createdAt: typeof ev.createdAt === "string" ? ev.createdAt : ev.occursAt,
+        updatedAt: typeof ev.updatedAt === "string" ? ev.updatedAt : ev.occursAt,
+      }))
+    : [];
+
+  // registryOverrides: chỉ giữ override có schemaVersion khớp bản gốc hiện
+  // hành (mục 4.2, mục 5.3, mục 8) — override lệch version bị BỎ QUA khi
+  // áp dụng nhưng KHÔNG bị xoá khỏi storage (yêu cầu giữ nguyên để chờ
+  // xác nhận lại). validateGameData vẫn giữ nguyên bản ghi trong object
+  // trả về (không xoá), chỉ đảm bảo shape tối thiểu (object hợp lệ);
+  // việc "bỏ qua khi áp dụng" là trách nhiệm của tầng merge (PR sau,
+  // ngoài phạm vi PR43.1), không phải của validate.
+  const registryOverrides = (raw.registryOverrides && typeof raw.registryOverrides === "object" && !Array.isArray(raw.registryOverrides))
+    ? raw.registryOverrides
+    : {};
+
+  return { version: GAME_DATA_SCHEMA_VERSION, energyStates, events, registryOverrides };
+}
+
+// ── 4.2 Migration ──────────────────────────────────────────────────────
+// migrateGameData: bước chuyển đổi dữ liệu khi version cũ hơn hiện hành.
+// v43:gameData là namespace hoàn toàn mới (mục 4.2) — hiện tại chỉ có
+// version 1 nên không có bước chuyển đổi thực sự nào cần chạy. Hàm này
+// tồn tại như điểm mở rộng bắt buộc cho tương lai: mọi thay đổi shape sau
+// này phải tăng GAME_DATA_SCHEMA_VERSION và thêm một nhánh chuyển đổi ở
+// đây, thay vì chỉnh trực tiếp readGameData.
+//
+// Trả về: dữ liệu đã ở version hiện hành (nếu migrate được), hoặc null
+// nếu version không nhận diện được / không có đường migrate (fallback rỗng
+// ở tầng gọi, đúng mục 4.4).
+function migrateGameData(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw.version === GAME_DATA_SCHEMA_VERSION) return raw; // đã ở version hiện hành, không cần migrate
+
+  // Chưa có version cũ hơn nào từng tồn tại (namespace mới hoàn toàn) →
+  // bất kỳ version nào khác 1 đều không nhận diện được ở bản này.
+  return null;
+}
+
+// ── readGameData / writeGameData ───────────────────────────────────────
+// Đọc v43:gameData qua S adapter (đúng cơ chế đang dùng cho toàn bộ
+// storage khác trong file — xem "STORAGE ADAPTER" phía trên). Chạy qua
+// migrate rồi validate trước khi trả về; nếu bất kỳ bước nào cho thấy dữ
+// liệu không đáng tin, fallback về emptyGameData() — KHÔNG throw ra ngoài
+// module (mục 4.4, acceptance criteria PR43.1), và KHÔNG ghi đè/xoá dữ
+// liệu gốc trên storage.
+async function readGameData() {
+  let rawStr;
+  try {
+    rawStr = await S.get(GAME_DATA_KEY);
+  } catch (e) {
+    console.error(`[v43:gameData] đọc storage thất bại:`, e);
+    return emptyGameData();
+  }
+
+  if (!rawStr || rawStr === "null") return emptyGameData();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawStr);
+  } catch (e) {
+    console.error(`[v43:gameData] dữ liệu lưu trữ không phải JSON hợp lệ — giữ nguyên trên storage, dùng fallback rỗng ở runtime.`, e);
+    return emptyGameData();
+  }
+
+  const migrated = migrateGameData(parsed);
+  if (!migrated) {
+    console.warn(`[v43:gameData] version không nhận diện được hoặc không có đường migrate — giữ nguyên trên storage, dùng fallback rỗng ở runtime.`);
+    return emptyGameData();
+  }
+
+  const validated = validateGameData(migrated);
+  if (!validated) {
+    console.warn(`[v43:gameData] dữ liệu không hợp lệ về shape sau migrate — giữ nguyên trên storage, dùng fallback rỗng ở runtime.`);
+    return emptyGameData();
+  }
+
+  return validated;
+}
+
+// Ghi v43:gameData qua S adapter. Validate trước khi persist — dữ liệu
+// không hợp lệ bị từ chối ghi (không tự ý "sửa cho đúng" rồi ghi đè, để
+// tránh mất thông tin caller không lường trước). Trả về true/false thay vì
+// throw, để caller (ở các PR sau) tự quyết định cách báo lỗi cục bộ theo
+// đúng mục 7 ("Ghi storage thất bại" → báo lỗi tại nơi khởi tạo hành động,
+// không tự động retry ngầm).
+async function writeGameData(data) {
+  const validated = validateGameData(data);
+  if (!validated) {
+    console.error(`[v43:gameData] writeGameData: dữ liệu không hợp lệ, từ chối ghi.`, data);
+    return false;
+  }
+  try {
+    await S.set(GAME_DATA_KEY, JSON.stringify(validated));
+    return true;
+  } catch (e) {
+    console.error(`[v43:gameData] ghi storage thất bại:`, e);
+    return false;
+  }
+}
+// ═════════════════════════════════════════════════════════════════════════
+// ── HẾT PR43.1 ──────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+
+// ======================================================
+// PR43.2 — GameDataContext + Provider
+// ======================================================
+// Tầng Runtime/Data cho Game Layer (xem V43_Final_Architecture.md, mục 2.3,
+// mục 11 — PR43.2). CHỈ tạo: Context, Provider, hook useGameData(), và
+// mutation API tối thiểu. KHÔNG có Widget, KHÔNG có UI, KHÔNG mount vào
+// App/DashboardHome ở PR này (roadmap mục 11: "chưa mount vào App thật";
+// mục 10, bảng Regression Risk PR43.2: "Provider chưa được mount vào App
+// thật, chỉ tồn tại độc lập").
+//
+// Độc lập hoàn toàn với Planner:
+//   - Không đọc PlannerRuntimeContext, không dùng usePlannerRuntime.
+//   - Không dùng useDebounceField (đó là debounce theo field, gắn với
+//     PlannerStorage) — Provider này có debounce ghi riêng, timer riêng
+//     (useRef cục bộ của chính Provider), không chia sẻ timer instance
+//     với bất kỳ debounce nào của Planner (mục 2.3, mục 11 acceptance
+//     criteria PR43.2).
+//   - Chỉ đọc/ghi qua readGameData()/writeGameData() của PR43.1 (namespace
+//     v43:gameData) — không tự ý đọc/ghi storage key nào khác.
+
+// ── Debounce delay riêng cho Game Layer ────────────────────────────────
+// Hằng số riêng, KHÔNG tái sử dụng delay mặc định của useDebounceField
+// (1500ms) dù giá trị có thể trùng — đây là một hằng số độc lập của Game
+// Layer, thay đổi delay của Planner trong tương lai sẽ không ảnh hưởng
+// giá trị này và ngược lại.
+const GAME_DATA_WRITE_DEBOUNCE_MS = 1500;
+
+// ── GameDataContext ─────────────────────────────────────────────────────
+// Context độc lập hoàn toàn với PlannerRuntimeContext — không lồng bên
+// trong, không được PlannerRuntimeContext tiêu thụ, không đọc/ghi
+// plannerStorage hay plannerToday.
+const GameDataContext = createContext(null);
+
+// ── GameDataProvider ────────────────────────────────────────────────────
+// Trách nhiệm (mục 2.3, mục 2.5, mục 4.4):
+//   1. Đọc GameData từ PR43.1 (readGameData()) một lần khi mount — validate
+//      và migrate đã nằm trong readGameData(), Provider không tự làm lại.
+//   2. Expose state (gameData) + setter thô (setGameData) + mutation API.
+//   3. Ghi xuống storage được debounce riêng, KHÔNG tự render UI nào.
+//
+// LƯU Ý QUAN TRỌNG: Provider này CHƯA được mount ở bất kỳ đâu trong cây
+// component thật (App/DashboardHome). Nó đứng độc lập, đúng theo roadmap
+// PR43.2 — việc mount vào App là phạm vi PR43.6 (mục 11), có feature flag
+// bao quanh. Khai báo Provider ở đây không tự động kích hoạt Game Layer.
+function GameDataProvider({ children }) {
+  // gameData: null khi chưa đọc xong storage lần đầu (tránh flash giá trị
+  // rỗng rồi lại nhảy sang giá trị thật ngay sau đó cho consumer nào cần
+  // phân biệt "đang tải" với "đã tải, rỗng thật sự"). Sau khi readGameData()
+  // resolve, luôn là một GameData hợp lệ (emptyGameData() nếu lỗi/rỗng —
+  // readGameData() đã đảm bảo điều này ở PR43.1, mục 4.4).
+  const [gameData, setGameData] = useState(null);
+
+  // ready: cờ tách biệt rõ "đã đọc xong lần đầu" khỏi việc suy đoán qua
+  // gameData !== null (giữ nguyên ý nghĩa tường minh cho consumer).
+  const [ready, setReady] = useState(false);
+
+  // Đọc một lần khi Provider mount (mục 2.5, bước 1). Không polling, không
+  // interval — chỉ một lần đọc khởi tạo.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const initial = await readGameData();
+      if (!cancelled) {
+        setGameData(initial);
+        setReady(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // ── Debounce ghi — hoàn toàn riêng, không chia sẻ timer với Planner ────
+  // writeTimerRef: setTimeout id riêng của Provider này. Không phải instance
+  // của useDebounceField, không được truyền ra ngoài, không được component
+  // nào khác nắm giữ tham chiếu.
+  const writeTimerRef = useRef(null);
+  // pendingWriteRef: giữ bản GameData mới nhất chưa kịp ghi (còn trong cửa
+  // sổ debounce), để flush đúng giá trị mới nhất khi Provider unmount giữa
+  // chừng — cùng nguyên tắc chống mất dữ liệu như useDebounceField đang áp
+  // dụng cho Planner (xem BUGFIX mục 9 của useDebounceField), nhưng cài đặt
+  // độc lập, không gọi lại hàm đó.
+  const pendingWriteRef = useRef(null);
+
+  const scheduleWrite = useCallback((nextData) => {
+    pendingWriteRef.current = nextData;
+    clearTimeout(writeTimerRef.current);
+    writeTimerRef.current = setTimeout(() => {
+      const toWrite = pendingWriteRef.current;
+      pendingWriteRef.current = null;
+      if (toWrite) writeGameData(toWrite); // writeGameData tự validate trước khi persist (PR43.1)
+    }, GAME_DATA_WRITE_DEBOUNCE_MS);
+  }, []);
+
+  // Flush ghi dở khi unmount — tránh mất thao tác cuối cùng nếu Provider bị
+  // gỡ khi vẫn còn dữ liệu đang chờ trong cửa sổ debounce.
+  useEffect(() => {
+    return () => {
+      clearTimeout(writeTimerRef.current);
+      if (pendingWriteRef.current) {
+        writeGameData(pendingWriteRef.current);
+        pendingWriteRef.current = null;
+      }
+    };
+  }, []);
+
+  // applyUpdate: helper nội bộ dùng chung bởi mọi hàm mutation bên dưới.
+  // Luôn tính state mới từ state cũ theo kiểu immutable (không mutate object
+  // hiện có), validate qua updater (mỗi mutation tự chịu trách nhiệm giữ
+  // đúng invariant của riêng mình — mục 8), rồi cập nhật runtime state ngay
+  // lập tức và lên lịch ghi debounce. Nếu updater trả về null, coi là thao
+  // tác bị từ chối (ví dụ trùng id) — không đổi state, không ghi.
+  const applyUpdate = useCallback((updater) => {
+    setGameData(prev => {
+      const base = prev || emptyGameData();
+      const next = updater(base);
+      if (!next) return prev; // thao tác bị từ chối — giữ nguyên state cũ
+      scheduleWrite(next);
+      return next;
+    });
+  }, [scheduleWrite]);
+
+  // ── Mutation API tối thiểu (mục "Nhiệm vụ" #4) ─────────────────────────
+
+  // updateEnergyState(gameId, resourceId, { lastValue, lastCheckedAt }):
+  // ghi nhận tường minh một EnergyState — đây là thao tác ghi chủ động của
+  // người dùng (mục 2.2 Derive Layer note: ghi lastCheckedAt chỉ xảy ra khi
+  // người dùng chủ động log, không phải hệ quả ngầm của render). Immutable:
+  // tạo mảng energyStates mới, không mutate phần tử cũ. Khoá duy nhất
+  // (gameId, resourceId) — nếu đã tồn tại thì thay thế, chưa có thì thêm.
+  const updateEnergyState = useCallback((gameId, resourceId, patch) => {
+    applyUpdate(prev => {
+      if (typeof gameId !== "string" || !gameId) return null;
+      if (typeof resourceId !== "string" || !resourceId) return null;
+      if (typeof patch?.lastValue !== "number" || !Number.isFinite(patch.lastValue)) return null;
+      if (typeof patch?.lastCheckedAt !== "string" || !patch.lastCheckedAt) return null;
+
+      // Clamp lastValue vào [0, max] nếu tra được resource từ registry
+      // (mục 8: "giới hạn trong khoảng từ không đến giá trị tối đa của tài
+      // nguyên tương ứng tại thời điểm ghi"). Không suy đoán max nếu không
+      // tra được (game/resource không còn trong registry).
+      const def = GAME_REGISTRY_BY_ID[gameId];
+      const resDef = def?.energyResources?.find(r => r.resourceId === resourceId);
+      const lastValue = resDef ? Math.min(resDef.max, Math.max(0, patch.lastValue)) : patch.lastValue;
+
+      const nextEntry = { gameId, resourceId, lastValue, lastCheckedAt: patch.lastCheckedAt };
+      const idx = prev.energyStates.findIndex(es => es.gameId === gameId && es.resourceId === resourceId);
+      const energyStates = idx === -1
+        ? [...prev.energyStates, nextEntry]
+        : prev.energyStates.map((es, i) => (i === idx ? nextEntry : es));
+
+      return { ...prev, energyStates };
+    });
+  }, [applyUpdate]);
+
+  // addGameEvent(event): thêm một GameEvent mới. Từ chối nếu id trùng (mục
+  // 3.2, mục 7: "Trùng id khi ghi một GameEvent mới → Từ chối thao tác ghi,
+  // không tự động đổi id"). occursAt + timezone bắt buộc đi cùng nhau.
+  const addGameEvent = useCallback((event) => {
+    let rejected = false;
+    applyUpdate(prev => {
+      if (!event || typeof event !== "object") { rejected = true; return null; }
+      if (typeof event.id !== "string" || !event.id) { rejected = true; return null; }
+      if (prev.events.some(ev => ev.id === event.id)) { rejected = true; return null; } // trùng id — từ chối
+      if (typeof event.gameId !== "string" || !event.gameId) { rejected = true; return null; }
+      if (typeof event.title !== "string" || !event.title) { rejected = true; return null; }
+      if (!["event", "livestream", "banner", "update", "maintenance", "reset"].includes(event.kind)) { rejected = true; return null; }
+      if (typeof event.occursAt !== "string" || !event.occursAt) { rejected = true; return null; }
+      if (typeof event.timezone !== "string" || !event.timezone) { rejected = true; return null; } // occursAt+timezone luôn đi cùng nhau
+      if (event.recurrence !== null && event.recurrence !== undefined &&
+          (typeof event.recurrence !== "object" || Array.isArray(event.recurrence) || typeof event.recurrence.frequency !== "string")) {
+        rejected = true; return null;
+      }
+
+      const now = new Date().toISOString();
+      const newEvent = {
+        ...event,
+        recurrence: event.recurrence ?? null,
+        priority: typeof event.priority === "number" ? event.priority : 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      return { ...prev, events: [...prev.events, newEvent] };
+    });
+    return !rejected;
+  }, [applyUpdate]);
+
+  // updateGameEvent(id, patch): sửa một GameEvent đã tồn tại theo id.
+  // Immutable — tạo phần tử mới, không mutate phần tử cũ. Không cho phép
+  // đổi id qua patch (id là khoá, bất biến). Nếu id không tồn tại, coi là
+  // thao tác bị từ chối (không tạo mới ngầm — đó là việc của addGameEvent).
+  const updateGameEvent = useCallback((id, patch) => {
+    applyUpdate(prev => {
+      if (typeof id !== "string" || !id) return null;
+      const idx = prev.events.findIndex(ev => ev.id === id);
+      if (idx === -1) return null; // không tồn tại — từ chối, không tạo mới ngầm
+
+      const merged = { ...prev.events[idx], ...patch, id, updatedAt: new Date().toISOString() };
+
+      // Giữ đúng invariant tối thiểu sau khi merge (mục 8) trước khi chấp
+      // nhận thao tác — nếu patch làm hỏng shape bắt buộc, từ chối toàn bộ
+      // thao tác thay vì ghi một bản ghi hỏng.
+      if (typeof merged.gameId !== "string" || !merged.gameId) return null;
+      if (typeof merged.title !== "string" || !merged.title) return null;
+      if (!["event", "livestream", "banner", "update", "maintenance", "reset"].includes(merged.kind)) return null;
+      if (typeof merged.occursAt !== "string" || !merged.occursAt) return null;
+      if (typeof merged.timezone !== "string" || !merged.timezone) return null;
+      if (merged.recurrence !== null && merged.recurrence !== undefined &&
+          (typeof merged.recurrence !== "object" || Array.isArray(merged.recurrence) || typeof merged.recurrence.frequency !== "string")) {
+        return null;
+      }
+
+      const events = prev.events.map((ev, i) => (i === idx ? merged : ev));
+      return { ...prev, events };
+    });
+  }, [applyUpdate]);
+
+  // removeGameEvent(id): xoá một GameEvent theo id. Immutable — tạo mảng
+  // mới qua filter, không mutate mảng cũ.
+  const removeGameEvent = useCallback((id) => {
+    applyUpdate(prev => {
+      if (typeof id !== "string" || !id) return null;
+      if (!prev.events.some(ev => ev.id === id)) return null; // không tồn tại — không có gì để xoá
+      return { ...prev, events: prev.events.filter(ev => ev.id !== id) };
+    });
+  }, [applyUpdate]);
+
+  // updateRegistryOverride(gameId, patch): ghi/merge một registryOverride
+  // cho gameId. Chỉ áp dụng đúng danh sách trường được phép override theo
+  // mục 5.3: displayName, color, icon, và các thuộc tính bên trong từng
+  // phần tử energyResources khi resourceId khớp phần tử gốc. Trường bất
+  // biến (id, schemaVersion, source, resetRules) KHÔNG được phép ghi qua
+  // patch — bị lọc bỏ nếu có mặt trong patch, không throw, chỉ bỏ qua các
+  // trường không được phép.
+  const OVERRIDABLE_TOP_LEVEL_FIELDS = ["displayName", "color", "icon"];
+  const updateRegistryOverride = useCallback((gameId, patch) => {
+    applyUpdate(prev => {
+      if (typeof gameId !== "string" || !gameId) return null;
+      if (!patch || typeof patch !== "object" || Array.isArray(patch)) return null;
+
+      const def = GAME_REGISTRY_BY_ID[gameId];
+      if (!def) return null; // override chỉ chỉnh sửa bản ghi đã tồn tại (mục 5.3), không tạo mới
+
+      // Lọc patch chỉ giữ trường được phép ở cấp top-level.
+      const filteredTop = {};
+      for (const key of OVERRIDABLE_TOP_LEVEL_FIELDS) {
+        if (key in patch) filteredTop[key] = patch[key];
+      }
+
+      // energyResources override: chỉ nhận khi resourceId khớp phần tử gốc
+      // đã tồn tại trong energyResources của GameDefinition (mục 5.3) —
+      // không cho phép thêm resourceId mới qua override.
+      let energyResourcesOverride;
+      if (Array.isArray(patch.energyResources)) {
+        const validResourceIds = new Set(def.energyResources.map(r => r.resourceId));
+        energyResourcesOverride = patch.energyResources.filter(
+          r => r && typeof r === "object" && typeof r.resourceId === "string" && validResourceIds.has(r.resourceId)
+        );
+      }
+
+      const existing = prev.registryOverrides[gameId];
+      // schemaVersion của override luôn đồng bộ theo schemaVersion hiện
+      // hành của registry gốc tại thời điểm ghi (mục 4.2, mục 5.3) — ghi
+      // mới qua Context luôn tạo override khớp version hiện tại; việc phát
+      // hiện override CŨ lệch version khi ĐỌC lại là trách nhiệm của tầng
+      // áp dụng override (ngoài phạm vi PR43.2).
+      const nextOverride = {
+        ...(existing || {}),
+        ...filteredTop,
+        schemaVersion: def.schemaVersion,
+        ...(energyResourcesOverride !== undefined ? { energyResources: energyResourcesOverride } : {}),
+      };
+
+      return {
+        ...prev,
+        registryOverrides: { ...prev.registryOverrides, [gameId]: nextOverride },
+      };
+    });
+  }, [applyUpdate]);
+
+  // value memo hoá — cùng khuôn mẫu PlannerRuntimeProvider, tránh re-render
+  // thừa ở consumer khi Provider re-render vì lý do không liên quan.
+  const value = useMemo(() => ({
+    gameData,
+    ready,
+    setGameData,
+    updateEnergyState,
+    addGameEvent,
+    updateGameEvent,
+    removeGameEvent,
+    updateRegistryOverride,
+  }), [gameData, ready, updateEnergyState, addGameEvent, updateGameEvent, removeGameEvent, updateRegistryOverride]);
+
+  return (
+    <GameDataContext.Provider value={value}>
+      {children}
+    </GameDataContext.Provider>
+  );
+}
+
+// ── useGameData() ───────────────────────────────────────────────────────
+// Hook truy cập GameDataContext. Throw rõ ràng nếu gọi ngoài
+// GameDataProvider — đúng yêu cầu "Nếu Context chưa tồn tại phải throw rõ
+// ràng" (mục "Nhiệm vụ" #3).
+function useGameData() {
+  const ctx = useContext(GameDataContext);
+  if (ctx === null) {
+    throw new Error(
+      "useGameData() phải được gọi bên trong <GameDataProvider>. " +
+      "GameDataProvider hiện CHƯA được mount vào App thật (thuộc phạm vi PR43.6) — " +
+      "nếu bạn thấy lỗi này ở component đang chạy trong production, đó là dấu hiệu " +
+      "component đó đang được mount ngoài phạm vi Provider dự kiến."
+    );
+  }
+  return ctx;
+}
+// ======================================================
+// End PR43.2
+// ======================================================
+
+// ======================================================
+// PR43.3 — Energy Tracker + Derive Layer
+// ======================================================
+// Derive Layer (mục 2.2, mục 3.3, mục 6.2, mục 11 — PR43.3) + component
+// hiển thị EnergyTrackerWidget. Đây là PR đầu tiên có UI, nhưng KHÔNG mount
+// vào DashboardHome/App/Planner/Widget Registry (thuộc phạm vi PR43.5/6).
+// Widget ở đây đứng riêng, chưa được bất kỳ nơi nào khác trong file gọi tới.
+//
+// Derive Layer — nguyên tắc bắt buộc (mục 2.2, mục 6.2):
+//   - Hàm thuần (pure), không side-effect, không ghi storage.
+//   - Không mutate object đầu vào (EnergyState, GameDefinition).
+//   - Không cập nhật lastCheckedAt — việc ghi lastCheckedAt chỉ xảy ra khi
+//     người dùng chủ động log (qua updateEnergyState() của PR43.2), không
+//     phải hệ quả ngầm của việc render/đọc.
+//   - Mọi tính toán chỉ dựa trên: EnergyState, GameDefinition (qua
+//     resourceId để tra energyResources), và thời gian hiện tại truyền vào
+//     (tham số `now`, KHÔNG tự gọi Date.now() bên trong để hàm dễ test và
+//     không phụ thuộc ẩn vào đồng hồ hệ thống tại thời điểm gọi).
+
+// ── deriveCurrentEnergy(energyState, resourceDef, now) ─────────────────
+// Công thức (mục 3.3, mục "Công thức" của PR43.3):
+//   current = lastValue + floor(elapsedMinutes / recoveryMinutesPerUnit)
+//   clamp về [0, max]
+// Không bao giờ vượt max, không bao giờ âm — kể cả khi lastCheckedAt ở
+// tương lai so với `now` (đồng hồ thiết bị sai, mục 7: "không coi là lỗi
+// chặn, chỉ là giá trị biên"). Không throw, không crash trong mọi trường
+// hợp đầu vào hợp lệ về shape.
+function deriveCurrentEnergy(energyState, resourceDef, now) {
+  const max = resourceDef.max;
+  const recoveryMinutesPerUnit = resourceDef.recoveryMinutesPerUnit;
+  const lastValue = energyState.lastValue;
+
+  if (typeof recoveryMinutesPerUnit !== "number" || !Number.isFinite(recoveryMinutesPerUnit) || recoveryMinutesPerUnit <= 0) {
+    return Math.min(max, Math.max(0, lastValue));
+  }
+
+  const lastCheckedAtMs = new Date(energyState.lastCheckedAt).getTime();
+  const nowMs = now.getTime();
+
+  if (!Number.isFinite(lastCheckedAtMs)) {
+    return Math.min(max, Math.max(0, lastValue));
+  }
+
+  const elapsedMinutes = (nowMs - lastCheckedAtMs) / 60000;
+  const recoveredUnits = elapsedMinutes > 0 ? Math.floor(elapsedMinutes / recoveryMinutesPerUnit) : 0;
+
+  const current = lastValue + recoveredUnits;
+  return Math.min(max, Math.max(0, current));
+}
+
+// ── deriveMinutesUntilNextUnit(energyState, resourceDef, now) ──────────
+// Số phút còn lại cho tới khi current tăng thêm 1 đơn vị ("+1 sau"). Trả
+// về null nếu current đã ở max hoặc recoveryMinutesPerUnit không hợp lệ.
+function deriveMinutesUntilNextUnit(energyState, resourceDef, now) {
+  const max = resourceDef.max;
+  const recoveryMinutesPerUnit = resourceDef.recoveryMinutesPerUnit;
+
+  if (typeof recoveryMinutesPerUnit !== "number" || !Number.isFinite(recoveryMinutesPerUnit) || recoveryMinutesPerUnit <= 0) {
+    return null;
+  }
+
+  const current = deriveCurrentEnergy(energyState, resourceDef, now);
+  if (current >= max) return null;
+
+  const lastCheckedAtMs = new Date(energyState.lastCheckedAt).getTime();
+  const nowMs = now.getTime();
+  if (!Number.isFinite(lastCheckedAtMs)) return null;
+
+  const elapsedMinutes = Math.max(0, (nowMs - lastCheckedAtMs) / 60000);
+  const minutesIntoCurrentUnit = elapsedMinutes % recoveryMinutesPerUnit;
+  const minutesRemaining = recoveryMinutesPerUnit - minutesIntoCurrentUnit;
+
+  return minutesRemaining;
+}
+
+// ── deriveMinutesUntilFull(energyState, resourceDef, now) ──────────────
+// Số phút còn lại cho tới khi current đạt max ("Đầy sau"). Trả về null nếu
+// đã đầy hoặc recoveryMinutesPerUnit không hợp lệ.
+function deriveMinutesUntilFull(energyState, resourceDef, now) {
+  const max = resourceDef.max;
+  const recoveryMinutesPerUnit = resourceDef.recoveryMinutesPerUnit;
+
+  if (typeof recoveryMinutesPerUnit !== "number" || !Number.isFinite(recoveryMinutesPerUnit) || recoveryMinutesPerUnit <= 0) {
+    return null;
+  }
+
+  const current = deriveCurrentEnergy(energyState, resourceDef, now);
+  if (current >= max) return null;
+
+  const minutesUntilNextUnit = deriveMinutesUntilNextUnit(energyState, resourceDef, now);
+  if (minutesUntilNextUnit === null) return null;
+
+  const unitsRemainingAfterNext = max - current - 1;
+  return minutesUntilNextUnit + unitsRemainingAfterNext * recoveryMinutesPerUnit;
+}
+
+// ── formatMinutesAsHM / formatSecondsAsMMSS ─────────────────────────────
+// Helper format cho tầng hiển thị (không thuộc Derive Layer nghiệp vụ,
+// không đọc/ghi gì) — thuần, chỉ nhận số và trả chuỗi.
+function formatMinutesAsHM(totalMinutes) {
+  const clamped = Math.max(0, Math.round(totalMinutes));
+  const hours = Math.floor(clamped / 60);
+  const minutes = clamped % 60;
+  if (hours <= 0) return `${minutes} phút`;
+  if (minutes <= 0) return `${hours} giờ`;
+  return `${hours} giờ ${minutes} phút`;
+}
+
+function formatSecondsAsMMSS(totalSeconds) {
+  const clamped = Math.max(0, Math.round(totalSeconds));
+  const mm = Math.floor(clamped / 60);
+  const ss = clamped % 60;
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+// ── EnergyTrackerWidget ──────────────────────────────────────────────────
+// UI theo đúng mẫu trong yêu cầu PR43.3: tên game, tên tài nguyên,
+// current/max, progress, "+1 sau" (đếm ngược mm:ss), "Đầy sau" (giờ/phút).
+//
+// Props (nhận qua props hoặc GameDataContext — mục "Widget" của PR43.3;
+// không tự fetch, không tự đọc storage, không tự validate):
+//   gameDefinition — GameDefinition
+//   energyResource — một phần tử của gameDefinition.energyResources
+//   energyState    — EnergyState tương ứng, hoặc null nếu chưa từng log
+//   showFullEta    — boolean, tuỳ chọn (mặc định true) — khai báo hiển thị
+//                    "Đầy sau" hay không thuộc về Widget Registry ở PR43.5
+//                    (mục 5.2); PR43.3 chỉ tạo prop tương ứng.
+//
+// Interval: UI hiển thị đếm ngược "+1 sau" dạng mm:ss → cần interval 1
+// giây, chỉ tồn tại cục bộ trong widget này, cleanup khi unmount, dừng hẳn
+// khi đã đầy (không còn gì để đếm). Không polling App/Context.
+//
+// Memo: bọc React.memo — chỉ re-render khi props liên quan (energyState/
+// gameDefinition/energyResource) đổi reference, hoặc khi tick nội bộ cập
+// nhật. Không phụ thuộc toàn bộ GameData (trách nhiệm trích xuất thuộc
+// GameWidgetZone ở PR43.5).
+const EnergyTrackerWidget = React.memo(function EnergyTrackerWidget({
+  gameDefinition,
+  energyResource,
+  energyState,
+  showFullEta = true,
+}) {
+  const [now, setNow] = useState(() => new Date());
+
+  const hasValidResource = !!energyResource && typeof energyResource.max === "number";
+  const effectiveState = energyState || null;
+
+  const current = hasValidResource && effectiveState
+    ? deriveCurrentEnergy(effectiveState, energyResource, now)
+    : 0;
+
+  const isFull = hasValidResource && current >= energyResource.max;
+
+  useEffect(() => {
+    if (!hasValidResource || !effectiveState || isFull) return; // không có gì để đếm — không tạo interval
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id); // cleanup bắt buộc (mục "Interval")
+  }, [hasValidResource, effectiveState, isFull]);
+
+  if (!gameDefinition || !hasValidResource) {
+    return null; // thiếu dữ liệu bắt buộc qua props — không crash, không tự fetch
+  }
+
+  const max = energyResource.max;
+  const progressPct = max > 0 ? Math.min(100, Math.max(0, (current / max) * 100)) : 0;
+
+  const minutesUntilNextUnit = effectiveState ? deriveMinutesUntilNextUnit(effectiveState, energyResource, now) : null;
+  const minutesUntilFull = effectiveState ? deriveMinutesUntilFull(effectiveState, energyResource, now) : null;
+
+  return (
+    <div
+      className="v43-energy-tracker-widget"
+      style={{
+        border: `1px solid ${gameDefinition.color || "#888"}55`,
+        borderRadius: 12,
+        padding: "12px 16px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span aria-hidden="true">{gameDefinition.icon}</span>
+        <span style={{ fontWeight: 600 }}>{gameDefinition.displayName}</span>
+      </div>
+
+      <div style={{ fontSize: 13, opacity: 0.75 }}>{energyResource.label}</div>
+
+      <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+        <span style={{ fontSize: 20, fontWeight: 700 }}>{current}</span>
+        <span style={{ fontSize: 14, opacity: 0.6 }}>/ {max}</span>
+      </div>
+
+      <div style={{ height: 6, borderRadius: 3, background: "#00000022", overflow: "hidden" }}>
+        <div
+          style={{
+            height: "100%",
+            width: `${progressPct}%`,
+            background: gameDefinition.color || "#888",
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+
+      {!effectiveState && (
+        <div style={{ fontSize: 12, opacity: 0.6 }}>Chưa có dữ liệu ghi nhận</div>
+      )}
+
+      {effectiveState && !isFull && minutesUntilNextUnit !== null && (
+        <div style={{ fontSize: 12, opacity: 0.75 }}>
+          +1 sau <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatSecondsAsMMSS(minutesUntilNextUnit * 60)}</span>
+        </div>
+      )}
+
+      {effectiveState && !isFull && showFullEta && minutesUntilFull !== null && (
+        <div style={{ fontSize: 12, opacity: 0.75 }}>
+          Đầy sau {formatMinutesAsHM(minutesUntilFull)}
+        </div>
+      )}
+
+      {effectiveState && isFull && (
+        <div style={{ fontSize: 12, opacity: 0.75 }}>Đã đầy</div>
+      )}
+    </div>
+  );
+});
+// ======================================================
+// End PR43.3
+// ======================================================
+
+// ======================================================
+// PR43.4 — Event Countdown
+// ======================================================
+// Derive Layer (mục 2.2, mục 3.2, mục 5.2, mục 6.2, mục 11 — PR43.4) +
+// component hiển thị EventCountdownWidget. Đây là PR tiếp theo có UI sau
+// PR43.3, cùng nguyên tắc: KHÔNG mount vào DashboardHome/App/Planner/Widget
+// Registry (thuộc phạm vi PR43.5/6). Widget ở đây đứng riêng, chưa được
+// bất kỳ nơi nào khác trong file gọi tới.
+//
+// CHỈ dùng API đã tồn tại từ PR43.1/43.2/43.3:
+//   - GAME_REGISTRY_BY_ID, GameDefinition shape (PR43.1)
+//   - GameEvent shape: id, gameId, title, kind, timezone, occursAt,
+//     recurrence, priority, createdAt, updatedAt (PR43.1, mục 3.2)
+//   - useGameData() / GameDataContext (PR43.2) — Widget đọc qua Context,
+//     không tự đọc storage.
+//   - formatMinutesAsHM, formatSecondsAsMMSS (PR43.3) — tái dùng thay vì
+//     định nghĩa hàm format trùng chức năng.
+// KHÔNG thêm trường mới vào GameEvent/GameData, không sửa storage module,
+// không sửa GameDataContext/Provider, không sửa Energy Derive Layer.
+//
+// Derive Layer — nguyên tắc bắt buộc (mục 2.2, mục 5.2, mục 6.2):
+//   - Hàm thuần (pure), không side-effect, không ghi storage, không mutate
+//     GameEvent/GameDefinition đầu vào.
+//   - Một hàm DUY NHẤT tính "lần xảy ra tiếp theo" cho MỌI `kind`
+//     (event, livestream, banner, update, maintenance, reset) — không rẽ
+//     nhánh theo kind (mục 5.2: "sử dụng chung một hàm duy nhất trong
+//     Derive Layer, nhận recurrence và occursAt làm đầu vào — không rẽ
+//     nhánh theo kind"). `kind` chỉ ảnh hưởng cách hiển thị (nhãn/icon/màu)
+//     ở tầng component, không ảnh hưởng phép tính.
+//   - Mọi tính toán chỉ dựa trên: GameEvent (occursAt, timezone,
+//     recurrence), và thời gian hiện tại truyền vào (tham số `now`, KHÔNG
+//     tự gọi Date.now()/new Date() bên trong để hàm dễ test và không phụ
+//     thuộc ẩn vào đồng hồ hệ thống tại thời điểm gọi) — cùng nguyên tắc
+//     đã áp dụng ở Derive Layer của PR43.3.
+//   - recurrence dùng chung shape đã được validate ở PR43.1/43.2:
+//     null (một lần), hoặc { frequency: string, interval?: number,
+//     daysOfWeek?: number[] (0=Chủ Nhật .. 6=Thứ Bảy, chỉ áp dụng khi
+//     frequency === "weekly"), end?: { type: "count"|"until", count?,
+//     until? } }. Không định nghĩa shape recurrence mới — chỉ đọc các
+//     trường theo đúng shape đã tồn tại trong hệ thống (mục 3.2: "cùng
+//     shape với đặc tả recurrence đã dùng ở các nơi khác của hệ thống").
+
+// ── Timezone helper (thuần, không side-effect) ──────────────────────────
+// Vì môi trường không có thư viện xử lý timezone ngoài Intl có sẵn của
+// trình duyệt, offset của một timezone tại một thời điểm cụ thể được suy
+// ra bằng cách so sánh cách Intl.DateTimeFormat biểu diễn thời điểm đó ở
+// timezone đích với biểu diễn UTC — cách tiếp cận này tự động đúng cho cả
+// DST (giờ mùa hè) vì offset được tính LẠI tại đúng thời điểm `atMs`
+// truyền vào, không dùng một offset cố định cho cả năm.
+function getTimezoneOffsetMs(timeZone, atMs) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hourCycle: "h23",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+    const parts = dtf.formatToParts(new Date(atMs));
+    const get = (type) => Number(parts.find(p => p.type === type)?.value);
+    const asUTC = Date.UTC(
+      get("year"), get("month") - 1, get("day"),
+      get("hour"), get("minute"), get("second")
+    );
+    return asUTC - atMs;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function addCalendarUnits(anchorMs, timezone, unitDays) {
+  const offsetAtAnchor = getTimezoneOffsetMs(timezone, anchorMs);
+  const wallMs = anchorMs + offsetAtAnchor;
+  const nextWallMs = wallMs + unitDays * 86400000;
+  const approxOffset = getTimezoneOffsetMs(timezone, nextWallMs - offsetAtAnchor);
+  return nextWallMs - approxOffset;
+}
+
+// ── PR43.7 — addCalendarMonths(anchorMs, timezone, unitMonths) ────────────
+// Bổ sung cho recurrence.frequency === "monthly". Rẽ nhánh ở deriveNextOccurrence
+// theo `frequency`, không theo `kind`, nên vẫn tuân thủ nguyên tắc mục 5.2
+// ("một hàm duy nhất, không rẽ nhánh theo kind"). Cùng cách tiếp cận
+// wall-clock + offset DST như addCalendarUnits ở trên: lấy giờ địa phương
+// tại anchor, cộng số tháng theo lịch (giữ nguyên ngày-trong-tháng khi có
+// thể, hạ về ngày cuối tháng nếu tháng đích ngắn hơn), rồi quy đổi lại UTC
+// bằng offset tại đúng thời điểm đích để tự đúng qua DST.
+function addCalendarMonths(anchorMs, timezone, unitMonths) {
+  const offsetAtAnchor = getTimezoneOffsetMs(timezone, anchorMs);
+  const wallDate = new Date(anchorMs + offsetAtAnchor);
+  const y = wallDate.getUTCFullYear();
+  const m = wallDate.getUTCMonth();
+  const d = wallDate.getUTCDate();
+  const hh = wallDate.getUTCHours();
+  const mm = wallDate.getUTCMinutes();
+  const ss = wallDate.getUTCSeconds();
+
+  const targetMonthIndex = m + unitMonths;
+  const targetYear = y + Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12;
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+  const targetDay = Math.min(d, daysInTargetMonth);
+
+  const nextWallMs = Date.UTC(targetYear, targetMonth, targetDay, hh, mm, ss);
+  const approxOffset = getTimezoneOffsetMs(timezone, nextWallMs - offsetAtAnchor);
+  return nextWallMs - approxOffset;
+}
+
+// ── PR43.7 — findNextDayOfWeekOccurrence ──────────────────────────────────
+// Cho recurrence.frequency === "weekly" kèm daysOfWeek (shape đã ghi ở
+// comment PR43.4: "daysOfWeek?: number[] (0=Chủ Nhật..6=Thứ Bảy, chỉ áp
+// dụng khi frequency === 'weekly'"). Hàm thuần: tìm ngày-trong-tuần gần
+// nhất >= searchFromMs nằm trong tập daysOfWeek, theo lịch địa phương của
+// timezone, giữ nguyên giờ-trong-ngày lấy từ anchorMs (occursAt). Nếu
+// daysOfWeek rỗng/không hợp lệ, trả về null — caller chịu trách nhiệm
+// fallback (hàm này không tự fallback, giữ đúng nguyên tắc "hàm thuần,
+// không rẽ nhánh ẩn").
+function findNextDayOfWeekOccurrence(anchorMs, timezone, daysOfWeek, searchFromMs) {
+  const sortedDays = [...new Set(daysOfWeek)].filter(x => Number.isInteger(x) && x >= 0 && x <= 6).sort((a, b) => a - b);
+  if (sortedDays.length === 0) return null;
+
+  const offsetAtAnchor = getTimezoneOffsetMs(timezone, anchorMs);
+  const anchorWall = new Date(anchorMs + offsetAtAnchor);
+  const hh = anchorWall.getUTCHours(), mm = anchorWall.getUTCMinutes(), ss = anchorWall.getUTCSeconds();
+
+  const offsetAtSearch = getTimezoneOffsetMs(timezone, searchFromMs);
+  const searchWall = new Date(searchFromMs + offsetAtSearch);
+  const searchDow = searchWall.getUTCDay();
+
+  let guard = 0;
+  let dayOffset = 0;
+  while (guard < 8) {
+    const dow = (searchDow + dayOffset) % 7;
+    if (sortedDays.includes(dow)) {
+      const candidateWallMs = Date.UTC(
+        searchWall.getUTCFullYear(), searchWall.getUTCMonth(), searchWall.getUTCDate() + dayOffset,
+        hh, mm, ss
+      );
+      const approxOffset = getTimezoneOffsetMs(timezone, candidateWallMs - offsetAtSearch);
+      const candidateMs = candidateWallMs - approxOffset;
+      if (candidateMs >= searchFromMs) return candidateMs;
+    }
+    dayOffset++;
+    guard++;
+  }
+  return null; // không tìm thấy trong 8 ngày tới — không nên xảy ra với daysOfWeek hợp lệ
+}
+
+function deriveNextOccurrence(occursAt, recurrence, timezone, now) {
+  const anchorMs = new Date(occursAt).getTime();
+  const nowMs = now.getTime();
+
+  if (!Number.isFinite(anchorMs)) {
+    return { occurrenceMs: null, isFuture: false, isPastNonRecurring: false };
+  }
+
+  if (!recurrence || typeof recurrence !== "object") {
+    return {
+      occurrenceMs: anchorMs,
+      isFuture: anchorMs > nowMs,
+      isPastNonRecurring: anchorMs <= nowMs,
+    };
+  }
+
+  if (anchorMs >= nowMs) {
+    return { occurrenceMs: anchorMs, isFuture: true, isPastNonRecurring: false };
+  }
+
+  const interval = typeof recurrence.interval === "number" && recurrence.interval > 0
+    ? recurrence.interval
+    : 1;
+
+  // ── PR43.7 — nhánh monthly (mới) ─────────────────────────────────────
+  // Bước theo tháng lịch, không quy đổi tháng thành số ngày cố định (tránh
+  // sai lệch vì các tháng có độ dài khác nhau).
+  if (recurrence.frequency === "monthly") {
+    let candidateMs = addCalendarMonths(anchorMs, timezone, interval);
+    let guard = 0;
+    while (candidateMs < nowMs && guard < 60) {
+      candidateMs = addCalendarMonths(candidateMs, timezone, interval);
+      guard++;
+    }
+    guard = 0;
+    while (guard < 60) {
+      const back = addCalendarMonths(candidateMs, timezone, -interval);
+      if (back < nowMs) break;
+      candidateMs = back;
+      guard++;
+    }
+    return { occurrenceMs: candidateMs, isFuture: candidateMs > nowMs, isPastNonRecurring: false };
+  }
+
+  // ── PR43.7 — nhánh weekly + daysOfWeek (mới) ─────────────────────────
+  // Chỉ áp dụng khi frequency === "weekly" VÀ daysOfWeek là mảng không
+  // rỗng. Nếu daysOfWeek thiếu/rỗng, rơi xuống nhánh weekly/daily/interval
+  // nguyên bản bên dưới — không đổi hành vi cũ trong trường hợp đó.
+  if (recurrence.frequency === "weekly" && Array.isArray(recurrence.daysOfWeek) && recurrence.daysOfWeek.length > 0) {
+    const found = findNextDayOfWeekOccurrence(anchorMs, timezone, recurrence.daysOfWeek, nowMs);
+    if (found !== null) {
+      return { occurrenceMs: found, isFuture: found > nowMs, isPastNonRecurring: false };
+    }
+    // fallback an toàn nếu không tìm được (không nên xảy ra) — tiếp tục
+    // xuống nhánh weekly thường bên dưới thay vì trả null.
+  }
+
+  // ── Nhánh nguyên bản: daily / weekly (không daysOfWeek) / interval ────
+  const stepDays = recurrence.frequency === "weekly" ? 7 * interval : interval;
+
+  const approxStepMs = stepDays * 86400000;
+  const approxSteps = Math.max(1, Math.floor((nowMs - anchorMs) / approxStepMs));
+
+  let candidateMs = addCalendarUnits(anchorMs, timezone, stepDays * approxSteps);
+  let guard = 0;
+  while (candidateMs < nowMs && guard < 8) {
+    candidateMs = addCalendarUnits(candidateMs, timezone, stepDays);
+    guard++;
+  }
+  guard = 0;
+  while (candidateMs - approxStepMs >= nowMs && guard < 8) {
+    const back = addCalendarUnits(candidateMs, timezone, -stepDays);
+    if (back < nowMs) break;
+    candidateMs = back;
+    guard++;
+  }
+
+  return { occurrenceMs: candidateMs, isFuture: candidateMs > nowMs, isPastNonRecurring: false };
+}
+
+function deriveRemainingTime(occurrenceMs, now) {
+  if (typeof occurrenceMs !== "number" || !Number.isFinite(occurrenceMs)) {
+    return { totalMs: 0, days: 0, hours: 0, minutes: 0, seconds: 0 };
+  }
+  const totalMs = Math.max(0, occurrenceMs - now.getTime());
+  const totalSeconds = Math.floor(totalMs / 1000);
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return { totalMs, days, hours, minutes, seconds };
+}
+
+const EVENT_ACTIVE_WINDOW_MINUTES = 30;
+
+function deriveEventStatus(occursAt, recurrence, timezone, now) {
+  const nowMs = now.getTime();
+  const activeWindowMs = EVENT_ACTIVE_WINDOW_MINUTES * 60000;
+  const next = deriveNextOccurrence(occursAt, recurrence, timezone, now);
+
+  if (next.occurrenceMs === null) {
+    return { status: "ended", occurrenceMs: null };
+  }
+
+  if (next.isPastNonRecurring && nowMs - next.occurrenceMs >= activeWindowMs) {
+    return { status: "ended", occurrenceMs: next.occurrenceMs };
+  }
+
+  if (next.occurrenceMs - nowMs <= activeWindowMs && next.occurrenceMs - nowMs >= 0) {
+    return { status: "active", occurrenceMs: next.occurrenceMs };
+  }
+
+  if (recurrence && typeof recurrence === "object") {
+    const interval = typeof recurrence.interval === "number" && recurrence.interval > 0
+      ? recurrence.interval : 1;
+
+    let previousOccurrenceMs;
+    // PR43.7 — previous-occurrence phải khớp đúng cách bước đã dùng ở
+    // deriveNextOccurrence cho từng nhánh (monthly / weekly+daysOfWeek /
+    // nguyên bản), nếu không "occurrence trước đó" sẽ bị tính sai lệch khi
+    // event dùng monthly hoặc daysOfWeek.
+    if (recurrence.frequency === "monthly") {
+      previousOccurrenceMs = addCalendarMonths(next.occurrenceMs, timezone, -interval);
+    } else if (recurrence.frequency === "weekly" && Array.isArray(recurrence.daysOfWeek) && recurrence.daysOfWeek.length > 0) {
+      // Lùi lại 8 ngày trước occurrenceMs hiện tại rồi tìm occurrence hợp lệ
+      // gần nhất < occurrenceMs hiện tại (đủ để phủ mọi tổ hợp daysOfWeek).
+      const searchFrom = next.occurrenceMs - 8 * 86400000;
+      let candidate = findNextDayOfWeekOccurrence(occursAt ? new Date(occursAt).getTime() : next.occurrenceMs, timezone, recurrence.daysOfWeek, searchFrom);
+      previousOccurrenceMs = null;
+      while (candidate !== null && candidate < next.occurrenceMs) {
+        previousOccurrenceMs = candidate;
+        candidate = findNextDayOfWeekOccurrence(occursAt ? new Date(occursAt).getTime() : next.occurrenceMs, timezone, recurrence.daysOfWeek, candidate + 60000);
+      }
+      if (previousOccurrenceMs === null) previousOccurrenceMs = next.occurrenceMs; // không tìm được — vô hiệu hoá nhánh active-lùi bên dưới
+    } else {
+      const stepDays = recurrence.frequency === "weekly" ? 7 * interval : interval;
+      previousOccurrenceMs = addCalendarUnits(next.occurrenceMs, timezone, -stepDays);
+    }
+
+    if (nowMs - previousOccurrenceMs >= 0 && nowMs - previousOccurrenceMs < activeWindowMs) {
+      return { status: "active", occurrenceMs: previousOccurrenceMs };
+    }
+  }
+
+  return { status: "upcoming", occurrenceMs: next.occurrenceMs };
+}
+
+function deriveSortedUpcomingEvents(events, now, limit) {
+  if (!Array.isArray(events)) return [];
+  const withStatus = events.map(ev => {
+    const statusResult = deriveEventStatus(ev.occursAt, ev.recurrence, ev.timezone, now);
+    return { event: ev, statusResult };
+  });
+  const relevant = withStatus.filter(x => x.statusResult.status !== "ended");
+  relevant.sort((a, b) => {
+    const diff = (a.statusResult.occurrenceMs ?? Infinity) - (b.statusResult.occurrenceMs ?? Infinity);
+    if (diff !== 0) return diff;
+    return (b.event.priority ?? 0) - (a.event.priority ?? 0);
+  });
+  const effectiveLimit = typeof limit === "number" && limit > 0 ? limit : relevant.length;
+  return relevant.slice(0, effectiveLimit).map(x => ({ event: x.event, ...x.statusResult }));
+}
+
+function formatCountdownLabel(remaining) {
+  if (remaining.days > 0) {
+    return `${remaining.days} ngày ${remaining.hours} giờ`;
+  }
+  const hh = String(remaining.hours).padStart(2, "0");
+  const mmss = formatSecondsAsMMSS(remaining.minutes * 60 + remaining.seconds);
+  return `${hh}:${mmss}`;
+}
+
+const EVENT_KIND_META = {
+  event: { label: "Sự kiện", icon: "🎉" },
+  livestream: { label: "Livestream", icon: "📺" },
+  banner: { label: "Banner", icon: "🎏" },
+  update: { label: "Cập nhật", icon: "🔧" },
+  maintenance: { label: "Bảo trì", icon: "🛠️" },
+  reset: { label: "Đặt lại", icon: "🔄" },
+};
+const ORPHANED_EVENT_META = { label: "Không xác định", icon: "❔" };
+
+const EventCountdownRow = React.memo(function EventCountdownRow({
+  event,
+  gameDefinition,
+  status,
+  remaining,
+}) {
+  const meta = EVENT_KIND_META[event.kind] || ORPHANED_EVENT_META;
+  const isOrphaned = !gameDefinition;
+  const accentColor = gameDefinition?.color || "#888";
+
+  return (
+    <div
+      className="v43-event-countdown-row"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "8px 10px",
+        borderRadius: 10,
+        border: `1px solid ${accentColor}33`,
+        opacity: isOrphaned ? 0.7 : 1,
+      }}
+    >
+      <span aria-hidden="true" style={{ fontSize: 18 }}>
+        {isOrphaned ? ORPHANED_EVENT_META.icon : (gameDefinition.icon || meta.icon)}
+      </span>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+          <span
+            style={{
+              fontWeight: 600,
+              fontSize: 13,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {event.title}
+          </span>
+          {isOrphaned && (
+            <span style={{ fontSize: 10, opacity: 0.6 }}>({ORPHANED_EVENT_META.label})</span>
+          )}
+        </div>
+        <div style={{ fontSize: 11, opacity: 0.6 }}>
+          {gameDefinition ? gameDefinition.displayName : event.gameId} · {meta.label}
+        </div>
+      </div>
+
+      <div style={{ textAlign: "right" }}>
+        {status === "active" ? (
+          <span style={{ fontSize: 12, fontWeight: 700, color: "#3AAE5C" }}>Đang diễn ra</span>
+        ) : (
+          <span style={{ fontSize: 13, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+            {formatCountdownLabel(remaining)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+});
+
+const EventCountdownWidget = React.memo(function EventCountdownWidget({
+  events: eventsProp,
+  maxVisible = 5,
+}) {
+  const gameDataCtx = useGameData();
+  const events = eventsProp !== undefined ? eventsProp : (gameDataCtx.gameData?.events || []);
+
+  const [now, setNow] = useState(() => new Date());
+
+  useEffect(() => {
+    if (!Array.isArray(events) || events.length === 0) return;
+    const id = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(id);
+  }, [events]);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        setNow(new Date());
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
+
+  const effectiveLimit = typeof maxVisible === "number" && maxVisible > 0 ? maxVisible : 5;
+  const derivedRows = useMemo(
+    () => deriveSortedUpcomingEvents(events, now, effectiveLimit),
+    [events, now, effectiveLimit]
+  );
+
+  if (!Array.isArray(events) || events.length === 0) {
+    return (
+      <div className="v43-event-countdown-widget" style={{ padding: "12px 16px", opacity: 0.6, fontSize: 13 }}>
+        Chưa có sự kiện nào được theo dõi
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="v43-event-countdown-widget"
+      style={{ display: "flex", flexDirection: "column", gap: 8, padding: "4px 0" }}
+    >
+      {derivedRows.map(({ event, status, occurrenceMs }) => (
+        <EventCountdownRow
+          key={event.id}
+          event={event}
+          gameDefinition={GAME_REGISTRY_BY_ID[event.gameId] || null}
+          status={status}
+          remaining={deriveRemainingTime(occurrenceMs, now)}
+        />
+      ))}
+    </div>
+  );
+});
+// ======================================================
+// End PR43.4
+// ======================================================
+
+// ======================================================
+// PR43.5 — Game Widget Registry + GameWidgetZone
+// ======================================================
+// Tầng điều phối Widget (V43_Final_Architecture.md, mục 2.2 "Widget
+// Registry", mục 2.4 Component Tree, mục 5.2, mục 6.1, mục 11 — PR43.5).
+// PR43.5 CHỈ tạo: bảng ánh xạ loại widget → component (Widget Registry) và
+// GameWidgetZone (đọc GameDataContext, trích xuất dữ liệu liên quan, gọi
+// Derive Layer nếu cần, truyền props xuống Widget qua Registry).
+//
+// KHÔNG có ở đây (ngoài phạm vi PR43.5, thuộc PR sau — mục 11):
+//   - Mount vào DashboardHome/App                → PR43.6
+//   - Settings UI (Event CRUD, Registry Override) → PR43.7
+//   - Cleanup rule cho event quá hạn              → PR43.8
+//
+// CHỈ dùng API đã tồn tại từ PR43.1/43.2/43.3/43.4 — không suy đoán API
+// mới, không sửa storage module, không sửa GameDataContext/Provider,
+// không sửa Derive Layer hay Widget của các PR trước:
+//   - GAME_REGISTRY, GAME_REGISTRY_BY_ID (PR43.1)
+//   - useGameData() / GameDataContext (PR43.2) — Zone đọc GameData duy
+//     nhất qua hook này, không tự đọc storage (readGameData/writeGameData
+//     không được gọi trực tiếp ở đây).
+//   - EnergyTrackerWidget, deriveCurrentEnergy và các derive-energy khác
+//     (PR43.3)
+//   - EventCountdownWidget, deriveSortedUpcomingEvents và các derive-event
+//     khác (PR43.4)
+//
+// Widget CHỈ render — không tự đọc storage, không tự validate, không tự
+// chuẩn bị dữ liệu (đúng yêu cầu tác vụ và mục 2.2 bảng "Cấu trúc tầng":
+// Presentation "Render, đọc Context, gọi Derive Layer" là trách nhiệm của
+// Zone, KHÔNG phải của bản thân từng Widget — EnergyTrackerWidget/
+// EventCountdownWidget ở PR43.3/43.4 đã đúng nguyên tắc này: chỉ nhận
+// props/đọc Context, không tự gọi readGameData()).
+//
+// Data Flow bắt buộc (mục 2.4):
+//   GameDataContext → GameWidgetZone → Widget Registry → Widget component
+// Không đảo chiều, không đọc chéo: Widget Registry không đọc
+// GameDataContext; Widget component không tự đọc GameDataContext để lấy
+// dữ liệu nghiệp vụ của chính nó (EventCountdownWidget ở PR43.4 có gọi
+// useGameData() nhưng chỉ làm fallback khi KHÔNG được truyền props `events`
+// — khi đứng sau GameWidgetZone, Zone luôn truyền `events` tường minh nên
+// nhánh fallback đó không được dùng tới trong data flow của PR43.5).
+
+// ── Widget Registry ──────────────────────────────────────────────────────
+// Bảng ánh xạ loại widget → { component, prepareProps, defaultConfig }
+// (mục 5.2: "mỗi loại widget trong bảng này có một khai báo cấu hình riêng
+// ... cấu hình này thuộc về khai báo của từng loại widget trong registry,
+// không phải logic điều kiện được viết trong GameWidgetZone").
+//
+// Mở rộng: thêm một widget type mới = thêm một entry vào GAME_WIDGET_REGISTRY
+// bên dưới, không sửa GameWidgetZone, không thêm nhánh if/switch theo tên
+// hay theo gameId ở bất kỳ đâu (yêu cầu tác vụ: "Không hardcode logic theo
+// tên game", "Không dùng if(gameId === ...)").
+//
+// Mỗi entry:
+//   component     — component React sẽ render (PR43.3/43.4, không định
+//                    nghĩa lại ở đây).
+//   defaultConfig — cấu hình mặc định riêng của loại widget này (ví dụ số
+//                    lượng sự kiện tối đa hiển thị cùng lúc của
+//                    EventCountdownWidget, có hiển thị "Đầy sau" hay không
+//                    của EnergyTrackerWidget — mục 5.2, ví dụ cụ thể).
+//   prepareProps(entryConfig, gameData, now) — hàm THUẦN của riêng loại
+//                    widget này: nhận entryConfig (đã merge với
+//                    defaultConfig) + toàn bộ gameData hiện có trong Context
+//                    + thời điểm hiện tại, trả về đúng phần props cần
+//                    truyền xuống component. Đây là nơi DUY NHẤT tri thức
+//                    "loại widget X cần trích xuất phần nào của gameData"
+//                    được khai báo — GameWidgetZone gọi hàm này qua
+//                    Registry, không tự biết cách trích xuất cho từng loại
+//                    (giữ đúng yêu cầu "Registry phải có khả năng mở rộng",
+//                    "GameWidgetZone ... chuẩn bị dữ liệu ... gọi Derive
+//                    Layer nếu cần" mà không rẽ nhánh cứng theo widget type
+//                    trong chính Zone).
+//
+// prepareProps không mutate gameData/GAME_REGISTRY đầu vào (cùng nguyên
+// tắc bất biến của Derive Layer, mục 2.2) và không tự đọc storage — toàn
+// bộ dữ liệu đầu vào đã được GameDataContext/GameDataProvider (PR43.2)
+// resolve sẵn.
+
+const GAME_WIDGET_REGISTRY = {
+  // ── energyTracker → EnergyTrackerWidget (PR43.3) ─────────────────────
+  energyTracker: {
+    component: EnergyTrackerWidget,
+    // defaultConfig theo đúng ví dụ nêu ở mục 5.2: "EnergyTrackerWidget
+    // khai báo có hiển thị thời điểm đầy hay không".
+    defaultConfig: {
+      showFullEta: true,
+    },
+    // Trích xuất đúng MỘT EnergyState + GameDefinition + energyResource
+    // liên quan tới (gameId, resourceId) mà entry này khai báo — không
+    // truyền toàn bộ blob gameData xuống Widget (mục 2.5 bước 2, mục 6.1).
+    prepareProps(entryConfig, gameData) {
+      const { gameId, resourceId } = entryConfig;
+      const gameDefinition = GAME_REGISTRY_BY_ID[gameId] || null;
+      const energyResource = gameDefinition
+        ? (gameDefinition.energyResources || []).find(r => r.resourceId === resourceId) || null
+        : null;
+      const energyState = (gameData?.energyStates || []).find(
+        es => es.gameId === gameId && es.resourceId === resourceId
+      ) || null;
+
+      return {
+        gameDefinition,
+        energyResource,
+        energyState,
+        showFullEta: entryConfig.showFullEta,
+      };
+    },
+  },
+
+  // ── eventCountdown → EventCountdownWidget (PR43.4) ───────────────────
+  eventCountdown: {
+    component: EventCountdownWidget,
+    // defaultConfig theo đúng ví dụ nêu ở mục 5.2: "EventCountdownWidget
+    // khai báo số lượng sự kiện tối đa hiển thị cùng lúc".
+    defaultConfig: {
+      maxVisible: 5,
+      // Nếu không khai báo gameIds, entry này theo dõi TẤT CẢ game — việc
+      // lọc theo game cụ thể (nếu có) là dữ liệu cấu hình của entry, không
+      // phải nhánh if(gameId === ...) trong Zone/Registry.
+      gameIds: null,
+    },
+    // Trích xuất đúng tập con `events` liên quan tới entry này (lọc theo
+    // gameIds nếu entry khai báo, giữ nguyên toàn bộ nếu không) — việc
+    // sắp xếp/giới hạn số lượng hiển thị đã là trách nhiệm của Derive
+    // Layer bên trong EventCountdownWidget (deriveSortedUpcomingEvents,
+    // PR43.4, mục 6.4), Zone chỉ cần trích đúng tập con events liên quan.
+    prepareProps(entryConfig, gameData) {
+      const allEvents = gameData?.events || [];
+      const gameIds = Array.isArray(entryConfig.gameIds) ? entryConfig.gameIds : null;
+      const events = gameIds
+        ? allEvents.filter(ev => gameIds.includes(ev.gameId))
+        : allEvents;
+
+      return {
+        events,
+        maxVisible: entryConfig.maxVisible,
+      };
+    },
+  },
+};
+
+// registerGameWidgetType(type, definition): điểm mở rộng tường minh để
+// thêm một loại widget mới vào Registry mà không sửa trực tiếp object
+// GAME_WIDGET_REGISTRY tại nơi khai báo (hữu ích nếu một PR sau muốn thêm
+// widget type từ một khối code khác trong cùng file). Không bắt buộc phải
+// dùng — thêm entry trực tiếp vào GAME_WIDGET_REGISTRY ở trên vẫn là cách
+// chính; hàm này chỉ đảm bảo Registry "có khả năng mở rộng" mà không phải
+// sửa cấu trúc lõi.
+function registerGameWidgetType(type, definition) {
+  if (typeof type !== "string" || !type) return false;
+  if (!definition || typeof definition !== "object") return false;
+  if (typeof definition.component !== "function" && typeof definition.component !== "object") return false;
+  if (typeof definition.prepareProps !== "function") return false;
+  GAME_WIDGET_REGISTRY[type] = {
+    defaultConfig: {},
+    ...definition,
+  };
+  return true;
+}
+
+// ── GameWidgetZone ────────────────────────────────────────────────────────
+// Nhiệm vụ (đúng yêu cầu tác vụ + mục 2.4, mục 6.1):
+//   - đọc GameDataContext (qua useGameData(), PR43.2)
+//   - chuẩn bị dữ liệu: với mỗi widget entry đã bật cho `slot`, gọi
+//     prepareProps của entry đó (Widget Registry) — đây chính là bước
+//     "gọi Derive Layer nếu cần", vì prepareProps của mỗi loại widget tự
+//     quyết định có cần gọi hàm Derive Layer nào hay không (ví dụ
+//     eventCountdown không tự gọi derive ở Zone vì EventCountdownWidget
+//     đã tự derive nội bộ theo đúng phạm vi PR43.4; energyTracker cũng
+//     tương tự — chỉ trích dữ liệu thô, EnergyTrackerWidget tự derive).
+//   - truyền props xuống Widget component tương ứng qua Widget Registry.
+//
+// GameWidgetZone KHÔNG đọc storage trực tiếp (không gọi readGameData/
+// writeGameData/S.get/S.set) — chỉ đọc qua GameDataContext, đúng Data Flow
+// bắt buộc.
+//
+// Props:
+//   slot    — string, định danh vị trí chèn (vd "home-top", "home-bottom",
+//             mục 2.1/2.4). Zone chỉ dùng để lọc entries thuộc slot này từ
+//             `entries` truyền vào — bản thân "home-top"/"home-bottom" là
+//             dữ liệu cấu hình do nơi gọi (PR43.6) cung cấp, KHÔNG phải
+//             một hằng số/nhánh điều kiện được hardcode trong Zone.
+//   entries — mảng khai báo widget đã bật, mỗi phần tử dạng:
+//               { id, type, slot, config?, enabled? }
+//             `type` tra vào GAME_WIDGET_REGISTRY để lấy component +
+//             prepareProps; `config` merge nông lên trên defaultConfig của
+//             entry đó trong Registry. Đây là nơi DUY NHẤT quyết định
+//             "widget nào bật cho slot nào" — hoàn toàn là dữ liệu, không
+//             phải nhánh if/switch trong Zone (yêu cầu tác vụ: "Registry
+//             phải có khả năng mở rộng", "Không hardcode logic theo tên
+//             game"). PR43.5 chưa mount nên `entries` mặc định rỗng; PR43.6
+//             sẽ là nơi truyền một danh sách entries thật vào Zone.
+//
+// Memo (mục "Memo" của yêu cầu tác vụ, mục 6.1):
+//   - Bản thân GameWidgetZone được bọc React.memo — không re-render vì lý
+//     do bên ngoài props của chính nó thay đổi (vd Planner re-render không
+//     kéo theo Zone re-render nếu props Zone không đổi).
+//   - Bên trong, việc tính props cho từng widget entry được useMemo hoá,
+//     phụ thuộc vào đúng phần gameData liên quan đã trích xuất (không phải
+//     theo reference toàn bộ gameData) — cùng nguyên tắc "mỗi widget memo
+//     hoá theo phần dữ liệu đã trích xuất" đã ghi ở mục 6.1: "một thay đổi
+//     nhỏ ở một phần của blob không kéo theo re-render toàn bộ các widget
+//     khác". Zone dùng gameData.energyStates / gameData.events làm dependency
+//     riêng biệt cho từng widget entry (qua prepareProps của đúng entry
+//     đó), không dùng gameData nguyên khối làm dependency chung cho mọi
+//     widget — nhờ vậy một entry loại "energyTracker" không bị tính lại
+//     props chỉ vì gameData.events đổi, và ngược lại.
+//   - Zone chỉ phụ thuộc gameData (từ GameDataContext) — không đọc, không
+//     phụ thuộc bất kỳ state/context nào của Planner, nên Planner thay đổi
+//     không kích hoạt re-render của Zone (yêu cầu tác vụ: "Không rerender
+//     vì Planner thay đổi").
+const GameWidgetZone = React.memo(function GameWidgetZone({ slot, entries = [] }) {
+  const { gameData } = useGameData();
+
+  // Lọc đúng entries thuộc slot này + đang bật (enabled !== false — mặc
+  // định coi là bật nếu không khai báo). Đây là dữ liệu, không phải nhánh
+  // điều kiện theo gameId/loại widget.
+  const slotEntries = useMemo(
+    () => (Array.isArray(entries) ? entries.filter(e => e && e.slot === slot && e.enabled !== false) : []),
+    [entries, slot]
+  );
+
+  // Với mỗi entry: tra Widget Registry theo `type`, merge config, gọi
+  // prepareProps của đúng entry đó để lấy props đã trích xuất — không có
+  // nhánh if/switch theo type hay theo gameId ở đây, toàn bộ được uỷ
+  // quyền cho GAME_WIDGET_REGISTRY[entry.type].prepareProps.
+  //
+  // Dependency là gameData?.energyStates và gameData?.events tách biệt
+  // (không phải gameData nguyên khối) — đúng yêu cầu memo theo phần dữ
+  // liệu đã trích xuất (mục 6.1), để một entry loại này không bị tính lại
+  // khi phần dữ liệu không liên quan của entry loại khác thay đổi.
+  const preparedWidgets = useMemo(() => {
+    return slotEntries.reduce((acc, entry) => {
+      const registryEntry = GAME_WIDGET_REGISTRY[entry.type];
+      if (!registryEntry) {
+        console.warn(`[PR43.5][GameWidgetZone] Widget type không tồn tại trong Registry: "${entry.type}" (entry.id="${entry.id}") — bỏ qua entry này.`);
+        return acc;
+      }
+      const mergedConfig = { ...(registryEntry.defaultConfig || {}), ...(entry.config || {}) };
+      const props = registryEntry.prepareProps(mergedConfig, gameData);
+      acc.push({
+        id: entry.id ?? entry.type,
+        Component: registryEntry.component,
+        props,
+      });
+      return acc;
+    }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slotEntries, gameData?.energyStates, gameData?.events, gameData?.registryOverrides]);
+
+  if (preparedWidgets.length === 0) return null;
+
+  return (
+    <div className="v43-game-widget-zone" data-slot={slot} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {preparedWidgets.map(({ id, Component, props }) => (
+        <Component key={id} {...props} />
+      ))}
+    </div>
+  );
+});
+// ======================================================
+// End PR43.5
+// ======================================================
+
 
 const rootEl = document.getElementById("root");
 const root = ReactDOM.createRoot(rootEl);
