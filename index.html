@@ -6610,6 +6610,9 @@ const blank = () => ({
   eveningNote:"",        // [PATCH v30] ghi chú tự do từ checklist cuối ngày trong SmartSchedule, không tính XP — thuần lưu để đọc lại/phân tích sau này
   // ── V38 (SmartSchedule kéo-thả + giãn cách cộng dồn) ──
   scheduleManualOrder:null, // [PATCH v38] mảng key theo THỨ TỰ sau khi người dùng kéo-thả sắp xếp lại (null = dùng thứ tự mặc định từ Core). Giờ hiển thị được tính lại cộng dồn từ thứ tự này, không còn ghi đè start trực tiếp.
+  // ── PR46 (SmartSchedule → Draft Editor) ──
+  draftBlocks:null,      // [PR46] null = chưa có draft hôm nay. Khi có: [{key,name,icon,kind,note}] — DANH SÁCH PHẲNG, KHÔNG start/end/dur. kind ∈ "routine"|"goal"|"deadline"|"other". NGUỒN CHÂN LÝ DUY NHẤT cho nội dung+thứ tự Draft Editor — thay thế vai trò "giờ thật" mà schedule[]/overrideLayer từng giữ cho card này. Sinh lần đầu (materialize) từ plannerOutput.schedule khi còn null; sau đó CHỈ "Làm lại" mới thay toàn bộ mảng.
+  draftDone:{},          // [PR46] {[key]:true} tick trực quan Draft Editor. KHÔNG cộng/trừ XP — tách biệt hoàn toàn khỏi timelineDone/actualCompletedAt (2 field cũ thuộc mô hình giờ-thật, giữ nguyên trong schema để không mất dữ liệu lịch sử, nhưng Draft Editor không đọc/ghi chúng nữa).
 });
 
 // P-03: reusable debounced-save hook for text inputs
@@ -12971,6 +12974,221 @@ function RescheduleBlockPopup({ item, onApply, onCancel }) {
   );
 }
 
+// ══════════════════════ PR46 — Draft Editor helpers ══════════════════════
+// [PR46] Timeline "Lịch trình hôm nay" đổi hoàn toàn triết lý: không còn
+// Timeline theo giờ thật (Google-Calendar-style), giờ là một DANH SÁCH DẠNG
+// DRAFT (Notion/Trello-style) — AI chỉ sinh gợi ý ban đầu, người dùng toàn
+// quyền sửa/sắp xếp/thêm/xoá/nhân bản, KHÔNG có khái niệm giờ/phút/duration
+// trong card này nữa. Các hàm dưới đây là HÀM THUẦN, không side-effect,
+// dùng riêng cho SmartSchedule — không đụng applyTimelineOverrides/
+// reflowTimelineBlocks/resizeTimelineBlock/rescheduleTimelineBlock/
+// pinTimelineBlock/assignGoalToSlot/... (các hàm đó vẫn được OneBigWinCard/
+// UnscheduledGoalsLane/MorningWidget dùng nguyên trạng, PR46 không sửa).
+
+// [PR46] Sinh 1 khoá ổn định, không trùng cho mỗi block draft — KHÔNG dùng
+// "start|tên" (timelineBlockKey cũ) vì draft không có start nữa. Dùng
+// timestamp + số ngẫu nhiên + index để tránh đụng độ khi tạo hàng loạt
+// trong cùng 1 tick (materialize từ schedule[] có nhiều item cùng lúc).
+let __pr46KeySeq = 0;
+function makeDraftBlockKey() {
+  __pr46KeySeq += 1;
+  return "db_" + Date.now().toString(36) + "_" + __pr46KeySeq.toString(36) + "_" + Math.random().toString(36).slice(2, 6);
+}
+
+// [PR46] Suy ra `kind` ban đầu (routine|goal|deadline|other) từ 1 block
+// schedule[] gốc (output buildScheduleV33/AI Planner Core, KHÔNG đổi) — chỉ
+// ĐỌC field có sẵn (type/isFixedRoutine), không tính toán gì thêm.
+function inferDraftKindFromScheduleBlock(b) {
+  if (b.type === "fixed" || (b.type === "task" && b.isFixedRoutine)) return "routine";
+  return "goal";
+}
+
+// [PR46] materializeDraftFromSchedule — chạy ĐÚNG 1 LẦN cho mỗi lần có
+// plannerOutput MỚI mà draftBlocks còn null (lần đầu hôm nay có kế hoạch
+// AI, hoặc ngay sau "Làm lại"): đọc schedule[] (gồm cả buffer, để lọc bỏ),
+// trả về mảng phẳng [{key,name,icon,kind,note}]. Đây là bước DUY NHẤT còn
+// đọc schedule[]/giờ — sau bước này, draftBlocks hoàn toàn độc lập, không
+// bao giờ tự đồng bộ lại theo schedule[] nữa (đúng yêu cầu "AI chỉ sinh
+// Draft, sau đó không bao giờ tự chỉnh lại").
+function materializeDraftFromSchedule(schedule) {
+  return (schedule || [])
+    .filter(b => b.type !== "buffer" && (b.name || "").trim().length > 0)
+    .map(b => ({
+      key: makeDraftBlockKey(),
+      name: b.name,
+      icon: b.type === "fixed" ? "📌" : (b.isFixedRoutine ? "⏰" : "🎯"),
+      kind: inferDraftKindFromScheduleBlock(b),
+      note: "",
+    }));
+}
+
+// [PR46] Reorder thuần — kéo phần tử ở fromIdx tới trước vị trí toIdx.
+function reorderDraftBlocks(blocks, fromIdx, toIdx) {
+  const list = Array.isArray(blocks) ? [...blocks] : [];
+  if (fromIdx < 0 || fromIdx >= list.length) return list;
+  const [moved] = list.splice(fromIdx, 1);
+  let insertAt = toIdx;
+  if (fromIdx < toIdx) insertAt -= 1;
+  list.splice(Math.max(0, Math.min(insertAt, list.length)), 0, moved);
+  return list;
+}
+
+const DRAFT_KIND_META = {
+  routine: { label: "Routine", icon: "⏰" },
+  goal: { label: "Goal", icon: "🎯" },
+  deadline: { label: "Deadline", icon: "⏳" },
+  other: { label: "Khác", icon: "✅" },
+};
+
+// ══════════════════════ PR46 — Popup Sửa block ══════════════════════
+// Cực đơn giản theo đúng yêu cầu: Tên, Emoji, Loại, Ghi chú, Lưu — KHÔNG có
+// duration/start/end. Có thêm 2 hành động phụ ngay trong popup: "Xoá khỏi
+// hôm nay" (chỉ gỡ khỏi draftBlocks, KHÔNG đụng taskPool) và "Nhân bản".
+function DraftBlockEditPopup({ item, onSave, onDelete, onDuplicate, onCancel }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [name, setName] = useState(item.name);
+  const [icon, setIcon] = useState(item.icon || "✅");
+  const [kind, setKind] = useState(item.kind || "other");
+  const [note, setNote] = useState(item.note || "");
+
+  const submit = () => {
+    if (!name.trim()) return;
+    onSave({ ...item, name: name.trim(), icon: (icon || "✅").trim() || "✅", kind, note });
+  };
+
+  return (
+    <ModalPortal>
+      <div style={{ background: theme.surface, borderRadius: 16, padding: 18, width: "100%", maxWidth: 380, boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: accent }}>✏️ Sửa việc</span>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: theme.textDim, fontSize: 20, cursor: "pointer" }}>×</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input value={icon} onChange={e => setIcon(e.target.value)} maxLength={4}
+            placeholder="✅"
+            style={{ width: 52, textAlign: "center", background: theme.surfaceAlt, border: `1px solid ${accent}44`, borderRadius: 10, padding: "8px 6px", color: theme.text, fontSize: 16, outline: "none" }} />
+          <input value={name} onChange={e => setName(e.target.value)} autoFocus
+            onKeyDown={e => e.key === "Enter" && submit()}
+            placeholder="Tên việc..."
+            style={{ flex: 1, background: theme.surfaceAlt, border: `1px solid ${accent}44`, borderRadius: 10, padding: "8px 10px", color: theme.text, fontSize: 13, outline: "none" }} />
+        </div>
+
+        <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6, fontWeight: 600 }}>LOẠI</div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+          {Object.entries(DRAFT_KIND_META).map(([k, meta]) => (
+            <button key={k} onClick={() => setKind(k)}
+              style={{
+                padding: "6px 12px", borderRadius: 999, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                border: `1px solid ${kind === k ? accent : theme.border}`,
+                background: kind === k ? `${accent}22` : "transparent",
+                color: kind === k ? accent : theme.textDim,
+              }}>
+              {meta.icon} {meta.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6, fontWeight: 600 }}>GHI CHÚ</div>
+        <textarea value={note} onChange={e => setNote(e.target.value)}
+          placeholder="Ghi chú thêm (tuỳ chọn)..."
+          rows={2}
+          style={{ width: "100%", background: theme.surfaceAlt, border: `1px solid ${accent}44`, borderRadius: 10, padding: "8px 10px", color: theme.text, fontSize: 12, outline: "none", resize: "vertical", marginBottom: 14, boxSizing: "border-box" }} />
+
+        <button onClick={submit}
+          style={{ width: "100%", background: accent, border: "none", borderRadius: 10, padding: "10px 0", color: "white", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
+          Lưu
+        </button>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => onDuplicate(item)}
+            style={{ flex: 1, background: "none", border: `1px solid ${theme.border}`, borderRadius: 10, padding: "8px 0", color: theme.text, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            📄 Nhân bản
+          </button>
+          <button onClick={() => onDelete(item)}
+            style={{ flex: 1, background: "none", border: `1px solid ${theme.danger}66`, borderRadius: 10, padding: "8px 0", color: theme.danger, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            🗑 Xoá khỏi hôm nay
+          </button>
+        </div>
+      </div>
+    </ModalPortal>
+  );
+}
+
+// ══════════════════════ PR46 — Popup Thêm block ══════════════════════
+function DraftBlockAddPopup({ onAdd, onCancel }) {
+  const theme = useContext(ThemeContext);
+  const accent = useContext(AccentContext);
+  const [name, setName] = useState("");
+  const [icon, setIcon] = useState("✅");
+  const [kind, setKind] = useState("other");
+
+  const submit = () => {
+    if (!name.trim()) return;
+    onAdd({ name: name.trim(), icon: (icon || "✅").trim() || "✅", kind, note: "" });
+  };
+
+  return (
+    <ModalPortal>
+      <div style={{ background: theme.surface, borderRadius: 16, padding: 18, width: "100%", maxWidth: 380, boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: accent }}>+ Thêm việc</span>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: theme.textDim, fontSize: 20, cursor: "pointer" }}>×</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input value={icon} onChange={e => setIcon(e.target.value)} maxLength={4}
+            placeholder="✅"
+            style={{ width: 52, textAlign: "center", background: theme.surfaceAlt, border: `1px solid ${accent}44`, borderRadius: 10, padding: "8px 6px", color: theme.text, fontSize: 16, outline: "none" }} />
+          <input value={name} onChange={e => setName(e.target.value)} autoFocus
+            onKeyDown={e => e.key === "Enter" && submit()}
+            placeholder="Tên việc..."
+            style={{ flex: 1, background: theme.surfaceAlt, border: `1px solid ${accent}44`, borderRadius: 10, padding: "8px 10px", color: theme.text, fontSize: 13, outline: "none" }} />
+        </div>
+
+        <div style={{ fontSize: 10, color: theme.textDim, marginBottom: 6, fontWeight: 600 }}>LOẠI</div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+          {Object.entries(DRAFT_KIND_META).map(([k, meta]) => (
+            <button key={k} onClick={() => setKind(k)}
+              style={{
+                padding: "6px 12px", borderRadius: 999, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                border: `1px solid ${kind === k ? accent : theme.border}`,
+                background: kind === k ? `${accent}22` : "transparent",
+                color: kind === k ? accent : theme.textDim,
+              }}>
+              {meta.icon} {meta.label}
+            </button>
+          ))}
+        </div>
+
+        <button onClick={submit} disabled={!name.trim()}
+          style={{ width: "100%", background: name.trim() ? accent : theme.surfaceAlt, border: "none", borderRadius: 10, padding: "10px 0", color: name.trim() ? "white" : theme.textDim, fontWeight: 700, fontSize: 13, cursor: name.trim() ? "pointer" : "default" }}>
+          Thêm vào hôm nay
+        </button>
+      </div>
+    </ModalPortal>
+  );
+}
+
+// ══════════════════════════════ PR46 — SmartSchedule ══════════════════════════════
+// [PR46] "📅 LỊCH TRÌNH HÔM NAY" đổi triết lý hoàn toàn: không còn Timeline
+// theo giờ (Google-Calendar-style) — giờ là 1 DANH SÁCH DRAFT (Notion/
+// Trello-style). AI (qua "Làm lại"/quickRegenerate, cùng pipeline cũ
+// runAiPlannerPipeline → aiPlannerCore.js, KHÔNG sửa Core) CHỈ sinh ra
+// draftBlocks[] ban đầu — sau đó KHÔNG BAO GIỜ tự sửa lại nếu người dùng đã
+// chỉnh (không reorder/auto fill/auto move/auto duration/auto gap/auto
+// optimize sau khi Draft đã tồn tại). Người dùng toàn quyền: sửa tên/emoji/
+// loại/ghi chú, kéo đổi THỨ TỰ ƯU TIÊN (không phải giờ), thêm/xoá/nhân bản.
+// KHÔNG còn duration/start/end/Free Time Engine/Suggestion Engine/Auto
+// Fill/Gap Block trong card này — các khái niệm đó bị bỏ hoàn toàn khỏi UI
+// và logic của SmartSchedule. plannerOutput/schedule/overrideLayer VẪN được
+// đọc (để lấy nguồn AI đề xuất khi "Làm lại" và giữ props ổn định cho
+// App.js — không đổi chữ ký gọi <SmartSchedule .../> ở Today.js), nhưng
+// overrideLayer/applyTimelineOverrides/reflowTimelineBlocks/resize/pin/
+// reschedule/assignGoalToSlot KHÔNG còn được dùng bên trong component này
+// nữa (các hàm đó giữ nguyên, vẫn phục vụ OneBigWinCard/UnscheduledGoalsLane
+// — PR46 chỉ sửa SmartSchedule, không đụng nơi khác).
 function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerStorage, plannerToday, onPlannerTodayChange, overrideLayer, setOverrideLayer, onTogglePoolTask }) {
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
@@ -12981,318 +13199,104 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
 
   const [regenerating, setRegenerating] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
-  // [V42 PR5.1] Cờ hiển thị InlineConfirm trước khi "Làm lại" thật sự chạy,
-  // CHỈ bật khi Override Layer đang có dữ liệu (Edge case #5: "cần một
-  // confirm dialog nhỏ nếu Override Layer không rỗng"). Dùng InlineConfirm
-  // đã có sẵn trong codebase (P-06, thay window.confirm bị chặn trong môi
-  // trường artifact) thay vì tạo cơ chế confirm mới.
   const [confirmRegenerate, setConfirmRegenerate] = useState(false);
+  const [editingItem, setEditingItem] = useState(null);
+  const [addingOpen, setAddingOpen] = useState(false);
+  const [draggingKey, setDraggingKey] = useState(null);
+  const [dragOverIdx, setDragOverIdx] = useState(null);
 
   const entryCount = today?.entries?.length ?? 0;
   const latestEntry = entryCount > 0 ? today.entries[entryCount - 1] : null;
-
   const plannerOutput = latestEntry?.plannerOutput || null;
   const schedule = plannerOutput?.schedule || [];
 
-  // [PATCH] SmartSchedule giờ CHỈ trả lời "hôm nay đến mấy giờ thì làm
-  // gì?" — Timeline theo giờ thật, gồm Routine (isFixedRoutine, từ
-  // v33:fixedTasks/enrichTasksWithContext) + lịch học thêm cố định
-  // (type:"fixed", từ ctx.fixedEvents, vd Toán/Lý). KHÔNG còn danh sách
-  // "Nhiệm vụ/Mục tiêu" để tick/thêm/kéo-thả trong card này nữa — việc đó
-  // đã chuyển hẳn sang TodaysGoalsCard/OneBigWinCard (Today.js). Buffer
-  // ("Nghỉ giữa việc") vẫn hiển thị để không có khoảng trống vô hình
-  // trong timeline.
-  // [V41 REFACTOR] Thêm `doneKey` ổn định (start+tên, KHÔNG dùng index vì
-  // index đổi mỗi lần "Làm lại") để checkbox mới trong mỗi block giữ đúng
-  // trạng thái tick khi lịch được tính lại, miễn tên+giờ task đó không đổi.
-  // [V42 PR1.3] Thay tự tính filter/map bằng applyTimelineOverrides()
-  // (PR1.1, KHÔNG sửa hàm đó) — chỉ map thêm field `color` (trình bày,
-  // phụ thuộc theme) từ `sourceColor` mà applyTimelineOverrides trả về,
-  // vì hàm thuần đó cố ý không tự áp theme.textDim (xem comment PR1.1).
-  // Với overrideLayer rỗng, applyTimelineOverrides dùng đúng filter/field
-  // y hệt bản cũ nên output timelineItems KHÔNG đổi.
-  // [V42 PR4.2] Truyền thêm taskPool (prop đã có sẵn của SmartSchedule,
-  // KHÔNG thêm prop mới) để applyTimelineOverrides tra được tên/icon của
-  // goal đã gán giờ (overrideLayer.goals chỉ lưu {start,dur} theo schema
-  // PR1.1, không có tên). Khi overrideLayer.goals rỗng (mọi ngày trước khi
-  // người dùng gán goal nào), applyTimelineOverrides trả về đúng
-  // reflowedBlocks y hệt trước PR4.2 — không đổi hành vi cũ.
-  // [BUGFIX / Edge case #7] data.dailyPicks truyền thêm làm tham số thứ 4
-  // (đã sẵn có trong prop `data` của SmartSchedule, KHÔNG thêm prop mới) để
-  // applyTimelineOverrides tự lọc bỏ goal đã bị xoá khỏi "Nhiệm vụ hôm nay"
-  // (xem comment chi tiết tại applyTimelineOverrides). Không ảnh hưởng
-  // reflowedBlocks/Routine/Fixed/Buffer — chỉ thu hẹp thêm goalBlocks.
-  const dailyPicks = Array.isArray(data.dailyPicks) ? data.dailyPicks : [];
-  // [PR44.2] `timelineItems` LUÔN đúng nguyên kết quả applyTimelineOverrides
-  // (Planner Engine/Reflow) — không còn bước "áp thứ tự hiển thị riêng"
-  // (manualOrder, PR44.1 mục 3) chèn phía sau nữa. applyTimelineOverrides
-  // (đã tự sort theo `start`, xem cuối hàm đó) là NGUỒN DUY NHẤT quyết định
-  // thứ tự render — Timeline luôn phản ánh đúng thứ tự thời gian thực, đúng
-  // mô hình "Reschedule" (đổi giờ thật) thay cho "Reorder" (đổi thứ tự
-  // hiển thị) mà PR44.2 yêu cầu.
-  const timelineItems = useMemo(() => {
-    return applyTimelineOverrides(schedule, overrideLayer, taskPool, dailyPicks).map(it => ({
-      ...it,
-      // [V42 PR4.2] Goal dùng màu riêng (accent theme, tách biệt khỏi màu
-      // đỏ mặc định #EF4444 của Routine) — "style riêng" theo đúng yêu cầu
-      // PR4.2, không đụng logic màu Routine/Fixed/Buffer đã có.
-      color: it.isGoal ? accent : (it.isBuffer ? theme.textDim : (it.sourceColor || "#EF4444")),
-    }));
-  }, [schedule, overrideLayer, taskPool, dailyPicks, theme.textDim, accent]);
-
-  // [PR45.2] unscheduledGoalsForFreeTime — CÙNG điều kiện lọc với
-  // UnscheduledGoalsLane (poolById[id] tồn tại, chưa hidden — PR45.1,
-  // chưa có trong overrideLayer.goals) để 2 nơi luôn nói cùng 1 danh sách
-  // "goal chưa xếp giờ". Giữ nguyên THỨ TỰ dailyPicks (không sort) — đúng
-  // yêu cầu autoFillUnscheduledGoals ("giữ nguyên thứ tự dailyPicks").
-  const poolByIdForFreeTime = useMemo(
-    () => Object.fromEntries((taskPool || []).map(t => [t.id, t])),
-    [taskPool]
-  );
-  const unscheduledGoalsForFreeTime = useMemo(() => {
-    const scheduledGoalIds = (overrideLayer && overrideLayer.goals) || {};
-    return dailyPicks
-      .filter(id => poolByIdForFreeTime[id] && !poolByIdForFreeTime[id].hidden && !scheduledGoalIds[id])
-      .map(id => ({ id, name: poolByIdForFreeTime[id].l, dur: GOAL_DEFAULT_DUR_MIN }));
-  }, [dailyPicks, poolByIdForFreeTime, overrideLayer]);
-
-  // [PR45.2] freeTimeResult — { placedSuggestions, freeTimeBlocks }, tính
-  // THUẦN từ timelineItems (đã Reflow + de-overlap) + goal chưa xếp giờ.
-  // Đây CHỈ là gợi ý hiển thị (không ghi overrideLayer) — xem chi tiết
-  // thiết kế ở comment đầu autoFillUnscheduledGoals.
-  const freeTimeResult = useMemo(
-    () => autoFillUnscheduledGoals(timelineItems, unscheduledGoalsForFreeTime),
-    [timelineItems, unscheduledGoalsForFreeTime]
-  );
-
-  // [V41] Trạng thái tick trực quan CHO RIÊNG Timeline — field data MỚI,
-  // tách biệt hoàn toàn khỏi data.dailyPicks/poolDone (Nhiệm vụ hôm nay)
-  // và data.bigGoalsToday (One Big Win). KHÔNG cộng XP (Routine/Fixed đã
-  // được tính XP qua cơ chế khác — xem dayExpFull) — tick ở đây CHỈ để
-  // đánh dấu trực quan "đã làm xong khối giờ này", theo đúng quyết định
-  // của Bảo (an toàn tuyệt đối cho dữ liệu XP hiện có, không tạo nguồn
-  // cộng dồn XP mới). KHÔNG tái dùng field cũ data.scheduleDone/scheduleXp
-  // (thuộc DailySchedule đã bị xoá) để tránh vô tình cộng XP cho những
-  // ngày cũ đã có dữ liệu ở field đó.
-  const timelineDone = data.timelineDone || {};
-  // [V42 PR3.3] toggleTimelineItem giờ nhận cả `it` (item timeline đầy đủ,
-  // không chỉ doneKey) để có thể ghi thêm thời điểm done THỰC TẾ vào
-  // Timeline Override Layer qua markTimelineBlockDoneAt (PR3.1, KHÔNG sửa
-  // chữ ký/hành vi hàm đó) — đây là bước "gọi hàm này thật sự từ
-  // toggleTimelineItem" mà chính comment PR3.1 (dòng ~2219) đã để dành,
-  // giờ mới thực sự nối dây để Reflow (PR3.2 thuật toán + PR3.3 pin +
-  // PR3.4 edge case) có dữ liệu thật để chạy trên UI — trước PR này,
-  // markTimelineBlockDoneAt tồn tại nhưng KHÔNG có call site nào, nên
-  // Reflow không bao giờ kích hoạt được trong thực tế.
-  // - data.timelineDone (field cũ) vẫn được ghi y hệt như trước — hành vi
-  //   tick trực quan cũ hoàn toàn không đổi (đúng regression PR3.1).
-  // - Khi TICK (chuyển từ chưa-done sang done): ghi doneAt = giờ hiện tại
-  //   thật (HH:MM, làm tròn phút) vào Override Layer.
-  // - Khi UNTICK (chuyển từ done sang chưa-done): xoá doneAt (truyền null
-  //   cho markTimelineBlockDoneAt) — Reflow không còn áp dụng delta của
-  //   block này nữa, đúng ý nghĩa "huỷ tick thì huỷ luôn ảnh hưởng Reflow
-  //   của lần tick đó".
-  // [PR44.1 mục 1] actualCompletedAt — field MỚI, tách biệt hoàn toàn khỏi
-  // timelineOverrideLayer.blocks[doneKey].doneAt (field cũ dùng cho Reflow
-  // ở trên — KHÔNG đụng, KHÔNG đọc, KHÔNG ghi field đó ở đây). Chỉ dùng để
-  // HIỂN THỊ "Kế hoạch/Thực tế" trên mỗi block, không ảnh hưởng Reflow,
-  // không ảnh hưởng start/end của bất kỳ block nào.
-  const actualCompletedAt = data.actualCompletedAt || {};
-  // [PR44.1] pendingActualTimeFor — item đang chờ người dùng xác nhận giờ
-  // hoàn thành qua popup (null = không có popup nào đang mở).
-  const [pendingActualTimeFor, setPendingActualTimeFor] = useState(null);
-
-  // [PR44.1] doTickTimelineItem — GIỮ NGUYÊN 100% thân hàm toggleTimelineItem
-  // cũ (đổi tên để phân biệt với hàm gate mới bên dưới). KHÔNG sửa 1 dòng
-  // logic doneAt/Reflow/timelineDone hiện có — chỉ thêm 1 tham số
-  // actualAt (tuỳ chọn) để ghi kèm data.actualCompletedAt khi TICK.
-  const doTickTimelineItem = (it, actualAt) => {
-    const doneKey = it && it.doneKey;
-    const wasDone = !!timelineDone[doneKey];
-    if (!wasDone) playSound("tick");
-    const nextActual = { ...actualCompletedAt };
-    if (wasDone) {
-      // UNTICK: xoá giờ thực tế đã ghi trước đó (nếu có), đối xứng với
-      // việc markTimelineBlockDoneAt(..., null) xoá doneAt bên dưới.
-      if (doneKey) delete nextActual[doneKey];
-    } else if (doneKey && actualAt) {
-      nextActual[doneKey] = actualAt;
-    }
-    save(td, { timelineDone: { ...timelineDone, [doneKey]: !wasDone }, actualCompletedAt: nextActual });
-    if (doneKey) {
-      const nowDate = new Date();
-      const nowHHMM = String(nowDate.getHours()).padStart(2, "0") + ":" + String(nowDate.getMinutes()).padStart(2, "0");
-      const nextLayer = markTimelineBlockDoneAt(overrideLayer, doneKey, wasDone ? null : nowHHMM);
-      setOverrideLayer(nextLayer);
-    }
-  };
-
-  // [PR44.1 mục 1] toggleTimelineItem — điểm vào từ UI (onClick/onChange
-  // của checkbox), giờ là 1 LỚP GATE mỏng phía trước doTickTimelineItem:
-  //   - UNTICK (đang done → bỏ tick): chạy NGAY như cũ, không hỏi gì thêm
-  //     (yêu cầu chỉ nói "khi tick hoàn thành" mới hỏi popup).
-  //   - TICK (đang chưa done → tick): nếu block CHƯA có actualCompletedAt,
-  //     mở popup hỏi "Bây giờ"/"Chọn thời gian" TRƯỚC, chưa ghi gì cả —
-  //     doTickTimelineItem chỉ chạy sau khi người dùng xác nhận trong popup.
-  const toggleTimelineItem = (it) => {
-    const doneKey = it && it.doneKey;
-    const wasDone = !!timelineDone[doneKey];
-    if (wasDone) {
-      doTickTimelineItem(it);
-      return;
-    }
-    if (!doneKey || actualCompletedAt[doneKey]) {
-      // Không có doneKey hợp lệ, hoặc đã có actualCompletedAt từ trước
-      // (vd tick lại sau khi đã từng ghi) — tick thẳng như hành vi cũ,
-      // không hỏi lại popup mỗi lần.
-      doTickTimelineItem(it);
-      return;
-    }
-    setPendingActualTimeFor(it);
-  };
-
-  // [PR44.2] pendingRescheduleFor — item Routine/Fixed đang chờ người
-  // dùng nhập giờ bắt đầu + thời lượng mới qua popup "Đổi thời gian"
-  // (null = không có popup nào đang mở). Thay thế HOÀN TOÀN cơ chế kéo-thả
-  // đổi thứ tự hiển thị (draggingKey/dragOverIdx/handleTimelineDrop,
-  // manualOrder) của PR44.1 mục 3 — đã xoá sạch, không còn dead code. Mô
-  // hình mới: "Reschedule" (đổi giờ THẬT của block) thay cho "Reorder"
-  // (đổi vị trí RENDER) — xem rescheduleTimelineBlock (PR44.2, hàm thuần).
-  const [pendingRescheduleFor, setPendingRescheduleFor] = useState(null);
-
-  // [V42 PR2.2] Resize UI — CHỈ cho block Routine (isFixedRoutine), tức
-  // trong timelineItems là những item có isBuffer=false VÀ isFixed=false
-  // (buffer/fixed không được resize theo phạm vi PR2.2). Gesture đơn giản
-  // tuyệt đối: theo dõi toạ độ Y chuột/ngón tay từ lúc nhấn xuống handle,
-  // tính newDur = durGốc(tại thời điểm bắt đầu kéo) + deltaY (1px = 1 phút),
-  // rồi gọi resizeTimelineBlock(overrideLayer, doneKey, newDur) → setOverrideLayer().
-  // KHÔNG tự đẩy block sau, KHÔNG tính lại schedule, KHÔNG animation/snap/
-  // inertia — chỉ commit số phút mới vào Override Layer, applyTimelineOverrides
-  // (không sửa) tự tính lại `end` để hiển thị. Override Layer là NGUỒN DUY
-  // NHẤT — không tạo state duration song song ngoài dragStateRef tạm thời
-  // dùng riêng cho phép tính trong lúc đang kéo (không phải nguồn hiển thị).
-  const dragStateRef = useRef(null);
-  const [dragTick, setDragTick] = useState(0); // ép re-render khi kéo, không lưu dữ liệu
-
-  const MIN_RESIZE_DUR = 5; // phút — ngưỡng tối thiểu, chỉ chặn ở bước commit
-
-  // [BUGFIX / memory leak] handleResizeStart gắn listener vào window và chỉ
-  // gỡ trong handleEnd (mouseup/touchend). Nếu component unmount GIỮA lúc
-  // đang kéo (vd người dùng chuyển tab khi đang resize trên mobile),
-  // handleEnd không bao giờ được gọi — listener bị rò rỉ vĩnh viễn, tiếp
-  // tục giữ closure cũ (overrideLayer/setOverrideLayer của lần render đó)
-  // và có thể setOverrideLayer với dữ liệu cũ sau khi component đã unmount.
-  // dragListenersRef giữ tham chiếu 2 hàm đang gắn (nếu có) để effect cleanup
-  // dưới đây có thể gỡ đúng listener khi unmount, không đổi hành vi kéo/thả
-  // bình thường (handleEnd vẫn tự gỡ + xoá ref khi thả tay như cũ).
-  const dragListenersRef = useRef(null);
+  // [PR46] draftBlocks — NGUỒN CHÂN LÝ DUY NHẤT hiển thị Draft Editor.
+  // Materialize (sinh lần đầu từ schedule[]) CHỈ khi: có plannerOutput hôm
+  // nay VÀ data.draftBlocks còn null (chưa từng "Làm lại" theo mô hình
+  // PR46, hoặc ngày mới chưa có draft). Sau khi materialize xong, KHÔNG
+  // bao giờ tự chạy lại theo schedule[] nữa — người dùng sửa gì, giữ nguyên
+  // nấy, kể cả khi app reload (đọc thẳng từ data.draftBlocks đã lưu).
+  const draftBlocks = data.draftBlocks;
   useEffect(() => {
-    return () => {
-      const l = dragListenersRef.current;
-      if (l) {
-        window.removeEventListener("mousemove", l.move);
-        window.removeEventListener("mouseup", l.end);
-        window.removeEventListener("touchmove", l.move);
-        window.removeEventListener("touchend", l.end);
-        dragListenersRef.current = null;
-      }
-    };
-  }, []);
+    if (draftBlocks == null && schedule.length > 0) {
+      save(td, { draftBlocks: materializeDraftFromSchedule(schedule) });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftBlocks, schedule.length, td]);
 
-  const handleResizeStart = (e, it) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    dragStateRef.current = {
-      doneKey: it.doneKey,
-      startY: clientY,
-      startDur: it.dur,
-    };
-    setDragTick(t => t + 1);
+  const draftDone = data.draftDone || {};
 
-    const handleMove = (moveEvt) => {
-      if (!dragStateRef.current) return;
-      const y = moveEvt.touches ? moveEvt.touches[0].clientY : moveEvt.clientY;
-      dragStateRef.current.currentY = y;
-      setDragTick(t => t + 1);
-    };
-    const handleEnd = () => {
-      const drag = dragStateRef.current;
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", handleEnd);
-      window.removeEventListener("touchmove", handleMove);
-      window.removeEventListener("touchend", handleEnd);
-      dragListenersRef.current = null; // [BUGFIX / memory leak] gỡ xong bình thường — không còn gì để unmount cleanup phải gỡ
-      if (!drag) return;
-      const deltaY = (drag.currentY ?? drag.startY) - drag.startY;
-      const rawDur = drag.startDur + deltaY;
-      const newDur = Math.max(MIN_RESIZE_DUR, Math.round(rawDur));
-      dragStateRef.current = null;
-      setDragTick(t => t + 1);
-      const nextLayer = resizeTimelineBlock(overrideLayer, drag.doneKey, newDur);
-      setOverrideLayer(nextLayer);
-    };
-
-    // [BUGFIX / memory leak] Ghi lại đúng 2 hàm vừa gắn để effect cleanup
-    // (unmount) có thể gỡ nếu handleEnd không bao giờ được gọi.
-    dragListenersRef.current = { move: handleMove, end: handleEnd };
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", handleEnd);
-    window.addEventListener("touchmove", handleMove, { passive: false });
-    window.addEventListener("touchend", handleEnd);
+  const toggleDraftDone = (key) => {
+    save(td, { draftDone: { ...draftDone, [key]: !draftDone[key] } });
   };
 
-  // Trong lúc đang kéo, hiển thị end tạm thời (chỉ để mắt thấy đang kéo tới
-  // đâu) — KHÔNG ghi vào Override Layer cho tới khi thả tay (handleEnd).
-  // Đây là preview thuần UI, không phải state duration song song: giá trị
-  // này KHÔNG được dùng làm nguồn cho bất kỳ tính toán nào khác ngoài chính
-  // dòng chữ hiển thị của block đang kéo.
-  const getDragPreviewDur = (doneKey, fallbackDur) => {
-    const drag = dragStateRef.current;
-    if (!drag || drag.doneKey !== doneKey || drag.currentY == null) return fallbackDur;
-    const deltaY = drag.currentY - drag.startY;
-    return Math.max(MIN_RESIZE_DUR, Math.round(drag.startDur + deltaY));
+  const saveEditedBlock = (updated) => {
+    const list = draftBlocks || [];
+    save(td, { draftBlocks: list.map(b => (b.key === updated.key ? updated : b)) });
+    setEditingItem(null);
   };
 
-  // [V42 PR2.3] Toggle pin cho 1 Routine block — chỉ ghi cờ `pinned` vào
-  // Override Layer qua pinTimelineBlock/unpinTimelineBlock đã có sẵn từ
-  // PR2.1 (KHÔNG sửa 2 hàm đó). Ở PR2.3 này, pin CHƯA chặn gì cả (không có
-  // Reflow, không có resize-đẩy-block-sau để chặn) — đây thuần là ghi dữ
-  // liệu + hiển thị trạng thái, chuẩn bị sẵn cờ cho Phase 3 (Reflow) đọc.
-  const handleTogglePin = (e, it) => {
-    e.stopPropagation(); // không kích hoạt toggleTimelineItem (tick done) của div cha
-    const nextLayer = it.pinned
-      ? unpinTimelineBlock(overrideLayer, it.doneKey)
-      : pinTimelineBlock(overrideLayer, it.doneKey);
-    setOverrideLayer(nextLayer);
+  const deleteBlock = (item) => {
+    // [PR46] "Xoá khỏi hôm nay" — CHỈ gỡ khỏi draftBlocks (Timeline hôm
+    // nay). KHÔNG đụng taskPool — đúng yêu cầu "Không xóa khỏi taskPool".
+    const list = draftBlocks || [];
+    save(td, {
+      draftBlocks: list.filter(b => b.key !== item.key),
+      draftDone: (() => { const n = { ...draftDone }; delete n[item.key]; return n; })(),
+    });
+    setEditingItem(null);
   };
 
-  // [V42 PR5.1] requestRegenerate — điểm vào MỚI cho nút "Làm lại". Kiểm
-  // tra Override Layer bằng isTimelineOverrideLayerEmpty (PR5.1, hàm thuần,
-  // KHÔNG side effect) TRƯỚC khi quyết định chạy ngay hay hỏi xác nhận.
-  // regenerate() bên dưới HOÀN TOÀN KHÔNG đổi — vẫn là nơi duy nhất gọi
-  // pipeline thật, requestRegenerate chỉ là một lớp gate mỏng phía trước.
+  const duplicateBlock = (item) => {
+    const list = draftBlocks || [];
+    const idx = list.findIndex(b => b.key === item.key);
+    const copy = { ...item, key: makeDraftBlockKey() };
+    const next = [...list];
+    next.splice(idx === -1 ? list.length : idx + 1, 0, copy);
+    save(td, { draftBlocks: next });
+    setEditingItem(null);
+  };
+
+  const addBlock = (fields) => {
+    const list = draftBlocks || [];
+    save(td, { draftBlocks: [...list, { key: makeDraftBlockKey(), ...fields }] });
+    setAddingOpen(false);
+  };
+
+  const handleDrop = (targetIdx) => {
+    if (draggingKey == null) return;
+    const list = draftBlocks || [];
+    const fromIdx = list.findIndex(b => b.key === draggingKey);
+    if (fromIdx !== -1) {
+      save(td, { draftBlocks: reorderDraftBlocks(list, fromIdx, targetIdx) });
+    }
+    setDraggingKey(null);
+    setDragOverIdx(null);
+  };
+
+  // [PR46] requestRegenerate/regenerate — "Làm lại" = xoá Draft hiện tại →
+  // sinh Draft mới → KHÔNG giữ chỉnh sửa cũ (đúng yêu cầu). Vẫn gọi ĐÚNG
+  // pipeline cũ (runAiPlannerPipeline → aiPlannerCore.js, Core KHÔNG đổi)
+  // để lấy schedule[] AI đề xuất mới nhất — chỉ khác bước cuối: thay vì giữ
+  // overrideLayer cũ, PR46 XOÁ SẠCH draftBlocks/draftDone rồi để effect ở
+  // trên tự materialize lại từ schedule[] mới. Luôn hỏi xác nhận trước khi
+  // "Làm lại" nếu Draft hiện tại có ít nhất 1 block đã bị người dùng tick
+  // hoặc danh sách không rỗng — tránh mất chỉnh sửa ngoài ý muốn (tinh thần
+  // giống InlineConfirm cũ ở PR5.1, áp dụng lại cho mô hình mới).
   const requestRegenerate = () => {
     if (regenerating) return;
-    if (isTimelineOverrideLayerEmpty(overrideLayer)) {
+    if (!draftBlocks || draftBlocks.length === 0) {
       regenerate();
     } else {
       setConfirmRegenerate(true);
     }
   };
 
-  // ── "Làm lại" — tính lại toàn bộ lịch từ giờ hiện tại. Gọi thẳng cùng
-  // pipeline MorningWidget dùng (runAiPlannerPipeline → aiPlannerCore.js),
-  // không viết lại logic xếp lịch ở đây. ──
   const regenerate = async () => {
     if (regenerating) return;
     setRegenerating(true);
     setErrorMsg(null);
     try {
-      // [PR0.4] Form + deadlinePlan giờ dựng qua buildPlannerForm/
-      // readDeadlinePlan dùng chung — output giữ nguyên y hệt object viết
-      // tay trước đây (không có goalMode/extraEvents, energy:3/homework:null
-      // cứng, đúng như thiết kế "quickRegenerate" ban đầu).
       const now = new Date();
       const todayDbData = db?.[td] || {};
       const form = buildPlannerForm("smartScheduleRegenerate", { todayData: todayDbData, td, now, db, dayExp, setts });
@@ -13301,23 +13305,11 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       const updatedToday = await runAiPlannerPipeline({ core, storage, td, form, dayLog, db, setts, taskPool, deadlinePlan });
       await writeAssignedMinutesToday(deadlinePlan, updatedToday);
       setToday(updatedToday);
-      // [BUGFIX / PR5.1 wiring] schedule[] gốc vừa đổi hoàn toàn — Override
-      // Layer cũ (resize/pin/doneAt/goal đã gán giờ) không còn ý nghĩa với
-      // lịch mới và có thể silently tái áp dụng lên block trùng doneKey
-      // ("start|tên") của lịch mới, gây stale-state hiển thị sai. Dùng
-      // clearAllTimelineOverrides (đã có sẵn từ PR2.1, không sửa hàm đó)
-      // đúng như thiết kế §10.3.4 — CHỈ reset khi pipeline thành công (nằm
-      // sau setToday, không nằm trong catch) để không mất override nếu
-      // chạy lại thất bại.
-      setOverrideLayer(clearAllTimelineOverrides(overrideLayer));
-      // [PR44.1, cập nhật PR44.2] Cùng lý do bugfix PR5.1 ở trên: schedule[]
-      // mới có thể sinh doneKey trùng tên với lịch cũ nhưng ý nghĩa khác
-      // hẳn — nếu giữ nguyên actualCompletedAt cũ, nhãn "Thực tế" có thể áp
-      // nhầm lên block mới. Reset về mặc định khi pipeline thành công,
-      // KHÔNG đụng timelineDone (giữ đúng hành vi cũ của field đó, ngoài
-      // phạm vi PR44.1/PR44.2). [PR44.2] manualOrder đã bị xoá hoàn toàn
-      // khỏi schema data — không còn gì để reset ở đây nữa.
-      save(td, { actualCompletedAt: {} });
+      // [PR46] "Làm lại" = xoá Draft cũ, KHÔNG giữ chỉnh sửa cũ — reset cả
+      // draftBlocks (về null để effect tự materialize từ schedule[] mới
+      // ngay khi updatedToday có plannerOutput) lẫn draftDone (tick trực
+      // quan cũ không còn ý nghĩa với danh sách hoàn toàn mới).
+      save(td, { draftBlocks: null, draftDone: {} });
     } catch (e) {
       console.error("[SmartSchedule] regenerate failed:", e);
       setErrorMsg("Chưa xếp lại được lịch — thử lại giúp mình nhé.");
@@ -13327,7 +13319,12 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
   };
 
   if (!today) return null; // Today chưa rotateDay xong lúc đầu — tránh nháy layout
-  if (!plannerOutput || timelineItems.length === 0) return null; // chưa có kế hoạch AI hôm nay → không hiện card rỗng
+  // [PR46] Không còn "chưa có kế hoạch AI hôm nay → ẩn card": nếu người
+  // dùng đã tự thêm block thủ công (draftBlocks có dữ liệu) dù chưa từng
+  // "Làm lại", card vẫn hiện để họ thấy + sửa tiếp. Chỉ ẩn khi thực sự
+  // không có gì để hiển thị (chưa có plannerOutput VÀ draftBlocks rỗng).
+  const list = draftBlocks || [];
+  if (!plannerOutput && list.length === 0) return null;
 
   return (
     <div style={{
@@ -13337,353 +13334,68 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       <div style={{ fontSize: 12, fontWeight: 700, color: theme.text, marginBottom: 8 }}>
         📅 LỊCH TRÌNH HÔM NAY
       </div>
+
       <div>
-        {/* [PR45.2] renderItems = timelineItems (Routine/Fixed/Goal đã
-            gán giờ) HOÀ CHUNG với gợi ý tự động lấp goal chưa xếp giờ
-            (isFreeTimeSuggestion) + khoảng trống thật còn lại
-            (isFreeTimeBlock), sắp theo `start` để hiển thị đúng thứ tự
-            thời gian — đúng yêu cầu PR45 "Timeline luôn kín, không
-            khoảng chết, đúng thứ tự thời gian". 2 loại mới này KHÔNG có
-            trong timelineItems gốc (KHÔNG sửa applyTimelineOverrides) —
-            chỉ chèn thêm ở tầng render, tính từ freeTimeResult (PR45.2,
-            hàm thuần, đã tính SAU applyTimelineOverrides). */}
-        {[
-          ...timelineItems,
-          ...freeTimeResult.placedSuggestions.map(s => ({
-            key: "freesug_" + s.goalId, isFreeTimeSuggestion: true,
-            goalId: s.goalId, name: s.name, start: s.start, end: s.end, dur: s.dur,
-          })),
-          ...freeTimeResult.freeTimeBlocks.map((g, i) => ({
-            key: "freeblock_" + i, isFreeTimeBlock: true,
-            start: g.start, end: g.end, dur: g.dur,
-          })),
-        ]
-          .sort((a, b) => parseTimeToMinutesV33(a.start) - parseTimeToMinutesV33(b.start))
-          .map((it) => {
-          // [PR45.2] Gợi ý tự động lấp goal chưa xếp giờ — hiển thị NHẸ
-          // HƠN goal đã gán giờ thật (viền chấm, nút "Chốt giờ này" gọi
-          // ĐÚNG assignGoalToSlot, cùng schema PR4.2 UnscheduledGoalsLane
-          // dùng — không tạo cơ chế ghi mới). Bấm "Chốt" biến gợi ý thành
-          // 1 goal thật trong timelineItems (overrideLayer.goals) — lần
-          // render sau, freeTimeResult tự tính lại vì goal đó không còn
-          // "chưa xếp giờ" nữa.
-          if (it.isFreeTimeSuggestion) {
-            return (
-              <div key={it.key} style={{
-                display: "flex", gap: 10, alignItems: "center",
-                padding: "9px 10px", marginBottom: 6, borderRadius: 10,
-                background: "transparent", border: `1px dashed ${accent}66`,
-              }}>
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                  {it.start}–{it.end}
-                </span>
-                <span style={{ fontSize: 13 }}>💡</span>
-                <span style={{ flex: 1, fontSize: 13, minWidth: 0, color: theme.textDim }}>
-                  Gợi ý: {it.name}
-                </span>
-                <button
-                  onClick={() => setOverrideLayer(assignGoalToSlot(overrideLayer, it.goalId, it.start, it.dur))}
-                  style={{ background: "none", border: `1px solid ${accent}66`, borderRadius: 999, padding: "3px 10px", color: accent, fontSize: 10, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
-                  Chốt giờ này
-                </button>
-              </div>
-            );
-          }
-          // [PR45.2] Khoảng trống thật KHÔNG còn goal nào để lấp — hiện rõ
-          // "Thời gian tự do" thay vì im lặng bỏ trống (đúng yêu cầu #7,
-          // đối lập với hành vi cũ "Timeline chỉ hiện task" của PR44.2 —
-          // PR44.2 ẩn buffer vì lúc đó buffer không mang thông tin gì hữu
-          // ích; giờ khoảng trống ĐÃ được xác nhận không còn goal nào lấp
-          // được, nên hiển thị lại có chủ đích, khác bản chất với buffer
-          // cũ). Bỏ qua khoảng quá ngắn (<10 phút) — không đáng hiển thị
-          // thành 1 dòng riêng, tránh rối mắt với các khe hở tự nhiên nhỏ.
-          // [PR45.3] Khoảng trống LỚN (>=90 phút) đổi sang hiển thị gợi ý
-          // UI dạng danh sách thay vì chỉ 1 dòng "Thời gian tự do" đơn giản
-          // — tránh cảm giác "khoảng chết" nhìn trống trải với khoảng lớn.
-          // Đây CHỈ là gợi ý HIỂN THỊ tĩnh (hardcode, không đọc/ghi
-          // storage, không tạo Goal, không gọi save/setOverrideLayer) —
-          // đúng yêu cầu mục 5 "Danh sách này chỉ là gợi ý UI".
-          if (it.isFreeTimeBlock) {
-            if (it.dur < 10) return null;
-            const isLargeGap = it.dur >= 90;
-            if (isLargeGap) {
-              return (
-                <div key={it.key} style={{
-                  padding: "10px 12px", marginBottom: 6, borderRadius: 10,
-                  background: "transparent", border: `1px dashed ${theme.border}`,
-                }}>
-                  <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 6 }}>
-                    <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                      {it.start}–{it.end}
-                    </span>
-                    <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
-                      ✨ Chưa có việc nào được lên lịch ({it.dur}')
-                    </span>
-                  </div>
-                  <div style={{ fontSize: 11, color: theme.textDim, paddingLeft: 86, lineHeight: 1.7 }}>
-                    Bạn có thể:
-                    <br />• Đi bơi
-                    <br />• Học
-                    <br />• Dashboard
-                    <br />• Nghỉ ngơi
-                  </div>
-                </div>
-              );
-            }
-            return (
-              <div key={it.key} style={{
-                display: "flex", gap: 10, alignItems: "center",
-                padding: "7px 10px", marginBottom: 6, borderRadius: 10,
-                background: "transparent",
-              }}>
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                  {it.start}–{it.end}
-                </span>
-                <span style={{ fontSize: 12, color: theme.textDim, fontStyle: "italic" }}>
-                  🕊️ Thời gian tự do ({it.dur}')
-                </span>
-              </div>
-            );
-          }
-          const done = !!timelineDone[it.doneKey];
-          // [V42 PR4.2] Goal block — render riêng, TÁCH HẲN khỏi nhánh
-          // Buffer/Routine phía dưới, để không vô tình rơi vào
-          // isRoutineBlock (vốn bật resize handle + nút pin — PR4.2 yêu
-          // cầu "Chưa làm: resize goal, pin goal"). Tick hoàn thành đọc/ghi
-          // qua data.poolDone[it.goalId] (ĐÚNG cơ chế cộng XP cũ của
-          // TodaysGoalsCard, KHÔNG dùng timelineDone/toggleTimelineItem —
-          // it.doneKey của goal luôn là null nên timelineDone[it.doneKey]
-          // ở dòng trên không áp dụng cho goal, phải đọc done riêng ở đây).
-          if (it.isGoal) {
-            const goalDone = !!data.poolDone?.[it.goalId];
-            return (
-              <div key={it.key}
-                onClick={() => onTogglePoolTask && onTogglePoolTask(it.goalId)}
-                style={{
-                  display: "flex", gap: 10, alignItems: "center", cursor: onTogglePoolTask ? "pointer" : "default",
-                  padding: "9px 10px", marginBottom: 6, borderRadius: 10,
-                  background: goalDone ? `${it.color}12` : theme.surfaceAlt,
-                  // [V42 PR4.2] Style riêng cho Goal: viền chấm (khác viền
-                  // liền của Routine/Fixed) để phân biệt rõ "đây là Today's
-                  // Goal được gán giờ thủ công", không nhầm với Routine.
-                  borderLeft: `3px dashed ${it.color}`,
-                  border: "1px solid transparent",
-                  opacity: goalDone ? 0.65 : 1,
-                }}>
-                <NeonCheckbox checked={goalDone} onChange={() => onTogglePoolTask && onTogglePoolTask(it.goalId)} accent={it.color}/>
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                  {it.start}–{it.end}
-                </span>
-                <span style={{ fontSize: 13 }}>🎯</span>
-                <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
-                  <span key={goalDone ? "done" : "undone"} className={goalDone ? "task-text-done" : ""} style={{ "--strike-color": it.color, color: theme.text }}>
-                    {it.name}
-                  </span>
-                </span>
-                {/* [V42 PR4.3] Gỡ goal khỏi Timeline — trả về dải "Chưa xếp
-                    giờ" (UnscheduledGoalsLane). Chỉ xoá mapping trong
-                    overrideLayer.goals qua unassignGoal (KHÔNG mutate input,
-                    hàm thuần từ PR4.3) — KHÔNG đụng data.dailyPicks/poolDone,
-                    KHÔNG đụng poolDone (đã tick vẫn giữ nguyên trạng thái tick
-                    dù gỡ khỏi Timeline, vì poolDone là nguồn XP độc lập, tách
-                    biệt khỏi việc "đã gán giờ hay chưa" — đúng thiết kế §9
-                    mục 2.4). stopPropagation để không kích hoạt toggle done
-                    của div cha (cùng pattern handleTogglePin ở trên). */}
-                <button
-                  onClick={(e) => { e.stopPropagation(); setOverrideLayer(unassignGoal(overrideLayer, it.goalId)); }}
-                  title="Gỡ khỏi Timeline"
-                  style={{ background: "none", border: "none", color: theme.textDim, fontSize: 13, cursor: "pointer", padding: 0, flexShrink: 0 }}>
-                  ↩︎
-                </button>
-              </div>
-            );
-          }
-          // [PR44.2] Buffer ("Nghỉ giữa việc") KHÔNG còn render gì trên
-          // Timeline nữa — bỏ hoàn toàn dải "🕒 Trống X giờ Y phút" (PR44.1
-          // mục 4). Timeline giờ CHỈ hiện task thật (Routine/Fixed/Goal),
-          // đúng yêu cầu PR44.2 "Timeline chỉ hiện task". Buffer vẫn tồn
-          // tại ở TẦNG DỮ LIỆU (schedule[]/reflowTimelineBlocks vẫn sinh ra
-          // item isBuffer:true để Reflow tính khoảng trống chính xác giữa
-          // các block) — đây thuần là bỏ 1 nhánh RENDER, không đụng
-          // Planner Engine/buildScheduleV33/Reflow.
-          if (it.isBuffer) {
-            return null;
-          }
-          // [V42 PR2.2] Resize handle CHỈ cho Routine block — trong
-          // timelineItems, Routine là item không phải buffer và không
-          // phải fixed (isBuffer=false, isFixed=false). Fixed (📌) và
-          // buffer đã return ở nhánh trên/giữ nguyên, không có handle.
-          const isRoutineBlock = !it.isBuffer && !it.isFixed;
-          const previewDur = isRoutineBlock ? getDragPreviewDur(it.doneKey, it.dur) : it.dur;
-          const previewEnd = isRoutineBlock && previewDur !== it.dur
-            ? minutesToHHMMV33(parseTimeToMinutesV33(it.start) + previewDur)
-            : it.end;
-          const isDraggingThis = dragStateRef.current && dragStateRef.current.doneKey === it.doneKey;
+        {list.length === 0 && (
+          <div style={{ fontSize: 11, color: theme.textDim, padding: "6px 0" }}>
+            Chưa có việc nào — bấm "Làm lại" để AI gợi ý, hoặc tự thêm bên dưới.
+          </div>
+        )}
+        {list.map((it, idx) => {
+          const done = !!draftDone[it.key];
+          const isDragging = draggingKey === it.key;
+          const isDragOver = dragOverIdx === idx && draggingKey != null && draggingKey !== it.key;
+          const kindMeta = DRAFT_KIND_META[it.kind] || DRAFT_KIND_META.other;
           return (
             <div key={it.key}>
-              <div onClick={() => toggleTimelineItem(it)}
-              title={it.overflow ? "Lịch quá tải — khối này không đủ chỗ, xem khu \"Chưa xếp được\" bên dưới" : undefined}
-              style={{
-                display: "flex", gap: 10, alignItems: "center", cursor: "pointer",
-                padding: "9px 10px", marginBottom: 6, borderRadius: 10,
-                background: done ? `${it.color}12` : theme.surfaceAlt,
-                borderLeft: `3px solid ${it.color}`,
-                // [V42 PR3.4] Block bị Reflow đẩy tới mức không đủ chỗ (vượt
-                // giờ ngủ hoặc đè lên mốc pin kế tiếp) — viền cảnh báo màu
-                // danger bao quanh toàn khối, để không "âm thầm chồng đè"
-                // hay trông giống một block bình thường. Không đổi
-                // borderLeft (vẫn giữ màu gốc của block để nhận diện loại).
-                border: it.overflow ? `1px dashed ${theme.danger}` : "1px solid transparent",
-                opacity: done ? 0.65 : 1,
-                position: "relative",
-              }}>
-              <NeonCheckbox checked={done} onChange={() => toggleTimelineItem(it)} accent={it.color}/>
-              {/* [PR44.1 mục 2] Khi đã hoàn thành VÀ có actualCompletedAt
-                  (ghi qua popup ở toggleTimelineItem), đổi hiển thị "giờ kế
-                  hoạch" đơn thuần thành 2 dòng "Kế hoạch/Thực tế" — KHÔNG
-                  đổi it.start/it.end (giờ kế hoạch gốc giữ nguyên tuyệt
-                  đối). Chưa hoàn thành (hoặc chưa từng ghi actual — vd data
-                  cũ trước PR44.1) → giữ đúng hiển thị "start–end" như cũ. */}
-              {done && actualCompletedAt[it.doneKey] ? (
-                <div style={{ fontSize: 10, color: theme.textDim, flexShrink: 0, minWidth: 76, lineHeight: 1.35 }}>
-                  <div>Kế hoạch<br/>{it.start}</div>
-                  <div style={{ marginTop: 2 }}>Thực tế<br/>{actualCompletedAt[it.doneKey]}</div>
-                </div>
-              ) : (
-                <span style={{ fontSize: 11, color: theme.textDim, flexShrink: 0, minWidth: 76 }}>
-                  {it.start}–{previewEnd}
-                </span>
-              )}
-              {/* [V42 PR2.3 fix] Icon đầu block chỉ biểu diễn LOẠI block
-                  (isFixed → 📌, còn lại → ⏰) — không được đổi theo trạng
-                  thái pinned. Trạng thái pin chỉ hiển thị qua nút pin riêng
-                  (📎/📍) ở dưới, để tránh nhầm "loại block" với "trạng thái". */}
-              <span style={{ fontSize: 13 }}>{it.isFixed ? "📌" : "⏰"}</span>
-              <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
-                <span key={done ? "done" : "undone"} className={done ? "task-text-done" : ""} style={{ "--strike-color": it.color, color: theme.text }}>
-                  {it.name}
-                </span>
-                {/* [V42 PR3.4] Badge chữ tường minh — không chỉ dựa vào
-                    viền dashed (màu sắc/kiểu viền có thể không đủ nổi bật
-                    để "không âm thầm chồng đè" theo đúng yêu cầu edge case
-                    #9). Chỉ hiện khi block thật sự overflow. */}
-                {it.overflow && (
-                  <span style={{
-                    marginLeft: 6, fontSize: 10, fontWeight: 700,
-                    color: theme.danger, whiteSpace: "nowrap",
-                  }}>
-                    ⚠ quá tải
-                  </span>
-                )}
-              </span>
-              {/* [V42 PR2.3] Nút pin/unpin — CHỈ cho Routine block, cùng điều
-                  kiện với resize handle (isRoutineBlock). Đặt cạnh resize
-                  handle, không che nó. Chỉ ghi cờ pinned qua
-                  pinTimelineBlock/unpinTimelineBlock (PR2.1, không sửa) —
-                  chưa chặn gì (Reflow/resize-đẩy thuộc Phase 3). */}
-              {isRoutineBlock && (
-                <button
-                  onClick={(e) => handleTogglePin(e, it)}
-                  title={it.pinned ? "Bỏ ghim" : "Ghim (Reflow sẽ không đẩy giờ khối này)"}
-                  style={{
-                    position: "absolute", right: 58, bottom: 2,
-                    width: 22, height: 18, cursor: "pointer",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    background: "transparent", border: "none", padding: 0,
-                    opacity: it.pinned ? 1 : 0.35,
-                    fontSize: 12, lineHeight: 1,
-                  }}
-                >
-                  {it.pinned ? "📍" : "📎"}
-                </button>
-              )}
-              {isRoutineBlock && (
-                <div
-                  onMouseDown={(e) => handleResizeStart(e, it)}
-                  onTouchStart={(e) => handleResizeStart(e, it)}
-                  onClick={(e) => e.stopPropagation()}
-                  style={{
-                    position: "absolute", right: 32, bottom: 2,
-                    width: 22, height: 14, cursor: "ns-resize",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    opacity: isDraggingThis ? 1 : 0.35,
-                    touchAction: "none",
-                  }}
-                  title="Kéo để đổi thời lượng"
-                >
-                  <span style={{ width: 16, height: 3, borderRadius: 2, background: it.color }} />
-                </div>
-              )}
-              {/* [PR44.2] Nút "Đổi thời gian" — mở popup Reschedule
-                  (RescheduleBlockPopup) để nhập giờ bắt đầu + thời lượng
-                  mới. Áp dụng cho CẢ Routine VÀ Fixed (đúng luật PR44.2:
-                  "Routine/Fixed block ✔ được đổi giờ ✔ được đổi duration") —
-                  khác isRoutineBlock (chỉ Routine) dùng cho pin/resize-kéo
-                  ở trên. Goal/Buffer không có nút này (Goal "không sửa",
-                  Buffer "không sửa trực tiếp" — engine tự tính lại qua
-                  Reflow). stopPropagation để không kích hoạt toggle done
-                  của div cha (cùng pattern handleTogglePin/resize handle). */}
-              <button
-                onClick={(e) => { e.stopPropagation(); setPendingRescheduleFor(it); }}
-                title="Đổi thời gian"
+              {isDragOver && <div style={{ height: 2, background: accent, margin: "2px 0", borderRadius: 2 }} />}
+              <div
+                draggable
+                onDragStart={() => setDraggingKey(it.key)}
+                onDragOver={(e) => { if (draggingKey != null) { e.preventDefault(); setDragOverIdx(idx); } }}
+                onDrop={(e) => { e.preventDefault(); handleDrop(idx); }}
+                onDragEnd={() => { setDraggingKey(null); setDragOverIdx(null); }}
                 style={{
-                  position: "absolute", right: 6, bottom: 2,
-                  width: 22, height: 18, cursor: "pointer",
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  background: "transparent", border: "none", padding: 0,
-                  opacity: 0.45, fontSize: 12, lineHeight: 1,
-                }}
-              >
-                🕐
-              </button>
+                  display: "flex", alignItems: "center", gap: 10,
+                  padding: "9px 10px", marginBottom: 6, borderRadius: 10,
+                  background: done ? `${accent}12` : theme.surfaceAlt,
+                  opacity: isDragging ? 0.4 : (done ? 0.65 : 1),
+                }}>
+                <span style={{ fontSize: 12, color: theme.textDim, cursor: "grab", flexShrink: 0 }}>⠿</span>
+                <div onClick={() => toggleDraftDone(it.key)} style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0, cursor: "pointer" }}>
+                  <NeonCheckbox checked={done} onChange={() => toggleDraftDone(it.key)} accent={accent} />
+                  <span style={{ fontSize: 13 }}>{it.icon || kindMeta.icon}</span>
+                  <span style={{ flex: 1, fontSize: 13, minWidth: 0 }}>
+                    <span key={done ? "done" : "undone"} className={done ? "task-text-done" : ""} style={{ "--strike-color": accent, color: theme.text }}>
+                      {it.name}
+                    </span>
+                  </span>
+                </div>
+                <button
+                  onClick={() => setEditingItem(it)}
+                  title="Sửa"
+                  style={{ background: "none", border: "none", color: theme.textDim, fontSize: 13, cursor: "pointer", padding: "0 2px", flexShrink: 0 }}>
+                  ✏️
+                </button>
               </div>
             </div>
           );
         })}
       </div>
 
-      {/* [V42 PR3.4] Khu "Chưa xếp được — quá tải hôm nay" (edge case #9,
-          Điều kiện hoàn thành PR3.3 gốc theo roadmap: "người dùng luôn
-          biết có bao nhiêu việc rớt ra khỏi ngày"). Đọc THUẦN từ field
-          `overflow` mà reflowTimelineBlocks (PR3.4) đã gắn sẵn trên từng
-          item — không tính toán lại, không state mới, không storage mới.
-          Chỉ hiện khi có ít nhất 1 block overflow, để không đổi giao diện
-          của những ngày lịch bình thường (không quá tải). */}
-      {(() => {
-        const overflowItems = timelineItems.filter(it => !it.isBuffer && it.overflow);
-        if (overflowItems.length === 0) return null;
-        return (
-          <div style={{
-            marginTop: 10, padding: "10px 12px", borderRadius: 10,
-            background: `${theme.danger}12`, border: `1px dashed ${theme.danger}`,
-          }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: theme.danger, marginBottom: 6 }}>
-              ⚠ Chưa xếp được — quá tải hôm nay ({overflowItems.length})
-            </div>
-            <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 6 }}>
-              Lịch hôm nay không đủ chỗ cho các việc dưới đây (do trễ giờ hoặc bị chặn bởi khối đã ghim). Không có việc nào bị xoá — cân nhắc ghim lại thời điểm hoặc bỏ ghim khối chặn.
-            </div>
-            {overflowItems.map(it => (
-              <div key={it.key} style={{ display: "flex", gap: 8, alignItems: "center", padding: "4px 0", fontSize: 12 }}>
-                <span style={{ width: 4, height: 4, borderRadius: "50%", background: theme.danger, flexShrink: 0 }} />
-                <span style={{ color: theme.text }}>{it.name}</span>
-                <span style={{ color: theme.textDim, fontSize: 10 }}>({it.dur}')</span>
-              </div>
-            ))}
-          </div>
-        );
-      })()}
+      <button onClick={() => setAddingOpen(true)}
+        style={{
+          width: "100%", marginTop: 4, padding: "8px 0", borderRadius: 10,
+          border: `1px dashed ${theme.border}`, background: "transparent",
+          color: theme.textDim, fontSize: 12, fontWeight: 600, cursor: "pointer",
+        }}>
+        + Thêm block
+      </button>
 
       <div style={{ marginTop: 10 }}>
-        {/* [V42 PR5.1] "Làm lại" giờ đi qua requestRegenerate — CHỈ hỏi xác
-            nhận (InlineConfirm) khi Override Layer đang có dữ liệu chưa
-            "chốt" (Edge case #5). Khi layer rỗng (trường hợp phổ biến nhất —
-            người dùng chưa từng resize/pin/gán goal), hành vi giữ NGUYÊN
-            100% như trước PR5.1: bấm là chạy ngay, không có bước xác nhận
-            thừa. */}
         {confirmRegenerate ? (
           <InlineConfirm
-            message="Làm lại sẽ xoá các điều chỉnh giờ thủ công hôm nay — tiếp tục?"
+            message="Làm lại sẽ xoá toàn bộ danh sách hiện tại (kể cả chỉnh sửa thủ công) và tạo Draft mới — tiếp tục?"
             confirmLabel="Làm lại"
             cancelLabel="Huỷ"
             onConfirm={() => { setConfirmRegenerate(false); regenerate(); }}
@@ -13700,37 +13412,19 @@ function SmartSchedule({ td, data, db, dayExp, setts, save, taskPool, plannerSto
       </div>
       {errorMsg && <div style={{ fontSize: 10, color: theme.danger, marginTop: 6 }}>⚠ {errorMsg}</div>}
 
-      {/* [PR44.1 mục 1] Popup xác nhận giờ hoàn thành thực tế — chỉ mở khi
-          tick 1 block Routine/Fixed lần đầu (chưa có actualCompletedAt).
-          onConfirm chạy đúng doTickTimelineItem gốc (không đổi logic
-          doneAt/Reflow), kèm actualAt để ghi data.actualCompletedAt. */}
-      {pendingActualTimeFor && (
-        <ActualTimeConfirmPopup
-          item={pendingActualTimeFor}
-          onCancel={() => setPendingActualTimeFor(null)}
-          onConfirm={(hhmm) => {
-            const it = pendingActualTimeFor;
-            setPendingActualTimeFor(null);
-            doTickTimelineItem(it, hhmm);
-          }}
+      {editingItem && (
+        <DraftBlockEditPopup
+          item={editingItem}
+          onSave={saveEditedBlock}
+          onDelete={deleteBlock}
+          onDuplicate={duplicateBlock}
+          onCancel={() => setEditingItem(null)}
         />
       )}
-
-      {/* [PR44.2] Popup "Đổi thời gian" — mở khi bấm nút 🕐 trên 1 block
-          Routine/Fixed. onApply gọi rescheduleTimelineBlock (hàm thuần,
-          PR44.2) → setOverrideLayer — applyTimelineOverrides/Reflow (không
-          sửa) tự tính lại toàn bộ Timeline theo giờ mới, dồn các block
-          phía sau nếu bị chồng giờ. KHÔNG regenerate lại AI Planner — chỉ
-          rebuild Timeline (đúng yêu cầu "Chỉ rebuild timeline"). */}
-      {pendingRescheduleFor && (
-        <RescheduleBlockPopup
-          item={pendingRescheduleFor}
-          onCancel={() => setPendingRescheduleFor(null)}
-          onApply={(newStart, newDur) => {
-            const it = pendingRescheduleFor;
-            setPendingRescheduleFor(null);
-            setOverrideLayer(rescheduleTimelineBlock(overrideLayer, it.doneKey, newStart, newDur));
-          }}
+      {addingOpen && (
+        <DraftBlockAddPopup
+          onAdd={addBlock}
+          onCancel={() => setAddingOpen(false)}
         />
       )}
     </div>
