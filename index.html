@@ -5739,6 +5739,139 @@ async function setGeminiEnabled(on) {
   try { await S.set(GEMINI_ENABLED_STORAGE_KEY, on ? "true" : "false"); } catch {}
 }
 
+// [GB-AI-CHAT-01] Custom Instructions — "ghi chú lâu dài" người dùng tự
+// viết, luôn nối vào cuối buildGeminiSystemPrompt() ở MỌI lần gọi Gemini
+// (cả handleRun lẫn chat). Lưu 1 chuỗi text duy nhất, KHÔNG theo ngày —
+// giống ghi chú cố định về bản thân (thói quen, điều cần tránh...), theo
+// đúng yêu cầu người dùng ("1 ô text cố định, luôn gửi kèm mọi lần chạy").
+const GEMINI_CUSTOM_INSTRUCTIONS_KEY = "v1:gemini:customInstructions";
+async function getGeminiCustomInstructions() {
+  try {
+    const v = await S.get(GEMINI_CUSTOM_INSTRUCTIONS_KEY);
+    return v && v !== "null" ? v : "";
+  } catch { return ""; }
+}
+async function setGeminiCustomInstructions(text) {
+  try { await S.set(GEMINI_CUSTOM_INSTRUCTIONS_KEY, text || ""); } catch {}
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [GB-AI-CHAT-01] CHAT CONVERSATIONS — khung chat với AI Planner
+// ════════════════════════════════════════════════════════════════════════
+// Nhiều cuộc hội thoại độc lập (kiểu Claude/ChatGPT), KHÔNG chia theo
+// ngày, KHÔNG gộp thành 1 luồng liên tục — mỗi cuộc có thể tạo mới, xem
+// lại danh sách cuộc cũ, lưu lâu dài (không tự xoá qua ngày).
+//
+// Shape 1 conversation:
+//   { id, title, mode: "auto"|"discuss", createdAt, updatedAt,
+//     messages: [{ role: "user"|"assistant", text, at }] }
+// mode: "auto" = "Tự cập nhật kế hoạch" (mỗi tin nhắn user gửi sẽ trigger
+//       chạy lại pipeline tạo kế hoạch, xem runAiPlannerChatAutoUpdate).
+//       "discuss" = "Chỉ trao đổi" (chat tự do, không đụng kế hoạch).
+//
+// Lưu 1 index (danh sách id+title+updatedAt, gọn) + từng conversation
+// riêng theo id, để không phải đọc/ghi toàn bộ lịch sử chat mỗi lần chỉ
+// cần đổi 1 cuộc — tránh phình 1 key duy nhất theo thời gian.
+const CHAT_INDEX_KEY = "v1:aiChat:index";
+const chatConvKey = (id) => `v1:aiChat:conv:${id}`;
+
+async function listChatConversations() {
+  try {
+    const raw = await S.get(CHAT_INDEX_KEY);
+    const idx = raw && raw !== "null" ? JSON.parse(raw) : [];
+    return Array.isArray(idx) ? idx.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || "")) : [];
+  } catch { return []; }
+}
+async function saveChatIndex(idx) {
+  try { await S.set(CHAT_INDEX_KEY, JSON.stringify(idx || [])); } catch {}
+}
+async function loadChatConversation(id) {
+  try {
+    const raw = await S.get(chatConvKey(id));
+    return raw && raw !== "null" ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+async function saveChatConversation(conv) {
+  try { await S.set(chatConvKey(conv.id), JSON.stringify(conv)); } catch {}
+  const idx = await listChatConversations();
+  const i = idx.findIndex(c => c.id === conv.id);
+  const entry = { id: conv.id, title: conv.title, mode: conv.mode, updatedAt: conv.updatedAt };
+  if (i >= 0) idx[i] = entry; else idx.push(entry);
+  await saveChatIndex(idx);
+}
+async function deleteChatConversation(id) {
+  try { await S.del(chatConvKey(id)); } catch {}
+  const idx = await listChatConversations();
+  await saveChatIndex(idx.filter(c => c.id !== id));
+}
+function newChatConversation(mode) {
+  const id = "chat_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+  const now = new Date().toISOString();
+  return { id, title: "Cuộc trò chuyện mới", mode: mode || "discuss", createdAt: now, updatedAt: now, messages: [] };
+}
+// Đặt tiêu đề tự động từ tin nhắn đầu tiên của user (giống Claude/ChatGPT
+// rút gọn câu đầu làm tên cuộc trò chuyện) — cắt 40 ký tự, không gọi thêm
+// API riêng cho việc này (tiết kiệm request).
+function autoTitleFromMessage(text) {
+  const t = (text || "").trim().replace(/\s+/g, " ");
+  if (!t) return "Cuộc trò chuyện mới";
+  return t.length > 40 ? t.slice(0, 40) + "…" : t;
+}
+
+// [GB-AI-CHAT-01] Gọi Gemini ở chế độ chat tự do ("Chỉ trao đổi") — KHÔNG
+// dùng response_schema (không ép JSON kế hoạch), chỉ trả lời text tự
+// nhiên. System prompt riêng, ngắn gọn, khác hẳn buildGeminiSystemPrompt
+// (vốn là prompt CHUYÊN cho việc sinh kế hoạch có schema) — dùng chung sẽ
+// khiến model cố nhét câu trả lời vào khuôn JSON kế hoạch dù không được
+// yêu cầu structured output, dễ trả lời lệch tông "đang chat".
+function buildChatDiscussSystemPrompt(customInstructions) {
+  let p = `Bạn là trợ lý cá nhân trò chuyện với một học sinh tên Gia Bảo, bên trong ứng dụng "GiaBao Dashboard". Đây là khung CHAT TỰ DO để Bảo hỏi/trao đổi về kế hoạch, thói quen, hoặc bất kỳ điều gì — bạn KHÔNG cần trả về JSON, chỉ trả lời bằng văn bản tự nhiên, ngắn gọn, giọng gần gũi như anh trai lớn tuổi hơn thật sự quan tâm, có kỷ luật nhưng không sáo rỗng. Trả lời bằng tiếng Việt.
+Nếu Bảo hỏi về kế hoạch hôm nay, bạn có thể xem dữ liệu kế hoạch hiện tại (nếu được cung cấp trong tin nhắn) để trả lời chính xác, nhưng bạn KHÔNG tự sửa kế hoạch ở chế độ này — nếu Bảo muốn thay đổi kế hoạch thật sự, gợi ý Bảo chuyển sang chế độ "Tự cập nhật kế hoạch" hoặc bấm nút Tạo lại kế hoạch.`;
+  if (customInstructions && customInstructions.trim()) {
+    p += `\n\nGHI CHÚ RIÊNG TỪ BẢO (ưu tiên/sở thích cá nhân cần tôn trọng):\n"""\n${customInstructions.trim()}\n"""`;
+  }
+  return p;
+}
+
+async function callGeminiChatDiscuss(apiKey, { messages, planContext }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const customInstructions = await getGeminiCustomInstructions();
+
+  // [GB-AI-CHAT-01] Chỉ gửi 10-15 tin nhắn gần nhất làm ngữ cảnh (tiết
+  // kiệm token, theo yêu cầu người dùng) — không gửi toàn bộ lịch sử.
+  const recentMessages = (messages || []).slice(-15);
+  const contents = recentMessages.map(m => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.text }],
+  }));
+
+  // Nếu có kế hoạch hôm nay, đính kèm tóm tắt vào tin nhắn user CUỐI CÙNG
+  // (không tạo thêm 1 "turn" riêng, tránh lệch thứ tự role user/model mà
+  // Gemini yêu cầu phải xen kẽ đúng chuẩn).
+  if (planContext && contents.length) {
+    const last = contents[contents.length - 1];
+    if (last.role === "user") {
+      last.parts[0].text = `[Bối cảnh kế hoạch hôm nay — chỉ để tham khảo, không phải lệnh]:\n${planContext}\n\n[Tin nhắn của Bảo]:\n${last.parts[0].text}`;
+    }
+  }
+
+  const body = {
+    system_instruction: { parts: [{ text: buildChatDiscussSystemPrompt(customInstructions) }] },
+    contents,
+    generationConfig: { temperature: 0.8 },
+  };
+
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Gemini API lỗi (${res.status}): ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+  if (!text) throw new Error("Gemini không trả về nội dung.");
+  return text;
+}
+
 
 // ── 2. KHUNG CÂU HỎI (PROMPT TEMPLATE) — "huấn luyện viên cố định" ──────
 // Đây là phần KHÔNG đổi mỗi lần chạy — giống khung dịch lời bài hát của
@@ -5764,8 +5897,8 @@ async function setGeminiEnabled(on) {
 // AI cũng KHÔNG được coi việc lệch kế hoạch là thất bại — mỗi lần chạy lại
 // (re-plan) phải dựa vào currentState (đang ở pha nào, vừa làm gì, chưa
 // làm gì) chứ không "tiếp tục" một lịch cũ đã lỗi thời.
-function buildGeminiSystemPrompt() {
-  return `Bạn là trợ lý lập kế hoạch cá nhân (personal planning assistant) cho một học sinh tên Gia Bảo, vận hành bên trong ứng dụng "GiaBao Dashboard".
+function buildGeminiSystemPrompt(customInstructions) {
+  const base = `Bạn là trợ lý lập kế hoạch cá nhân (personal planning assistant) cho một học sinh tên Gia Bảo, vận hành bên trong ứng dụng "GiaBao Dashboard".
 
 NGUYÊN TẮC THIẾT KẾ CỐT LÕI — ĐỌC KỸ TRƯỚC KHI LÀM BẤT CỨ GÌ:
 Bạn KHÔNG quản lý đồng hồ. Bạn quản lý DÒNG CHẢY của một ngày.
@@ -5799,9 +5932,19 @@ QUY TẮC BẮT BUỘC:
 - KHÔNG lập kế hoạch cho các pha ĐÃ QUA theo currentState — chỉ lập cho pha hiện tại trở đi.
 - Nếu mainGoal là "rest" hoặc "fun" — ưu tiên nghỉ ngơi/giải trí, KHÔNG nhồi nhét việc học.
 - Nếu homeworkChoice là "pending" — bài tập môn đó PHẢI xếp vào pha sớm nhất còn khả thi, priority "high".
+- priority "high" nghĩa là "BẮT BUỘC phải xong hôm nay" — dùng cho: (a) bài tập "pending", (b) việc PHẢI hoàn thành TRƯỚC một mốc cố định gần nhất trong ngày (recurringSchedule/fixedEvents, vd sắp tới giờ học thêm mà việc nhà/bài tập chưa xong), (c) deadlinePlan gấp (remainingHours thấp so với daysLeft). Đây là tín hiệu quan trọng hiển thị nổi bật (tô màu) trên UI cho Bảo — CHỈ gán "high" cho việc thật sự cấp bách, KHÔNG gán tràn lan (nếu gán quá nhiều việc "high", tín hiệu mất tác dụng).
 - oneBigWin KHÔNG được là một task riêng biệt ngoài "tasks" — nó luôn là THAM CHIẾU (cùng id) tới một phần tử đã có trong "tasks". Không tạo hai bản ghi cho cùng một việc.
 - Trả lời BẰNG TIẾNG VIỆT, giọng điệu gần gũi nhưng có kỷ luật, giống một anh trai lớn tuổi hơn thật sự quan tâm — không sáo rỗng, không lặp lại y hệt mỗi ngày.
 - CHỈ trả về JSON đúng theo schema đã cho — không thêm text, không thêm markdown code fence, không thêm lời chào.`;
+
+  // [GB-AI-CHAT-01] Ghi chú lâu dài của người dùng (Custom Instructions) —
+  // nối vào CUỐI, không chèn giữa để không phá vỡ mạch chỉ dẫn cốt lõi ở
+  // trên. Model coi đây là bổ sung/ưu tiên cá nhân, không phải luật thay
+  // thế các nguyên tắc bắt buộc (schema, tiếng Việt, không bịa task...).
+  if (customInstructions && customInstructions.trim()) {
+    return base + `\n\nGHI CHÚ RIÊNG TỪ BẢO (đọc kỹ, đây là ưu tiên/sở thích cá nhân cần tôn trọng khi lập kế hoạch, nhưng KHÔNG được vi phạm các quy tắc bắt buộc ở trên như schema JSON, không bịa task ngoài taskPool):\n"""\n${customInstructions.trim()}\n"""`;
+  }
+  return base;
 }
 
 // [PR-043] Xác định "bây giờ đang ở đâu trong dòng chảy ngày" — nền tảng
@@ -5997,8 +6140,12 @@ function buildGeminiResponseSchema() {
 async function callGeminiFlash(apiKey, userPayload) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
+  // [GB-AI-CHAT-01] Ghi chú lâu dài của người dùng luôn được đọc và nối
+  // vào system prompt ở MỌI lần gọi Gemini qua hàm này (handleRun lẫn
+  // chat mode "Tự cập nhật kế hoạch" đều đi qua callGeminiFlash).
+  const customInstructions = await getGeminiCustomInstructions();
   const body = {
-    system_instruction: { parts: [{ text: buildGeminiSystemPrompt() }] },
+    system_instruction: { parts: [{ text: buildGeminiSystemPrompt(customInstructions) }] },
     contents: [{
       role: "user",
       parts: [{ text: "Dữ liệu check-in hôm nay (JSON):\n" + JSON.stringify(userPayload, null, 2) }],
@@ -6351,6 +6498,35 @@ async function runSinglePlannerFlow({ storage, td, runForm, taskPool, deadlinePl
   }
 }
 
+// [GB-AI-CHAT-01] Chế độ chat "Tự cập nhật kế hoạch" — KHÔNG tự parse/sửa
+// kế hoạch trực tiếp từ hội thoại. Thay vào đó, gộp nội dung chat gần đây
+// thành 1 đoạn text ngắn, nối vào runForm.checkinNote (field đã có sẵn,
+// đúng ngữ nghĩa "ghi chú thêm từ Bảo" trong buildGeminiUserPayload), rồi
+// gọi lại NGUYÊN VẸN runSinglePlannerFlow — same pipeline như nút "Tạo kế
+// hoạch"/"Tạo lại kế hoạch". Cách này tái dùng toàn bộ validate/mapping đã
+// có, tránh viết lại parser JSON kế hoạch riêng cho chat (rủi ro lệch
+// schema/contract dữ liệu mà nhiều nơi khác trong app đang đọc).
+async function runAiPlannerChatAutoUpdate({ storage, td, baseRunForm, taskPool, deadlinePlan, dayLog, db, dayExp, targetXP, core, chatMessages }) {
+  // Chỉ lấy vài tin nhắn gần nhất của USER làm ngữ cảnh bổ sung (giữ ngắn
+  // gọn, tránh checkinNote quá dài làm loãng payload).
+  const recentUserMsgs = (chatMessages || [])
+    .filter(m => m.role === "user")
+    .slice(-5)
+    .map(m => m.text.trim())
+    .filter(Boolean);
+  const chatNote = recentUserMsgs.length
+    ? `[Yêu cầu từ cuộc trò chuyện với Bảo — ưu tiên xem xét khi lập kế hoạch]: ${recentUserMsgs.join(" | ")}`
+    : "";
+
+  const runForm = {
+    ...baseRunForm,
+    checkinNote: [baseRunForm.checkinNote, chatNote].filter(Boolean).join("\n"),
+  };
+
+  return runSinglePlannerFlow({ storage, td, runForm, taskPool, deadlinePlan, dayLog, db, dayExp, targetXP, core });
+}
+
+
 // ── 5. HÀM ĐIỀU PHỐI CHÍNH — GỌI TỪ handleRun() ─────────────────────────
 // KHÔNG ghi storage trực tiếp ở đây (giữ đúng nguyên tắc "orchestration
 // only" của các hàm run* khác) — trả về updatedToday-shaped object,
@@ -6429,6 +6605,282 @@ function GeminiSettingsInline({ theme, accent }) {
             style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
             {saved ? "✅ Đã lưu" : "Lưu"}
           </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// [GB-AI-CHAT-01] Ô nhập "ghi chú lâu dài" — lưu 1 lần, tự động nối vào
+// system prompt ở MỌI lần gọi Gemini sau đó (xem callGeminiFlash). Cùng
+// pattern collapse với GeminiSettingsInline để nhất quán UI.
+function CustomInstructionsPanel({ theme, accent }) {
+  const [text, setText] = useState("");
+  const [open, setOpen] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setText(await getGeminiCustomInstructions());
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    await setGeminiCustomInstructions(text);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  };
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <button onClick={() => setOpen(o => !o)}
+        style={{ fontSize: 11, color: theme.textDim, background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+        {open ? "▲ Ẩn ghi chú riêng cho AI" : "▼ ✍️ Ghi chú riêng cho AI (tuỳ chọn)"}
+      </button>
+      {open && (
+        <div style={{ marginTop: 8, padding: 10, borderRadius: 10, border: `1px solid ${theme.border}` }}>
+          <div style={{ fontSize: 11, color: theme.textDim, marginBottom: 6, lineHeight: 1.5 }}>
+            Viết những điều bạn muốn AI luôn nhớ khi lập kế hoạch (thói quen, điều nên tránh, sở thích cá nhân...). Ghi chú này được gửi kèm MỌI lần AI tạo hoặc cập nhật kế hoạch, không cần nhập lại mỗi ngày.
+          </div>
+          <textarea rows={4} value={text} onChange={e => setText(e.target.value)}
+            placeholder="Ví dụ: Mình học buổi tối hay mệt sau 21h, ưu tiên xếp việc nhẹ. Mình hay trễ hẹn học thêm nên đừng xếp việc sát giờ trước đó..."
+            disabled={!loaded}
+            style={{ width: "100%", padding: 8, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12, marginBottom: 8, fontFamily: "inherit", resize: "vertical" }}/>
+          <button onClick={save}
+            style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
+            {saved ? "✅ Đã lưu" : "Lưu ghi chú"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// [GB-AI-CHAT-01] AIPlannerChatPanel — khung chat với AI Planner
+// ════════════════════════════════════════════════════════════════════════
+// Danh sách nhiều cuộc hội thoại (kiểu Claude/ChatGPT) + 2 chế độ chuyển
+// qua lại bằng nút riêng:
+//   - "auto"    = Tự cập nhật kế hoạch: mỗi tin nhắn gửi đi sẽ chạy lại
+//                 TOÀN BỘ pipeline tạo kế hoạch (runAiPlannerChatAutoUpdate
+//                 → runSinglePlannerFlow), y hệt bấm nút "Tạo kế hoạch",
+//                 chỉ khác là có thêm ngữ cảnh từ chat.
+//   - "discuss" = Chỉ trao đổi: gọi callGeminiChatDiscuss, trả lời tự do,
+//                 KHÔNG đụng tới kế hoạch đã lưu.
+// Nhận đủ props cần thiết để gọi lại pipeline (giống handleRun trong
+// AIPlannerBeta) — truyền xuống từ AIPlannerBeta, không tự tạo lại logic.
+function AIPlannerChatPanel({ theme, accent, storage, td, today, setToday, taskPool, db, dayExp, targetXP, core, buildRunFormAndDeadline }) {
+  const [open, setOpen] = useState(false);
+  const [convList, setConvList] = useState([]);
+  const [activeConv, setActiveConv] = useState(null); // full conversation object đang mở
+  const [showList, setShowList] = useState(true); // true = đang xem danh sách cuộc trò chuyện
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const scrollRef = useRef(null);
+
+  const refreshList = useCallback(async () => {
+    setConvList(await listChatConversations());
+  }, []);
+
+  useEffect(() => { if (open) refreshList(); }, [open, refreshList]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [activeConv?.messages?.length, sending]);
+
+  const openConversation = async (id) => {
+    const conv = await loadChatConversation(id);
+    if (conv) { setActiveConv(conv); setShowList(false); setErrorMsg(null); }
+  };
+
+  const startNewConversation = (mode) => {
+    setActiveConv(newChatConversation(mode));
+    setShowList(false);
+    setErrorMsg(null);
+  };
+
+  const backToList = async () => {
+    await refreshList();
+    setShowList(true);
+  };
+
+  const removeConversation = async (id, e) => {
+    e.stopPropagation();
+    if (!window.confirm("Xoá cuộc trò chuyện này?")) return;
+    await deleteChatConversation(id);
+    await refreshList();
+    if (activeConv?.id === id) { setActiveConv(null); setShowList(true); }
+  };
+
+  const toggleMode = async () => {
+    if (!activeConv) return;
+    const next = { ...activeConv, mode: activeConv.mode === "auto" ? "discuss" : "auto", updatedAt: new Date().toISOString() };
+    setActiveConv(next);
+    await saveChatConversation(next);
+  };
+
+  // Tóm tắt kế hoạch hiện tại — dùng làm planContext cho chế độ "discuss"
+  // để AI trả lời đúng bối cảnh mà không cần Bảo mô tả lại thủ công.
+  const buildPlanContext = () => {
+    const entries = today?.entries || [];
+    const last = entries[entries.length - 1];
+    if (!last) return null;
+    const tasks = (last.plannerOutput?.tasks || []).map(t => `${t.name} (${t.priority || "med"})`).join(", ");
+    return `Verdict: ${last.result?.verdict || ""}. ${last.result?.message || ""}. Các việc trong kế hoạch: ${tasks || "(chưa có)"}`;
+  };
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || !activeConv || sending) return;
+    setSending(true);
+    setErrorMsg(null);
+
+    const userMsg = { role: "user", text, at: new Date().toISOString() };
+    let conv = {
+      ...activeConv,
+      messages: [...activeConv.messages, userMsg],
+      title: activeConv.messages.length === 0 ? autoTitleFromMessage(text) : activeConv.title,
+      updatedAt: new Date().toISOString(),
+    };
+    setActiveConv(conv);
+    setInput("");
+    await saveChatConversation(conv);
+
+    try {
+      const apiKey = await getGeminiApiKey();
+      if (!apiKey) throw new Error("Chưa có Gemini API key — mở '⚙️ Cài đặt Gemini' phía trên để dán key.");
+      const geminiOn = await getGeminiEnabled();
+      if (!geminiOn) throw new Error("Gemini đang tắt — mở '⚙️ Cài đặt Gemini' phía trên để bật.");
+
+      let replyText;
+      if (conv.mode === "auto") {
+        // [GB-AI-CHAT-01] Tự cập nhật kế hoạch: gọi lại TOÀN BỘ pipeline,
+        // dùng runForm thật hiện tại của form check-in (giống handleRun).
+        const { runForm, deadlinePlan } = await buildRunFormAndDeadline();
+        const dayLog = today?.entries || [];
+        const { updatedToday, usedGemini, errorMsg: runErr } = await runAiPlannerChatAutoUpdate({
+          storage, td, baseRunForm: runForm, taskPool, deadlinePlan, dayLog, db, dayExp, targetXP, core,
+          chatMessages: conv.messages,
+        });
+        setToday(updatedToday);
+        if (!usedGemini && runErr) {
+          replyText = "⚠️ " + runErr;
+        } else {
+          const lastEntry = updatedToday?.entries?.[updatedToday.entries.length - 1];
+          replyText = lastEntry?.result?.message
+            ? `✅ Đã cập nhật kế hoạch.\n\n${lastEntry.result.verdict ? lastEntry.result.verdict + "\n" : ""}${lastEntry.result.message}`
+            : "✅ Đã cập nhật kế hoạch.";
+        }
+      } else {
+        replyText = await callGeminiChatDiscuss(apiKey, { messages: conv.messages, planContext: buildPlanContext() });
+      }
+
+      const assistantMsg = { role: "assistant", text: replyText, at: new Date().toISOString() };
+      conv = { ...conv, messages: [...conv.messages, assistantMsg], updatedAt: new Date().toISOString() };
+      setActiveConv(conv);
+      await saveChatConversation(conv);
+    } catch (e) {
+      console.error("[AI Planner Chat] lỗi:", e);
+      setErrorMsg(e.message || "Có lỗi khi gửi tin nhắn.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <button onClick={() => setOpen(o => !o)}
+        style={{ fontSize: 11, color: theme.textDim, background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+        {open ? "▲ Ẩn khung chat với AI" : "▼ 💬 Chat với AI Planner"}
+      </button>
+
+      {open && (
+        <div style={{ marginTop: 8, borderRadius: 10, border: `1px solid ${theme.border}`, overflow: "hidden" }}>
+
+          {showList && (
+            <div style={{ padding: 10 }}>
+              <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                <button onClick={() => startNewConversation("discuss")} className="gb-ripple" onMouseDown={gbRipple}
+                  style={{ flex: 1, padding: "10px 0", borderRadius: 8, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: "pointer" }}>
+                  ＋ Cuộc trò chuyện mới
+                </button>
+              </div>
+              {convList.length === 0 && (
+                <div style={{ fontSize: 12, color: theme.textDim, textAlign: "center", padding: "12px 0" }}>
+                  Chưa có cuộc trò chuyện nào. Bắt đầu chat để hỏi AI về kế hoạch của bạn.
+                </div>
+              )}
+              {convList.map(c => (
+                <button key={c.id} onClick={() => openConversation(c.id)} className="gb-ripple" onMouseDown={gbRipple}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "10px 8px", marginBottom: 6, borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, fontSize: 12, textAlign: "left", cursor: "pointer" }}>
+                  <span style={{ fontSize: 14 }}>{c.mode === "auto" ? "🔄" : "💬"}</span>
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.title}</span>
+                  <span onClick={(e) => removeConversation(c.id, e)} style={{ color: theme.textDim, padding: "2px 6px" }}>🗑️</span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          {!showList && activeConv && (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: `1px solid ${theme.border}`, background: theme.surfaceAlt }}>
+                <button onClick={backToList} style={{ background: "none", border: "none", color: theme.textDim, fontSize: 16, cursor: "pointer", padding: 0 }}>←</button>
+                <span style={{ flex: 1, fontSize: 12, fontWeight: 600, color: theme.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{activeConv.title}</span>
+                <button onClick={toggleMode} style={{
+                  fontSize: 10, padding: "4px 8px", borderRadius: 999, border: `1px solid ${theme.border}`,
+                  background: activeConv.mode === "auto" ? accent : "transparent",
+                  color: activeConv.mode === "auto" ? "#fff" : theme.textDim, cursor: "pointer", whiteSpace: "nowrap",
+                }}>
+                  {activeConv.mode === "auto" ? "🔄 Tự cập nhật" : "💬 Chỉ trao đổi"}
+                </button>
+              </div>
+
+              <div ref={scrollRef} style={{ maxHeight: 320, overflowY: "auto", padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                {activeConv.messages.length === 0 && (
+                  <div style={{ fontSize: 11, color: theme.textDim, textAlign: "center", padding: "16px 0" }}>
+                    {activeConv.mode === "auto"
+                      ? "Chế độ Tự cập nhật: mỗi tin nhắn bạn gửi sẽ khiến AI tạo lại kế hoạch hôm nay theo yêu cầu của bạn."
+                      : "Chế độ Chỉ trao đổi: hỏi AI bất cứ điều gì về kế hoạch, AI sẽ không tự sửa kế hoạch."}
+                  </div>
+                )}
+                {activeConv.messages.map((m, i) => (
+                  <div key={i} style={{
+                    alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                    maxWidth: "85%", padding: "8px 12px", borderRadius: 12,
+                    background: m.role === "user" ? accent : theme.surface,
+                    color: m.role === "user" ? "#fff" : theme.text,
+                    fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-wrap",
+                  }}>
+                    {m.text}
+                  </div>
+                ))}
+                {sending && (
+                  <div style={{ alignSelf: "flex-start", fontSize: 11, color: theme.textDim, fontStyle: "italic" }}>
+                    {activeConv.mode === "auto" ? "Đang tạo lại kế hoạch…" : "Đang trả lời…"}
+                  </div>
+                )}
+              </div>
+
+              {errorMsg && (
+                <div style={{ fontSize: 11, color: theme.danger, padding: "0 10px 8px" }}>{errorMsg}</div>
+              )}
+
+              <div style={{ display: "flex", gap: 6, padding: 10, borderTop: `1px solid ${theme.border}` }}>
+                <input value={input} onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                  placeholder={activeConv.mode === "auto" ? "Yêu cầu thay đổi kế hoạch..." : "Hỏi AI..."}
+                  disabled={sending}
+                  style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bg, color: theme.text, fontSize: 12 }}/>
+                <button onClick={sendMessage} disabled={sending || !input.trim()}
+                  style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: accent, color: "#fff", fontSize: 12, cursor: sending ? "default" : "pointer", opacity: sending || !input.trim() ? 0.6 : 1 }}>
+                  Gửi
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -6762,6 +7214,10 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP, taskPool }) {
           Gemini là AI Planner duy nhất và sinh toàn bộ kế hoạch. Một lớp kiểm tra an toàn (năng lượng, nghỉ ngơi, deadline) chạy sau đó để rà soát kết quả — không có luật nào do người dùng cấu hình ảnh hưởng đến gợi ý.
         </div>
         <GeminiSettingsInline theme={theme} accent={accent} />
+        <CustomInstructionsPanel theme={theme} accent={accent} />
+        <AIPlannerChatPanel theme={theme} accent={accent} storage={storage} td={td} today={today} setToday={setToday}
+          taskPool={taskPool} db={db} dayExp={dayExp} targetXP={targetXP} core={core}
+          buildRunFormAndDeadline={buildRunFormAndDeadline}/>
       </div>
 
       <div style={{ background: theme.surface, borderRadius: 14, padding: 12, marginBottom: 12 }}>
@@ -7008,21 +7464,13 @@ function AIPlannerBeta({ db, setDb, td, dayExp, targetXP, taskPool }) {
         </button>
       </div>
 
-      {today && today.entries.length > 0 && (
-        <div style={{ marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: theme.text }}>
-            Nhật ký kế hoạch hôm nay ({today.entries.length})
-          </div>
-          <button onClick={handleNewDay}
-            style={{ fontSize: 11, padding: "4px 10px", borderRadius: 999, border: `1px solid ${theme.border}`, background: "transparent", color: theme.textDim, cursor: "pointer" }}>
-            ↺ Bắt đầu ngày mới
-          </button>
-        </div>
-      )}
-
-      {today && [...today.entries].reverse().map((entry, idx) => (
-        <PlannerRunLogCard key={entry.id} entry={entry} isLatest={idx === 0} theme={theme} accent={accent} />
-      ))}
+      {/* [GB-UI-CLEAN-01] Nhật ký kế hoạch hôm nay (danh sách PlannerRunLogCard)
+          đã ẩn khỏi UI theo yêu cầu người dùng — nhìn rối và chật chỗ.
+          KHÔNG xoá dữ liệu/logic: today.entries vẫn được ghi/đọc bình
+          thường (dùng cho nút "↻ Tạo lại kế hoạch" ở trên và cho lịch sử),
+          chỉ không render danh sách log ra màn hình nữa. handleNewDay vẫn
+          còn nhưng không còn nút gọi trực tiếp ở đây — dùng "↻ Tạo lại kế
+          hoạch" phía trên để đạt hiệu quả tương tự. */}
 
       {/* [PATCH v36] MỤC 2: form thêm/sửa/xoá task cố định. */}
       <FixedTasksManager/>
@@ -7152,6 +7600,7 @@ function PreviewModal({ onClose, runPreview, draftOverrides, conflictWarnings, t
   }, []);
 
   return (
+    <ModalPortal>
     <div style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000,
       display: "flex", alignItems: "flex-end", justifyContent: "center",
@@ -7186,6 +7635,7 @@ function PreviewModal({ onClose, runPreview, draftOverrides, conflictWarnings, t
         </button>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -8256,6 +8706,17 @@ const NEON_CSS = `
 @keyframes gbExpand {
   from { opacity:0; transform: translateY(-4px); max-height:0; }
   to   { opacity:1; transform: translateY(0); max-height:600px; }
+}
+
+/* [GB-UI-FIX-02] Dành cho panel có thể cao hơn 600px (vd. khối AI Planner
+   trong SettingsHub) — chỉ animate opacity/translateY, không giới hạn
+   max-height nên không bị cắt nội dung sau khi animation kết thúc. */
+.gb-ai-panel-enter {
+  animation: gbPanelExpand 0.22s cubic-bezier(0.4,0,0.2,1) both;
+}
+@keyframes gbPanelExpand {
+  from { opacity:0; transform: translateY(-6px); }
+  to   { opacity:1; transform: translateY(0); }
 }
 
 .gb-day-expand {
@@ -10715,31 +11176,11 @@ function App() {
            themeKey={themeKey} themeMenuOpen={themeMenuOpen} setThemeMenuOpen={setThemeMenuOpen} chooseTheme={chooseTheme}
            mediaModalOpen={mediaModalOpen} setMediaModalOpen={setMediaModalOpen}
            xp2Status={planningSectionArgs?.xp2Status} onActivateXp2={planningSectionArgs?.onActivateXp2}/>
-      {/* Pill Tab Bar */}
-      <div style={{position:"sticky",top:0,zIndex:10,background:theme.surfaceAlt,borderBottom:`1px solid ${theme.border}`,display:"flex",overflowX:"auto",WebkitOverflowScrolling:"touch",scrollbarWidth:"none",padding:"8px 10px",gap:6}}>
-        {VISIBLE_TABS.map(({t,i})=>{
-          const isActive = tab===i;
-          const tabColor = TAB_COLORS[i] || accent;
-          return (
-            <button key={i} onClick={()=>switchTab(i)} className="gb-ripple" onMouseDown={gbRipple} style={{
-              flex:"0 0 auto",
-              padding: isActive ? "6px 16px" : "6px 12px",
-              border:"none",
-              background: isActive ? `linear-gradient(135deg,${tabColor},${tabColor}CC)` : "transparent",
-              cursor:"pointer",
-              color: isActive ? "#FFFFFF" : theme.textDim,
-              borderRadius:999,
-              fontSize:11,
-              fontWeight: isActive ? 700 : 400,
-              boxShadow: isActive ? `0 4px 14px ${tabColor}55` : "none",
-              whiteSpace:"nowrap",
-              transition:"all 0.2s ease",
-            }}>
-              {t}
-            </button>
-          );
-        })}
-      </div>
+      {/* [GB-NAV-01] Pill Tab Bar trên đã bị XÓA theo yêu cầu người dùng —
+          điều hướng giờ chỉ qua BottomNav (Hôm nay/Lịch/Số liệu/Khác).
+          VISIBLE_TABS/TAB_COLORS vẫn giữ ở nơi khai báo (không xóa) vì
+          AIPlannerBeta Dev Tools (?dev=1) và các nơi khác có thể còn tham
+          chiếu TABS — chỉ gỡ phần JSX render thanh tab này. */}
 
       {/* PR-006 — FAB tách component (xem định nghĩa <FAB/> gần
           HomeScreen). Whitelist tab vẫn tính bằng FAB_WHITELIST_TABS
@@ -10872,12 +11313,17 @@ function App() {
         {tab===12 && <SettingsHub setts={setts} saveSetts={saveSetts} db={db} str={str} txp={txp} dayExp={dayExp} lv={lv} rt={rt}
               finTxs={finTxs} setFinTxs={setFinTxs} capsuleNotif={capsuleNotif} setCapsuleNotif={setCapsuleNotif}
               exportData={exportData} importData={importData} backupList={backupList} restoreFromBackup={restoreFromBackup}
-              save={save} td={td} taskPool={taskPool}/>}
+              save={save} td={td} taskPool={taskPool} onSwitchTab={switchTab} setDb={setDb} targetXP={setts.targetXP||150}/>}
         {tab===6 && <KnowledgeBank/>}
         {tab===7 && <HanhTrinh capsuleNotif={capsuleNotif} setCapsuleNotif={setCapsuleNotif} db={db} str={str} txp={txp}/>}
         {tab===8 && <BossFight db={db} save={save} td={td} setts={setts}/>}
         {tab===9 && <KhamPha db={db} dayExp={dayExp} str={str} txp={txp} finTxs={finTxs} setts={setts}/>}
         {tab===10 && <TaiChinh txs={finTxs||[]} onTxsChange={setFinTxs}/>}
+        {/* [GB-NAV-01] tab===11 không còn lối vào từ UI (Pill Tab Bar đã
+            xóa, mục "AI Planner" trong Khác giờ mount AIPlannerBeta trực
+            tiếp thay vì switchTab(11)) — route giữ nguyên, không xóa, để
+            không phá vỡ numbering tab===N hay bất kỳ chỗ nào khác còn gọi
+            switchTab(11) trực tiếp (ví dụ code cũ/URL) trong tương lai. */}
         {tab===11 && (
           <AIPlannerErrorBoundary theme={theme}>
             <AIPlannerBeta db={db} setDb={setDb} td={td} dayExp={dayExp} targetXP={setts.targetXP||150} taskPool={taskPool}/>
@@ -11402,6 +11848,7 @@ function GameEnergyEditorModal({ onClose }) {
   };
 
   return (
+    <ModalPortal>
     <div
       className="gb-modal-backdrop-fade"
       style={{ position: "fixed", inset: 0, zIndex: 210, background: "rgba(0,0,0,.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
@@ -11471,6 +11918,7 @@ function GameEnergyEditorModal({ onClose }) {
         })}
       </div>
     </div>
+    </ModalPortal>
   );
 }
 // ======================================================
@@ -11941,6 +12389,7 @@ function GameEventEditorModal({ onClose }) {
   };
 
   return (
+    <ModalPortal>
     <div
       className="gb-modal-backdrop-fade"
       style={{ position: "fixed", inset: 0, zIndex: 210, background: "rgba(0,0,0,.85)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
@@ -12037,6 +12486,7 @@ function GameEventEditorModal({ onClose }) {
         )}
       </div>
     </div>
+    </ModalPortal>
   );
 }
 // ======================================================
@@ -12861,6 +13311,17 @@ function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onE
 
   const showSuggestToast = (msg) => { setSuggestToast(msg); setTimeout(()=>setSuggestToast(null), 2200); };
 
+  // [PREVIEW-CLEANUP-05] applyOne/applyAll: khi tạo pool entry mới từ gợi ý
+  // AI, mang theo cờ "important" nếu Gemini đã gán priority:"high" cho task
+  // đó (nghĩa là bắt buộc phải làm hôm nay, thường vì có mốc cố định/deadline
+  // sắp tới trong ngày — xem buildGeminiSystemPrompt mục 9). Đây LÀ field
+  // mới trên taskPool item ({id,l,e,i,hidden} → +important), additive-only,
+  // optional (undefined ở mọi entry cũ/thủ công không ảnh hưởng gì) — chỉ
+  // dùng để tô màu vàng nổi bật trong danh sách "Mục tiêu hôm nay" (xem
+  // style dùng t.important bên dưới ở phần render picks). onEditPoolTask
+  // dùng để set field này SAU khi addPoolTask tạo id (addPoolTask hiện tại
+  // chỉ nhận label/xp/icon — không sửa signature của nó để không phá các
+  // call site khác, chỉ patch thêm field ngay sau khi có id).
   const applyOne = (t) => {
     const norm = normalizeTaskName(t.name);
     if (existingNames.has(norm)) {
@@ -12869,6 +13330,7 @@ function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onE
     }
     const existingPoolEntry = (taskPool||[]).find(p => normalizeTaskName(p.l) === norm);
     const poolId = existingPoolEntry ? existingPoolEntry.id : ai.onAddPoolTask(t.name, t.xp, t.icon || "✅");
+    if (t.priority === "high" && ai.onEditPoolTask) ai.onEditPoolTask(poolId, { important: true });
     ai.save(td, { dailyPicks: [...picks, poolId] });
     existingNames.add(norm);
   };
@@ -12881,6 +13343,7 @@ function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onE
       if (seen.has(norm)) return;
       const existingPoolEntry = (taskPool||[]).find(p => normalizeTaskName(p.l) === norm);
       const poolId = existingPoolEntry ? existingPoolEntry.id : ai.onAddPoolTask(t.name, t.xp, t.icon || "✅");
+      if (t.priority === "high" && ai.onEditPoolTask) ai.onEditPoolTask(poolId, { important: true });
       next.push(poolId);
       seen.add(norm);
     });
@@ -13002,11 +13465,16 @@ function TodaysGoalsCard({td,data,taskPool,onToggle,onAdd,onRemove,onReorder,onE
                 <>
                   <div onClick={()=>onToggle(id)} style={{cursor:"pointer",display:"flex",alignItems:"center",gap:10,flex:1,minWidth:0}}>
                     <NeonCheckbox checked={checked} onChange={()=>onToggle(id)} accent={accent}/>
-                    <span style={{fontSize:14}}>{t.i||"✅"}</span>
+                    <span style={{fontSize:14}}>{t.important && !checked ? "🔥" : (t.i||"✅")}</span>
                     <span style={{flex:1,fontSize:12,minWidth:0}}>
-                      <span key={checked?"done":"undone"} className={checked?"task-text-done":""} style={{"--strike-color":accent}}>{t.l}</span>
+                      {/* [PREVIEW-CLEANUP-05] t.important: việc AI đánh dấu bắt
+                          buộc phải làm hôm nay (thường vì có mốc cố định/
+                          deadline sắp tới trong ngày) — tô vàng + đậm để nổi
+                          bật, tắt hiệu ứng này khi đã hoàn thành (checked). */}
+                      <span key={checked?"done":"undone"} className={checked?"task-text-done":""}
+                        style={{"--strike-color":accent, color:(t.important && !checked)?"#F5C518":undefined, fontWeight:(t.important && !checked)?700:undefined}}>{t.l}</span>
                     </span>
-                    <span style={{fontSize:10,padding:"2px 8px",borderRadius:999,background:checked?`${accent}22`:"rgba(255,255,255,.05)",color:checked?accent:theme.textDim,flexShrink:0}}>+{t.e||TP_XP}XP</span>
+                    <span style={{fontSize:10,padding:"2px 8px",borderRadius:999,background:checked?`${accent}22`:(t.important?"#F5C51822":"rgba(255,255,255,.05)"),color:checked?accent:(t.important?"#F5C518":theme.textDim),flexShrink:0}}>+{t.e||TP_XP}XP</span>
                   </div>
                   <button onClick={()=>startEdit(t)} style={{background:"none",border:"none",color:accent,fontSize:12,cursor:"pointer",flexShrink:0}}>✏️</button>
                   <button onClick={()=>onRemove(id)} style={{background:"none",border:"none",color:theme.danger,fontSize:16,cursor:"pointer",flexShrink:0}}>×</button>
@@ -14566,6 +15034,7 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
           pipeline, để enrichTasksWithContext chia nhỏ được ngay từ lần
           đầu — đúng MỤC 3 của yêu cầu gốc. */}
       {pendingDeadline && (
+        <ModalPortal>
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200,
           display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
           <div style={{ background: theme.surface, borderRadius: 16, padding: 18, maxWidth: 340, width: "100%",
@@ -14595,6 +15064,7 @@ function MorningWidget({ td, data, db, dayExp, setts, save, onSwitchTab, taskPoo
             </div>
           </div>
         </div>
+        </ModalPortal>
       )}
     </div>
   );
@@ -15053,18 +15523,26 @@ function NavigationShell({ tab, onSwitchTab, children }) {
    đổi entry point (§12.2 Scope PR-032, Hard Constraint §2 "Không đổi
    public API của component cũ"). */
 
-// [UI polish] Nhánh "⚙️ Chung" (chỉ có toggle dev Boss Fight) và "🔔 Thông
-// báo" (hoàn toàn trống, chưa có nội dung) đã bị XOÁ theo yêu cầu người
-// dùng ("chưa thật sự hữu ích"). Toggle Boss Fight thật (functional) vẫn
-// còn nguyên trong panel "⚙️ Cài đặt" ở Section "Sức khỏe & Thói quen"
-// (Today()) — không mất chức năng. `branch` mặc định đổi từ "chung" sang
-// "ai" (nhánh đầu tiên còn lại) để tránh màn hình trắng khi mở SettingsHub.
-const SETTINGS_HUB_BRANCHES = [
-  { key: "ai",       label: "🛠️ Rule Editor (Legacy)" },
-  { key: "data",     label: "💾 Dữ liệu" },
-  { key: "game",     label: "🎮 Game Registry" },
-  { key: "media",    label: "🖼️ Media" },
-  { key: "tertiary", label: "🗂️ Thêm" },
+// [GB-NAV-01] Mục "Khác" đổi từ pill-tab con (SETTINGS_HUB_BRANCHES) sang
+// 1 danh sách menu duy nhất, theo yêu cầu người dùng:
+//  - Xóa hẳn nhánh "Rule Editor (Legacy)" (RuleEditorFlow/DayRulesManager/
+//    ConditionRulesManager/ScheduleManagerPanel) — Gemini AI Planner đã
+//    thay thế, không còn dùng.
+//  - Xóa nhánh "Dữ liệu" khỏi đây — đã có sẵn ở cuối tab Thống kê (Stats).
+//  - Xóa nhánh "Media" khỏi đây — đã có sẵn trong nút 3 chấm (header).
+//  - "Game Registry" (Năng lượng game/Sự kiện game) giữ lại nhưng gộp
+//    chung vào mục "AI Planner" (không còn là nhánh riêng).
+//  - 6 tab cũ của Pill Tab Bar (đã bị xóa) giờ là các mục trong danh sách
+//    này, điều hướng qua switchTab (route {tab===N} ở App() giữ nguyên
+//    100% — chỉ đổi cách người dùng đi tới, không đổi nơi mount).
+// Thứ tự hiển thị do người dùng chỉ định.
+const SETTINGS_HUB_MENU = [
+  { key: "ai",       icon: "🤖", label: "AI Planner",          tabIndex: 11 },
+  { key: "finance",  icon: "💰", label: "Tài chính",           tabIndex: 10 },
+  { key: "insights", icon: "🔬", label: "Khám Phá",            tabIndex: 9 },
+  { key: "knowledge",icon: "📚", label: "Kho kiến thức",       tabIndex: 6 },
+  { key: "psych",    icon: "🧠", label: "Tâm lý & Bản thân",   tabIndex: 3 },
+  { key: "journey",  icon: "📖", label: "Nhật ký phát triển",  tabIndex: 7 },
 ];
 
 // PR-032 — GameRegistryModalEntry
@@ -15102,135 +15580,109 @@ function GameRegistryModalEntry() {
 
 function SettingsHub(props) {
   const {
-    setts, saveSetts, db, str, txp, dayExp, lv, rt, finTxs, setFinTxs,
+    setts, saveSetts, db, setDb, str, txp, dayExp, lv, rt, finTxs, setFinTxs,
     capsuleNotif, setCapsuleNotif,
     exportData, importData, backupList, restoreFromBackup,
-    taskPool, td,
+    taskPool, td, targetXP, onSwitchTab,
   } = props;
   const theme = useContext(ThemeContext);
   const accent = useContext(AccentContext);
-  const [branch, setBranch] = useState("ai");
 
-  // [PR-033b] Điểm gọi createAIPlannerCore() thứ 5 — HỢP LỆ theo ngoại lệ
-  // tường minh mới, xác nhận trong PR-033b (xem "LƯU Ý VỀ ĐIỂM GỌI
-  // createAIPlannerCore() THỨ 5" tại Master_Migration_Plan.md Hard
-  // Constraint §2, cùng pattern với ngoại lệ điểm thứ 4 của PR-030).
-  // SettingsHub là root độc lập, sibling của AIPlannerBeta dưới App() —
-  // không có đường props tới core hiện có của AIPlannerBeta, nên cần
-  // instance riêng, y hệt nguyên tắc §5.2 "mỗi UI tự useMemo() riêng,
-  // không share 1 instance" đã áp dụng cho AIPlannerPreviewPanel.
-  const core = useMemo(() => createAIPlannerCore(), []);
-  // [PR-033b] Đọc plannerStorage/plannerToday qua Context đã có sẵn,
-  // đúng 3-field contract — không dùng setPlannerToday (preview không
-  // ghi storage), không mở rộng Context (K2 điều kiện 6/8).
-  const { plannerStorage: settingsStorage, plannerToday: settingsToday } = useContext(PlannerRuntimeContext);
+  // [GB-UI-CLEAN-02] Danh sách dài dạng hàng ngang (1 cột) đổi sang lưới
+  // 3x2 các thẻ vuông, theo yêu cầu người dùng ("gọn gọn tí", "6 card
+  // hình vuông xếp đều 3 trên 3 dưới"). Mục "AI Planner" giờ là 1 thẻ
+  // trong lưới thay vì luôn mở sẵn full-height — bấm vào để mở/đóng xổ
+  // xuống (accordion) ngay dưới lưới, có hiệu ứng mở/đóng (.gb-expand-enter
+  // đã có sẵn trong file). Các mục còn lại vẫn điều hướng qua switchTab
+  // như cũ (onSwitchTab), không đổi cách các tab đó mount.
+  const [expandedKey, setExpandedKey] = useState(null);
 
-  // [PR-033b] runPreviewFromSettingsHub — nguồn runPreview cho
-  // RuleEditorFlow khi mount trong SettingsHub. Tự build runForm bằng
-  // buildPlannerForm("aiPlannerBetaInit", ...) (Owner đã xác nhận chấp
-  // nhận đánh đổi "form mặc định" thay vì form thật của AIPlannerBeta —
-  // xem Proposal §5.2/§8 rủi ro 1). goalMode mặc định "study" (Owner đã
-  // xác nhận — Proposal §5.3/§10 mục 3). Gọi qua runAiPlannerPreview
-  // (shared runner K2) — không gọi thẳng runAiPlannerPipeline, không
-  // duplicate logic.
-  const runPreviewFromSettingsHub = async (draftOverrides) => {
-    const now = new Date();
-    const todayData = db?.[td] || {};
-    const baseForm = buildPlannerForm("aiPlannerBetaInit", { todayData, td, now, db, dayExp, setts });
-    const runForm = { ...baseForm, extraEvents: [], goalMode: "study" };
-    const deadlinePlan = await readDeadlinePlan();
-    const dayLog = settingsToday?.entries || [];
-    return runAiPlannerPreview({
-      core, storage: settingsStorage, td, runForm, dayLog, db, taskPool, deadlinePlan,
-      draftOverrides,
-    });
-  };
+  const gridItems = SETTINGS_HUB_MENU; // AI Planner đã ở vị trí đầu tiên
 
   return (
-    <div>
-      {/* Tertiary navigation — cùng pattern cuộn ngang với Pill Tab Bar
-          hiện có (App(), dòng ~9819), không tạo pattern UI mới. */}
-      <div role="tablist" aria-label="Danh mục cài đặt" style={{position:"sticky",top:0,zIndex:10,background:theme.surfaceAlt,borderBottom:`1px solid ${theme.border}`,display:"flex",overflowX:"auto",WebkitOverflowScrolling:"touch",scrollbarWidth:"none",padding:"8px 10px",gap:6,marginBottom:SPACING.md}}>
-        {SETTINGS_HUB_BRANCHES.map(b=>{
-          const isActive = branch===b.key;
+    <div style={{padding:"0 2px"}}>
+      <div style={{ fontSize: 11, color: theme.textDim, padding: "0 2px 12px", lineHeight: 1.5 }}>
+        Danh sách các mục khác của app. Chạm để mở.
+      </div>
+
+      <div style={{
+        display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:8, marginBottom:8,
+      }}>
+        {gridItems.map(item=>{
+          const isAi = item.key === "ai";
+          const isOpen = isAi && expandedKey === "ai";
           return (
-            <button key={b.key} onClick={()=>setBranch(b.key)} className="gb-ripple" onMouseDown={gbRipple}
-              role="tab" aria-selected={isActive} style={{
-              flex:"0 0 auto",
-              padding: isActive ? "6px 16px" : "6px 12px",
-              border:"none",
-              background: isActive ? `linear-gradient(135deg,${accent},${accent}CC)` : "transparent",
-              cursor:"pointer",
-              color: isActive ? "#FFFFFF" : theme.textDim,
-              borderRadius:RADIUS.pill,
-              fontSize:11,
-              fontWeight: isActive ? 700 : 400,
-              whiteSpace:"nowrap",
-              transition:"all 0.2s ease",
+            <button key={item.key}
+              onClick={()=> isAi ? setExpandedKey(isOpen ? null : "ai") : (onSwitchTab && onSwitchTab(item.tabIndex))}
+              className="gb-ripple gb-card-hover" onMouseDown={gbRipple} style={{
+              aspectRatio:"1 / 1", display:"flex", flexDirection:"column", alignItems:"center",
+              justifyContent:"center", gap:6, padding:"10px 6px", borderRadius:RADIUS.lg,
+              border:`1px solid ${isOpen ? accent : theme.border}`,
+              background: isOpen ? `${accent}1A` : theme.surface,
+              color:theme.text, textAlign:"center", cursor:"pointer",
             }}>
-              {b.label}
+              <span style={{fontSize:22}}>{item.icon}</span>
+              <span style={{fontSize:11, fontWeight:600, lineHeight:1.25}}>{item.label}</span>
+              {isAi && (
+                <span style={{fontSize:9, color: isOpen ? accent : theme.textDim}}>{isOpen ? "▲ đóng" : "▼ mở"}</span>
+              )}
             </button>
           );
         })}
       </div>
 
-      {/* [UI polish] Nhánh "chung"/"notif" đã xoá khỏi SETTINGS_HUB_BRANCHES
-          (xem comment tại định nghĩa hằng số) — JSX tương ứng xoá theo. */}
-      {branch==="ai" && (
-        <div style={{padding:"0 2px"}}>
-          {/* PR-033 — re-route 3/4 component (ConditionRulesManager,
-              DayRulesManager, ScheduleManagerPanel). [PR-041] Điểm mount
-              cũ trong AIPlannerBeta (tab AI Planner chính) đã GỠ trong PR
-              này — đây giờ là nơi DUY NHẤT hiển thị 3 component rule-based
-              này, đúng theo cutover đã dự kiến từ PR-033.
+      {/* [V24 MỤC 10 - giữ nguyên] Boss Fight ẩn/hiện qua Settings
+          (setts.bossEnabled, mặc định OFF) — không phải mục cố định do
+          người dùng liệt kê, nhưng vẫn cần 1 lối vào khi bật, nếu không
+          tab===8 sẽ không có cách nào truy cập được nữa. */}
+      {setts.bossEnabled && (
+        <button onClick={()=>onSwitchTab && onSwitchTab(8)}
+          className="gb-ripple" onMouseDown={gbRipple} style={{
+          width:"100%", display:"flex", alignItems:"center", gap:10,
+          padding:"14px 14px", marginBottom:8, borderRadius:RADIUS.lg,
+          border:`1px solid ${theme.border}`, background:theme.surface,
+          color:theme.text, fontSize:14, textAlign:"left", cursor:"pointer",
+        }}>
+          <span style={{fontSize:18}}>⚔️</span>
+          <span style={{flex:1, fontWeight:600}}>Boss</span>
+          <span style={{color:theme.textDim, fontSize:14}}>›</span>
+        </button>
+      )}
 
-              [PR-033b] RuleEditorFlow giờ CŨNG mount ở đây, dùng
-              runPreviewFromSettingsHub làm nguồn runPreview (K2: Shared
-              implementation — cùng gọi runAiPlannerPreview, core instance
-              RIÊNG của SettingsHub, không share state với AIPlannerBeta).
-              Đánh đổi đã Owner xác nhận: "Xem thử" tại đây dùng form
-              check-in MẶC ĐỊNH (buildPlannerForm("aiPlannerBetaInit",...)),
-              không phải form thật người dùng đang điền ở tab AI Planner —
-              xem PR033b_Proposal.md §5.2/§8 rủi ro 1. */}
-          <div style={{ fontSize: 11, color: theme.textDim, padding: "0 2px 12px", lineHeight: 1.5 }}>
-            Công cụ soạn luật cũ — không còn dùng cho kế hoạch thật. Gemini là AI Planner duy nhất và học từ dữ liệu thực tế (lịch sử, check-in, task hoàn thành), không dựa vào rule cấu hình ở đây.
+      {/* Mục "AI Planner" — gộp AIPlannerBeta + Game Registry (Năng lượng
+          game/Sự kiện game) vào cùng 1 khối, theo yêu cầu người dùng.
+          Giờ xổ xuống/thu lại khi bấm thẻ "AI Planner" trong lưới ở trên,
+          thay vì luôn hiển thị. Header "🤖 AI Planner" trùng lặp (khối
+          này + bên trong AIPlannerBeta) đã bỏ — chỉ còn 1 header do
+          AIPlannerBeta tự vẽ. */}
+      {expandedKey === "ai" && (
+        // [GB-UI-FIX-01] Panel này chứa các card con (FixedTasksManager,
+        // ScheduleManagerPanel, CatalogManager...) đều tự vẽ nền
+        // theme.surface. Nếu khối bọc ngoài CŨNG dùng theme.surface thì bị
+        // "surface lồng trong surface" — cùng 1 màu xám, chỉ phân biệt bằng
+        // viền mảnh, nhìn lệch tông/kì so với phần còn lại của app (nơi
+        // luôn xen kẽ bg/surface). Đổi bọc ngoài sang theme.bg (màu nền
+        // trang) để các card con nổi lên đúng như thiết kế gốc.
+        // [GB-UI-FIX-02] KHÔNG dùng class "gb-expand-enter" ở đây: animation
+        // gbExpand giới hạn max-height: 600px (đủ cho dropdown nhỏ, nhưng
+        // panel AI Planner đầy đủ (Bối cảnh + Sự kiện + Check-in + nút chạy
+        // + Quản lý task cố định...) cao hơn 600px nhiều). Vì animation dùng
+        // fill-mode "both", trạng thái max-height:600px bị giữ lại VĨNH VIỄN
+        // sau khi chạy xong — cắt cụt nội dung và tạo viền/bóng ma chồng lấn
+        // y hệt lỗi trong ảnh chụp màn hình. Dùng animation riêng, chỉ
+        // opacity + translateY, không đụng max-height.
+        <div className="gb-ai-panel-enter" style={{
+          padding:"14px 14px", marginBottom:8, borderRadius:RADIUS.lg,
+          border:`1px solid ${theme.border}`, background:theme.bg,
+        }}>
+          <AIPlannerErrorBoundary theme={theme}>
+            <AIPlannerBeta db={db} setDb={setDb} td={td} dayExp={dayExp} targetXP={targetXP} taskPool={taskPool}/>
+          </AIPlannerErrorBoundary>
+          <div style={{marginTop:12, paddingTop:12, borderTop:`1px solid ${theme.border}`}}>
+            <div style={{fontSize:11, color:theme.textDim, marginBottom:8}}>🎮 Game Registry</div>
+            <CatalogManager/>
+            <GameRegistryModalEntry/>
           </div>
-          <RuleEditorFlow runPreview={runPreviewFromSettingsHub}/>
-          <DayRulesManager/>
-          <ConditionRulesManager/>
-          <ScheduleManagerPanel/>
-        </div>
-      )}
-
-      {branch==="data" && (
-        <div style={{padding:"0 2px"}}>
-          <DataBackupPanel exportData={exportData} importData={importData} backupList={backupList} restoreFromBackup={restoreFromBackup}/>
-        </div>
-      )}
-
-      {branch==="game" && (
-        <div style={{padding:"0 2px"}}>
-          <CatalogManager/>
-          <GameRegistryModalEntry/>
-        </div>
-      )}
-
-      {branch==="media" && (
-        <MediaSettingsBranchEntry/>
-      )}
-
-      {branch==="tertiary" && (
-        <div style={{padding:"0 2px"}}>
-          {/* [FIX xung đột route] PsychProfileQA đã có route riêng ở
-              tab===3 (pill "🧠 Tâm lý & Bản thân") — bỏ khỏi đây để
-              không hiện trùng 2 nơi. Các mục còn lại (Kho/Hành Trình/
-              Boss/Insights/Tài chính) vẫn chưa có route riêng trong
-              BottomNav nên tạm giữ ở nhánh "Thêm" này. */}
-          <div><KnowledgeBank/></div>
-          <div style={{marginTop:SPACING.lg}}><HanhTrinh capsuleNotif={capsuleNotif} setCapsuleNotif={setCapsuleNotif} db={db} str={str} txp={txp}/></div>
-          {setts.bossEnabled && <div style={{marginTop:SPACING.lg}}><BossFight db={db} save={props.save} td={props.td} setts={setts}/></div>}
-          <div style={{marginTop:SPACING.lg}}><KhamPha db={db} dayExp={dayExp} str={str} txp={txp} finTxs={finTxs} setts={setts}/></div>
-          <div style={{marginTop:SPACING.lg}}><TaiChinh txs={finTxs||[]} onTxsChange={setFinTxs}/></div>
         </div>
       )}
     </div>
@@ -15449,27 +15901,20 @@ function TimelineFullScreen({ td, db, save, dayExp, setts, weeklyReviews, onOpen
 
       {view === "today" && (
         <div style={{ padding: "12px 12px 0" }}>
-          {/* [PREVIEW-CLEANUP-04] Kế hoạch & Nhiệm vụ chính — chuyển từ tab
-              "Hôm nay" (Today()) sang đây theo yêu cầu người dùng. Props đến
-              từ planningSectionArgs, được Today() tính và đẩy lên qua
-              useEffect (xem onPlanningSectionArgsChange trong Today()).
-              null-safe: nếu Today() chưa render lần nào (hiếm, vì Today()
-              luôn mounted qua display:none), planningSectionArgs sẽ null
-              trong 1 khung hình đầu — không crash, chỉ tạm ẩn Section. */}
+          {/* [PREVIEW-CLEANUP-05] Theo yêu cầu người dùng: bỏ khung accordion
+              "Kế hoạch & Nhiệm vụ chính" cùng MorningWidget và HeroGoalCard
+              (khung "One Big Win"/"Ôn lại bài cũ" + nút "Áp dụng Mục tiêu
+              lớn") khỏi tab Lịch — cảm giác rối, không cần thiết. CHỈ giữ
+              lại TodaysGoalsCompact ("📋 Mục tiêu hôm nay"), render trực
+              tiếp (không bọc Section/accordion nữa). Props vẫn lấy từ
+              planningSectionArgs (không đổi luồng dữ liệu, chỉ đổi phần
+              JSX được render) — null-safe y hệt trước. MorningWidget/
+              HeroGoalCard/Section KHÔNG bị xoá khỏi codebase (Rule 6:
+              không xoá tính năng, chỉ ẩn điểm mount) — chỉ không còn được
+              gọi ở đây. */}
           {planningSectionArgs && (
-            <Section title="Kế hoạch & Nhiệm vụ chính" icon="🎯" theme={theme} defaultOpen={true}>
-              <MorningWidget {...planningSectionArgs.morningWidgetProps}/>
-              <HeroGoalCard heroGoalCardProps={planningSectionArgs.heroGoalCardProps}/>
-              {/* [Simplify Home & Schedule UX] AISuggestionsCard (card riêng)
-                  và "CHƯA XẾP GIỜ"/"Lịch trình hôm nay" (thời gian thực) đã bị
-                  xoá — gợi ý AI giờ hiển thị GỘP bên trong TodaysGoalsCompact/
-                  TodaysGoalsCard (props aiSuggestions/... bên dưới), không còn
-                  khái niệm giờ/gán giờ. Không tạo hệ thống mới — logic áp dụng
-                  gợi ý (applyOne/applyAll/applyBigWin) giữ nguyên, chỉ chuyển
-                  nơi render vào trong TodaysGoalsCard. */}
-              <TodaysGoalsCompact todaysGoalsCardProps={planningSectionArgs.todaysGoalsCardProps}
-                onOpenFullScreen={planningSectionArgs.onOpenTodaysGoalsFullScreen}/>
-            </Section>
+            <TodaysGoalsCompact todaysGoalsCardProps={planningSectionArgs.todaysGoalsCardProps}
+              onOpenFullScreen={planningSectionArgs.onOpenTodaysGoalsFullScreen}/>
           )}
 
         </div>
@@ -15715,6 +16160,12 @@ function AIPlannerPreviewPanel({ td, db, data, taskPool, plannerStorage, planner
   const bigWinApplied = oneBigWin && bigGoalNames.has(normalizeTaskName(oneBigWin.label));
 
   return (
+    <ModalPortal>
+    {/* [FIX] Trước đây modal này render trực tiếp (không qua ModalPortal),
+        nên bị kẹt trong stacking context của tab content — Pill Tab Bar
+        (sticky, zIndex:10) và BottomNav (fixed, zIndex:40) đè lên dù modal
+        có zIndex:1000 cục bộ (đúng bug đã ghi ở ModalPortal, dòng ~8426).
+        Bọc bằng ModalPortal để nhất quán với 13 modal khác trong file. */}
     <div style={{
       position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000,
       display: "flex", alignItems: "flex-end", justifyContent: "center",
@@ -15857,6 +16308,7 @@ function AIPlannerPreviewPanel({ td, db, data, taskPool, plannerStorage, planner
         </button>
       </div>
     </div>
+    </ModalPortal>
   );
 }
 
@@ -16991,7 +17443,13 @@ function Today({td,data,dayE,save,setts,saveSetts,studyRunning,studySecs,stopStu
     // TodaysGoalsCard — cùng nguồn dữ liệu AISuggestionsCard đã dùng trước
     // đây (db/plannerStorage/plannerToday/onAddPoolTask/save), không tạo
     // nguồn mới.
-    aiSuggestions: { db, plannerStorage, plannerToday, onAddPoolTask, save },
+    // [PREVIEW-CLEANUP-05] +onEditPoolTask — cần để applyOne/applyAll gán
+    // cờ important=true lên pool entry khi Gemini trả priority:"high" cho
+    // gợi ý đó (xem TodaysGoalsCard.applyOne/applyAll). onEditPoolTask đã
+    // tồn tại sẵn trong scope Today() (dùng ở todaysGoalsCardProps.onEditPoolTask
+    // ngay phía trên) — chỉ thêm lại reference vào object aiSuggestions,
+    // không tạo hàm mới.
+    aiSuggestions: { db, plannerStorage, plannerToday, onAddPoolTask, onEditPoolTask, save },
   };
 
   // [PR-017] onOpenFullScreen: prop MỚI dành riêng cho TodaysGoalsCompact
@@ -19960,13 +20418,16 @@ function MilestoneLog({db,str,txp}) {
 
       {/* Lightbox ảnh — MỤC 6.8 */}
       {lightbox&&(
+        <ModalPortal>
         <div className="gb-modal-backdrop-fade" onClick={()=>setLightbox(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:20,cursor:"zoom-out"}}>
           <img className="gb-modal-fade-scale" src={lightbox} alt="" style={{maxWidth:"100%",maxHeight:"100%",borderRadius:12,boxShadow:"0 12px 48px rgba(0,0,0,0.5)"}}/>
         </div>
+        </ModalPortal>
       )}
 
       {/* Achievement detail modal — mở từ badge trên milestone */}
       {openAch&&(
+        <ModalPortal>
         <div className="gb-modal-backdrop-fade" onClick={()=>setOpenAch(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:999,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
           <div className="gb-modal-fade-scale" onClick={e=>e.stopPropagation()} style={{background:theme.surface,borderRadius:16,padding:20,maxWidth:320,width:"100%",boxShadow:"0 12px 48px rgba(0,0,0,0.5)",textAlign:"center"}}>
             <div style={{fontSize:36,marginBottom:8}}>{openAch.done?openAch.icon:"❓"}</div>
@@ -19976,6 +20437,7 @@ function MilestoneLog({db,str,txp}) {
             <button onClick={()=>setOpenAch(null)} style={{width:"100%",padding:"9px 0",borderRadius:999,border:"none",background:theme.accent,color:"white",fontWeight:700,fontSize:12,cursor:"pointer"}}>Đóng</button>
           </div>
         </div>
+        </ModalPortal>
       )}
 
       <div style={{height:16}}/>
@@ -21903,11 +22365,16 @@ function TaiChinh({txs=[], onTxsChange}) {
         </button>
       )}
 
-      {/* Add/Edit Form Modal. Note: the .gb-tab-fade stacking-context trap that
-          caused this to render under the sticky TabBar is fixed at its source
-          (see .gb-tab-fade CSS rule) rather than via portal, since the
-          Artifact runtime doesn't support react-dom/createPortal. */}
+      {/* [FIX] Add/Edit Form Modal — trước đây không dùng ModalPortal (comment
+          cũ nói "Artifact runtime doesn't support createPortal", đã lỗi thời:
+          ModalPortal hiện đã portal thật ra document.body và được 13 modal
+          khác trong file dùng thành công). Không dùng portal khiến modal này
+          bị kẹt trong stacking context của tab content, nên Pill Tab Bar
+          (sticky, zIndex:10) và BottomNav (fixed, zIndex:40) đè lên dù modal
+          có zIndex cao hơn cục bộ — đúng bug đã ghi ở ModalPortal (dòng
+          ~8426). Bọc bằng ModalPortal để nhất quán với các modal khác. */}
       {form && (
+        <ModalPortal>
         <div className="gb-modal-backdrop-fade" style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",zIndex:100,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={()=>setForm(null)}>
           <div className="gb-expand-enter" style={{background:theme.surfaceAlt,borderRadius:"18px 18px 0 0",padding:"18px 18px calc(18px + env(safe-area-inset-bottom, 0px))",width:"100%",maxWidth:480,maxHeight:"85vh",overflowY:"auto",boxSizing:"border-box"}} onClick={e=>e.stopPropagation()}>
             <div style={{fontSize:13,fontWeight:700,color:theme.primary,marginBottom:12}}>{form.id?"✏️ Sửa giao dịch":"💰 Giao dịch mới"}</div>
@@ -21953,6 +22420,7 @@ function TaiChinh({txs=[], onTxsChange}) {
             </div>
           </div>
         </div>
+        </ModalPortal>
       )}
     </div>
   );
