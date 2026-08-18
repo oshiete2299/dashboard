@@ -12813,6 +12813,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             id: conv.id,
             title: conv.title,
             updatedAt: conv.updatedAt,
+            messageCount: (conv.messages || []).length,
           };
         (idx >= 0 ? (list[idx] = summary) : list.push(summary),
           await saveAssistantChatIndex(list));
@@ -12823,6 +12824,32 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         } catch {}
         const list = await listAssistantChatConversations();
         await saveAssistantChatIndex(list.filter((c) => c.id !== id));
+      }
+      /* PHASE 28 — dọn các conv "Cuộc trò chuyện mới" bị bỏ dở (0 tin nhắn,
+         tạo ra khi mở tab/sheet rồi thoát mà không gõ gì). Không đụng vào
+         conv đang active (activeId) dù nó đang rỗng, để không xoá ngay
+         dưới tay Bảo khi đang gõ dở. Additive, không đổi hành vi lưu/đọc
+         hiện có — chỉ gọi thêm ở chỗ mount để dọn rác tồn đọng. */
+      async function pruneEmptyAssistantChatConversations(activeId) {
+        try {
+          const list = await listAssistantChatConversations(),
+            keep = [],
+            toDelete = [];
+          for (const c of list) {
+            0 === (c.messageCount ?? 1) && c.id !== activeId
+              ? toDelete.push(c.id)
+              : keep.push(c);
+          }
+          if (!toDelete.length) return;
+          for (const id of toDelete) {
+            try {
+              await S.del(assistantChatConvKey(id));
+            } catch {}
+          }
+          await saveAssistantChatIndex(keep);
+        } catch (e) {
+          console.error("[Trợ lý] pruneEmptyAssistantChatConversations failed:", e);
+        }
       }
       function newAssistantChatConversation() {
         const id =
@@ -13058,6 +13085,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         BUDDY_HISTORY_KEY = "v1:buddy:history",
         BUDDY_MEMORY_KEY = "v1:buddy:memory",
         BUDDY_NAME_KEY = "v1:buddy:name",
+        BUDDY_PERSONALITY_KEY = "v1:buddy:personality",
         BUDDY_DEFAULT_NAME = "Buddy",
         BUDDY_HISTORY_MAX_MESSAGES = 200;
       async function getBuddyName() {
@@ -13111,6 +13139,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           await S.set(BUDDY_MEMORY_KEY, v || "");
         } catch {}
       }
+      async function getBuddyPersonality() {
+        try {
+          const v = await S.get(BUDDY_PERSONALITY_KEY);
+          return v && "null" !== v ? v : "";
+        } catch {
+          return "";
+        }
+      }
+      async function setBuddyPersonality(v) {
+        try {
+          await S.set(BUDDY_PERSONALITY_KEY, v || "");
+        } catch {}
+      }
       async function loadBuddyHistory() {
         try {
           const raw = await S.get(BUDDY_HISTORY_KEY),
@@ -13143,7 +13184,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           at: new Date().toISOString(),
         };
       }
-      function buildBuddySystemPrompt(memoryNote, buddyName, digitalActivityNote, companionContext) {
+      function buildBuddySystemPrompt(memoryNote, buddyName, digitalActivityNote, companionContext, personalityNote) {
         const name = (buddyName || BUDDY_DEFAULT_NAME).trim() || BUDDY_DEFAULT_NAME;
         let prompt =
           `Bạn tên là "${name}" — một người bạn AI trò chuyện thân thiết bên ` +
@@ -13167,6 +13208,19 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
           "hoạch của Bảo.\n\n" +
           "Trả lời bằng tiếng Việt, giọng gần gũi, ấm áp, chân thành, không " +
           "sáo rỗng, không giảng đạo dài dòng.";
+        /* PHASE 28 — personalityNote là do chính Bảo viết để định hình TÍNH
+           CÁCH/giọng điệu của Buddy (cách xưng hô, mức độ đùa cợt, phong
+           cách nói chuyện...). KHÁC với memoryNote (thông tin VỀ Bảo) —
+           personalityNote là hướng dẫn VỀ CÁCH Buddy cư xử. Áp dụng ngay
+           sau phần vai trò cốt lõi, trước memory, để định hình giọng điệu
+           xuyên suốt toàn bộ phản hồi. Không ghi đè các nguyên tắc an toàn/
+           cô lập khỏi Planner đã nêu ở trên. */
+        personalityNote &&
+          personalityNote.trim() &&
+          (prompt +=
+            "\n\nTÍNH CÁCH BẠN NÊN THỂ HIỆN (do Bảo tự đặt ra, hãy nói chuyện " +
+            'đúng theo phong cách này):\n"""\n' +
+            `${personalityNote.trim()}\n"""`);
         memoryNote &&
           memoryNote.trim() &&
           (prompt += `\n\nĐIỀU BẠN NHỚ VỀ BẢO (do chính Bảo lưu lại cho bạn, chỉ để trò chuyện gần gũi hơn):\n"""\n${memoryNote.trim()}\n"""`);
@@ -13276,6 +13330,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${BUDDY_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
           memoryNote = await getBuddyMemory(),
           buddyName = await getBuddyName(),
+          personalityNote = await getBuddyPersonality(),
           contents = (messages || []).slice(-30).map((m) => ({
             role: "assistant" === m.role ? "model" : "user",
             parts: [{ text: m.text }],
@@ -13312,7 +13367,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
             system_instruction: {
               parts: [
                 {
-                  text: buildBuddySystemPrompt(memoryNote, buddyName, digitalActivityNote, companionContext),
+                  text: buildBuddySystemPrompt(memoryNote, buddyName, digitalActivityNote, companionContext, personalityNote),
                 },
               ],
             },
@@ -21552,14 +21607,16 @@ QUY TẮC BẮT BUỘC:
           [l, s] = useState(!1),
           [mem, setMem] = useState(""),
           [memSaved, setMemSaved] = useState(!1),
-          [buddyName, setBuddyNameLocal] = useState(BUDDY_DEFAULT_NAME);
+          [buddyName, setBuddyNameLocal] = useState(BUDDY_DEFAULT_NAME),
+          [personality, setPersonality] = useState("");
         return (
           useEffect(() => {
             (async () => {
               (a(await getBuddyApiKey()),
                 r(await getBuddyEnabled()),
                 setMem(await getBuddyMemory()),
-                setBuddyNameLocal(await getBuddyName()));
+                setBuddyNameLocal(await getBuddyName()),
+                setPersonality(await getBuddyPersonality()));
             })();
           }, []),
           React.createElement(
@@ -21636,6 +21693,37 @@ QUY TẮC BẮT BUỘC:
                     marginBottom: 8,
                   },
                 }),
+                React.createElement(
+                  "div",
+                  {
+                    style: {
+                      fontSize: 11,
+                      color: theme.textDim,
+                      marginBottom: 6,
+                      lineHeight: 1.5,
+                    },
+                  },
+                  "🎭 Tính cách — định hình cách Buddy nói chuyện (giọng điệu, mức độ đùa, xưng hô...). Khác với ô bộ nhớ bên dưới: đây là HƯỚNG DẪN về cách cư xử, không phải thông tin về bạn.",
+                ),
+                React.createElement("textarea", {
+                  rows: 3,
+                  value: personality,
+                  onChange: (e) => setPersonality(e.target.value),
+                  placeholder:
+                    "Ví dụ: nói chuyện như một người chị thân thiết, hay trêu chọc nhẹ nhàng, xưng chị-em, không sáo rỗng, thẳng thắn khi cần...",
+                  style: {
+                    width: "100%",
+                    padding: 8,
+                    borderRadius: 8,
+                    border: `1px solid ${theme.border}`,
+                    background: theme.bg,
+                    color: theme.text,
+                    fontSize: 12,
+                    marginBottom: 8,
+                    resize: "vertical",
+                    fontFamily: "inherit",
+                  },
+                }),
                 React.createElement("input", {
                   type: "password",
                   value: n,
@@ -21710,6 +21798,7 @@ QUY TẮC BẮT BUỘC:
                         await setBuddyEnabled(o),
                         await setBuddyMemory(mem),
                         await setBuddyName(buddyName),
+                        await setBuddyPersonality(personality),
                         c(!0),
                         setMemSaved(!0),
                         setTimeout(() => (c(!1), setMemSaved(!1)), 1500));
@@ -23041,12 +23130,40 @@ QUY TẮC BẮT BUỘC:
           refreshHistory = useCallback(async () => {
             setConversations(await listAssistantChatConversations());
           }, []);
+        /* PHASE 28 — Bảo phản hồi: mỗi lần mở lại tab "Trợ lý" (activeTab
+           unmount/remount), cuộc trò chuyện trước đó "biến mất" khỏi màn
+           hình dù đã lưu, vì effect cũ luôn tạo conv rỗng mới thay vì tiếp
+           tục conv gần nhất. Từ Phase 28: khi mount, nếu có conv gần nhất
+           trong index VÀ conv đó còn tin nhắn, tự động resume conv đó thay
+           vì luôn tạo mới. Chỉ tạo conv mới khi index rỗng hoặc lỗi đọc.
+           Không đổi schema/khoá lưu trữ, không đổi hành vi "Cuộc trò chuyện
+           mới" (nút đó vẫn ép tạo mới như cũ). */
         (useEffect(() => {
-          refreshHistory();
-        }, [refreshHistory]),
-          useEffect(() => {
-            conv || setConv(newAssistantChatConversation());
-          }, [conv]),
+          (async () => {
+            const list = await listAssistantChatConversations();
+            setConversations(list);
+            let resumedId = null;
+            if (!conv) {
+              const mostRecent = list.find((c) => (c.messageCount ?? 1) > 0) || list[0];
+              if (mostRecent) {
+                const loaded = await loadAssistantChatConversation(mostRecent.id);
+                if (loaded && (loaded.messages || []).length) {
+                  setConv(loaded);
+                  resumedId = loaded.id;
+                } else {
+                  setConv(newAssistantChatConversation());
+                }
+              } else {
+                setConv(newAssistantChatConversation());
+              }
+            } else {
+              resumedId = conv.id;
+            }
+            await pruneEmptyAssistantChatConversations(resumedId);
+            setConversations(await listAssistantChatConversations());
+          })();
+          // eslint-disable-next-line
+        }, []),
           useEffect(() => {
             const raf = requestAnimationFrame(() => {
               scrollRef.current &&
